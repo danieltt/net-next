@@ -22,7 +22,7 @@ For monitoring and control pktgen creates:
 	/proc/net/pktgen/pgctrl
 	/proc/net/pktgen/kpktgend_X
         /proc/net/pktgen/ethX
-
+	/proc/net/pktgen/pgrx
 
 Viewing threads
 ===============
@@ -154,6 +154,43 @@ Examples:
  pgset "rate 300M"        set rate to 300 Mb/s
  pgset "ratep 1000000"    set rate to 1Mpps
 
+Viewing receiver
+================
+
+/proc/net/pktgen/pgrx
+
+		RECEPTION STATISTICS
+	PER-CPU Stats. 
+CPU 0: 	Rx packets: 0	 Rx bytes: 0
+CPU 1: 	Rx packets: 2502400	 Rx bytes: 150144000
+	Rate:  22218pps 10 Mb/sec (10665033bps) 
+	Worktime 112625248 us 
+CPU 2: 	Rx packets: 1251200	 Rx bytes: 75072000
+	Rate:  11109pps 5 Mb/sec (5332412bps) 
+	Worktime 112627453 us 
+CPU 3: 	Rx packets: 1251100	 Rx bytes: 75066000
+	Rate:  11108pps 5 Mb/sec (5332035bps) 
+	Worktime 112626413 us 
+CPU 4: 	Rx packets: 1251400	 Rx bytes: 75084000
+	Rate:  11111pps 5 Mb/sec (5333458bps) 
+	Worktime 112623364 us 
+CPU 5: 	Rx packets: 1251200	 Rx bytes: 75072000
+	Rate:  11110pps 5 Mb/sec (5332844bps) 
+	Worktime 112618314 us 
+CPU 6: 	Rx packets: 1241500	 Rx bytes: 74490000
+	Rate:  11023pps 5 Mb/sec (5291273bps) 
+	Worktime 112623172 us 
+CPU 7: 	Rx packets: 1251200	 Rx bytes: 75072000
+	Rate:  11109pps 5 Mb/sec (5332628bps) 
+	Worktime 112622877 us 
+
+	Global Statistics
+Packets Rx: 10000000	 Bytes Rx: 600000000 
+Start: 64952587054 us	 Stop: 65065224574 us	 Worktime  112637519 us
+Received throughput: 
+  88780pps 42 Mb/sec (42614574bps)
+
+
 Example scripts
 ===============
 
@@ -245,6 +282,12 @@ flowlen
 
 rate
 ratep
+
+**Receiver commands:
+
+rx [device]
+rx_reset
+rx_disable
 
 References:
 ftp://robur.slu.se/pub/Linux/net-development/pktgen-testing/

@@ -1905,7 +1905,7 @@ static const struct file_operations pktgen_thread_fops = {
 };
 
 /*
- * Funshow Receiver statistics
+ * Function that show Receiver statistics
  */
 static int pgrx_show(struct seq_file *seq, void *v)
 {
@@ -4163,9 +4163,6 @@ int pktgen_rcv_basic(struct sk_buff *skb, struct net_device *dev,
 	}
 
 	if(unlikely(pgh->pgh_magic!= PKTGEN_MAGIC_NET)){
-		if(debug)
-			if(printk_ratelimit())
-				printk(KERN_INFO "pkgten: INVALID HEADER\n");
 		goto end;
 	}
 	
