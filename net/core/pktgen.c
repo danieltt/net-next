@@ -114,6 +114,7 @@
  * Fixed src_mac command to set source mac of packet to value specified in
  * command by Adit Ranadive <adit.262@gmail.com>
  *
+ * Receiver support and rate control by Daniel Turull <daniel.turull@gmail.com>
  */
 #include <linux/sys.h>
 #include <linux/types.h>
@@ -168,8 +169,9 @@
 #include <linux/uaccess.h>
 #include <asm/dma.h>
 #include <asm/div64.h>		/* do_div */
+#include "kmap_skb.h"
 
-#define VERSION 	"2.73"
+#define VERSION 	"2.74"
 #define IP_NAME_SZ 32
 #define MAX_MPLS_LABELS 16 /* This is the max label stack depth */
 #define MPLS_STACK_BOTTOM htonl(0x00000100)
@@ -204,8 +206,10 @@
 
 /* Used to help with determining the pkts on receive */
 #define PKTGEN_MAGIC 0xbe9be955
+#define PKTGEN_MAGIC_NET htonl(PKTGEN_MAGIC)
 #define PG_PROC_DIR "pktgen"
 #define PGCTRL	    "pgctrl"
+#define PGRX 	    "pgrx"
 static struct proc_dir_entry *pg_proc_dir;
 
 #define MAX_CFLOWS  65536
@@ -406,6 +410,15 @@ struct pktgen_thread {
 	struct completion start_done;
 };
 
+/*Recevier parameters per cpu*/
+struct pktgen_rx {
+	u64 rx_packets; 		/*packets arrived*/
+	u64 rx_bytes;			/*bytes arrived*/
+
+	ktime_t start_time;		/*first time stamp of a packet*/
+	ktime_t last_time;		/*last packet arrival */
+};
+
 #define REMOVE 1
 #define FIND   0
 
@@ -438,6 +451,12 @@ static void pktgen_stop_all_threads_ifs(void);
 static void pktgen_stop(struct pktgen_thread *t);
 static void pktgen_clear_counters(struct pktgen_dev *pkt_dev);
 
+/*Receiver functions*/
+int pktgen_rcv_basic(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev);
+static int pktgen_add_rx(const char *ifname);
+static int pktgen_clean_rx(void);
+static void pg_reset_rx(void);
+
 static unsigned int scan_ip6(const char *s, char ip[16]);
 static unsigned int fmt_ip6(char *s, const char ip[16]);
 
@@ -450,8 +469,17 @@ static int debug  __read_mostly;
 static DEFINE_MUTEX(pktgen_thread_lock);
 static LIST_HEAD(pktgen_threads);
 
+DEFINE_PER_CPU(struct pktgen_rx,pktgen_rx_data);
+static int pg_initialized=0;
+
 static struct notifier_block pktgen_notifier_block = {
 	.notifier_call = pktgen_device_event,
+};
+
+/*Reception functions test*/
+static struct packet_type pktgen_packet_type __read_mostly = {
+	.type = __constant_htons(ETH_P_IP),
+	.func = pktgen_rcv_basic, 
 };
 
 /*
@@ -978,6 +1006,40 @@ static ssize_t pktgen_if_write(struct file *file,
 
 		sprintf(pg_result, "OK: delay=%llu",
 			(unsigned long long) pkt_dev->delay);
+		return count;
+	}
+	if (!strcmp(name, "rate")) {
+		len = num_arg(&user_buffer[i], 10, &value);
+		if (len < 0)
+			return len;
+
+		i += len;
+		if(value==0)
+			return len;
+		pkt_dev->delay=pkt_dev->min_pkt_size*8*NSEC_PER_USEC/value;
+		if(debug)
+			printk(KERN_INFO
+				 "pktgen: Delay set at: %llu ns\n",
+					pkt_dev->delay);
+
+		sprintf(pg_result, "OK: rate=%lu",value);
+		return count;
+	}
+	if (!strcmp(name, "ratep")) {
+		len = num_arg(&user_buffer[i], 10, &value);
+		if (len < 0)
+			return len;
+
+		i += len;
+		if(value==0)
+			return len;
+		pkt_dev->delay=NSEC_PER_SEC/value;
+		if (debug)
+			printk(KERN_INFO
+				 "pktgen: Delay set at: %llu ns\n",
+					pkt_dev->delay);
+
+		sprintf(pg_result, "OK: rate=%lu",value);
 		return count;
 	}
 	if (!strcmp(name, "udp_src_min")) {
@@ -1842,6 +1904,190 @@ static const struct file_operations pktgen_thread_fops = {
 	.release = single_release,
 };
 
+/*
+ * Funshow Receiver statistics
+ */
+static int pgrx_show(struct seq_file *seq, void *v)
+{
+	__u64 bps,mbps,pps;
+	int cpu;
+	u64 total_packets=0,total_bytes=0,work_time_us=0,packets=0,bytes=0;
+	ktime_t start_global, stop_global,tmp;
+	start_global.tv64=0;
+	stop_global.tv64=0;
+
+	seq_puts(seq, "\t\tRECEPTION STATISTICS\n");
+	if(pg_initialized==0){
+		seq_puts(seq, "Not enabled.\n");
+		return 0;
+	}
+	seq_puts(seq, "\tPER-CPU Stats. \n");
+	
+	for_each_online_cpu(cpu) {
+		seq_printf(seq, "CPU %d: ",cpu);
+		packets=per_cpu(pktgen_rx_data,cpu).rx_packets;
+		bytes=per_cpu(pktgen_rx_data,cpu).rx_bytes;
+
+		total_packets+=packets;
+		total_bytes+=bytes;
+		seq_printf(seq, "\tRx packets: %llu\t Rx bytes: %llu\n",
+			packets, bytes);
+
+		tmp=per_cpu(pktgen_rx_data,cpu).start_time;
+		if(start_global.tv64==0 && tmp.tv64!=0)
+			start_global=tmp;
+		else if(tmp.tv64<start_global.tv64 && tmp.tv64!=0)
+			start_global=tmp;
+
+		tmp=per_cpu(pktgen_rx_data,cpu).last_time;
+		if(ktime_to_ns(tmp)>ktime_to_ns(stop_global))
+			stop_global=tmp;
+
+		work_time_us = ktime_to_us(ktime_sub(
+			per_cpu(pktgen_rx_data,cpu).last_time,
+			per_cpu(pktgen_rx_data,cpu).start_time));
+		
+		if(work_time_us==0){
+			continue;
+		}
+
+		bps=div64_u64(bytes*8*USEC_PER_SEC,work_time_us);
+		mbps = bps;
+		do_div(mbps, 1000000);
+		pps = div64_u64(packets * USEC_PER_SEC,work_time_us);
+
+		seq_printf(seq,"\tRate:  %llupps %llu Mb/sec (%llubps) \n",
+				(unsigned long long)pps,
+				(unsigned long long)mbps,
+		    		(unsigned long long)bps);
+		seq_printf(seq,"\tWork time %llu us \n",work_time_us);
+
+	}
+
+	seq_puts(seq, "\n\tGlobal Statistics\n");
+
+	seq_printf(seq, "Packets Rx: %llu\t Bytes Rx: %llu \n",
+		(unsigned long long) total_packets,
+		(unsigned long long ) total_bytes);
+
+	/*Bandwidth*/	
+	work_time_us = ktime_to_us(ktime_sub(stop_global,start_global));
+
+	seq_printf(seq,"Start: %llu us\t Stop: %llu us\t Work time  %llu us\n",
+		ktime_to_us(start_global),
+		ktime_to_us(stop_global),
+		work_time_us);
+
+	if(work_time_us==0){
+		return 0;
+	}
+	bps=div64_u64(total_bytes*8*USEC_PER_SEC,work_time_us);
+	mbps = bps;
+	do_div(mbps, 1000000);
+	pps = div64_u64(total_packets * USEC_PER_SEC,work_time_us);
+
+	seq_puts(seq,"Received throughput: \n");
+
+	seq_printf(seq,"  %llupps %llu Mb/sec (%llubps)\n",
+		     (unsigned long long)pps,
+		     (unsigned long long)mbps,
+		     (unsigned long long)bps);
+
+	return 0;
+}
+/*receiver configuration*/
+static ssize_t pgrx_write(struct file *file, const char __user * user_buffer,
+			    size_t count, loff_t * ppos)
+{
+	int i = 0, max, len, ret;
+	char name[40];
+
+	if (count < 1) {
+		return -EINVAL;
+	}
+
+	max = count - i;
+	len = count_trail_chars(&user_buffer[i], max);
+	if (len < 0)
+		return len;
+
+	i += len;
+
+	/* Read variable name */
+
+	len = strn_len(&user_buffer[i], sizeof(name) - 1);
+	if (len < 0)
+		return len;
+
+	memset(name, 0, sizeof(name));
+	if (copy_from_user(name, &user_buffer[i], len))
+		return -EFAULT;
+	i += len;
+
+	max = count - i;
+	len = count_trail_chars(&user_buffer[i], max);
+	if (len < 0)
+		return len;
+
+	i += len;
+
+	if (debug)
+		printk(KERN_DEBUG "pktgen: t=%s, count=%lu\n",
+		       name, (unsigned long)count);
+
+
+	if(!strcmp(name,"rx")){
+		char f[32];
+		memset(f, 0, 32);
+		len = strn_len(&user_buffer[i], sizeof(f) - 1);
+		if (len < 0) {
+			ret = len;
+			goto out;
+		}
+		if (copy_from_user(f, &user_buffer[i], len))
+			return -EFAULT;
+		i += len;
+		
+		if(debug)
+			printk(KERN_INFO "pktgen: Adding rx %s\n",f);
+		pktgen_add_rx(f);
+		ret = count;
+		goto out;
+	}else if(!strcmp(name,"rx_reset")){
+		ret=count;
+		pg_reset_rx();
+		if(debug)
+			printk(KERN_INFO "pktgen: Reseting reception\n");
+		goto out;
+	}else if(!strcmp(name,"rx_disable")){
+		ret=count;
+		pktgen_clean_rx();
+		if(debug)
+			printk(KERN_INFO "pktgen: Cleaning reception\n");
+		goto out;
+	}else
+		printk(KERN_WARNING "pktgen: Unknown command: %s\n", name);
+
+	ret = count;
+
+out:
+	return ret;
+}
+
+static int pgrx_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, pgrx_show, PDE(inode)->data);
+}
+
+static const struct file_operations pktgen_rx_fops = {
+	.owner   = THIS_MODULE,
+	.open    = pgrx_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.write   = pgrx_write,
+	.release = single_release,
+};
+
 /* Think find or remove for NN */
 static struct pktgen_dev *__pktgen_NN_threads(const char *ifname, int remove)
 {
@@ -2142,15 +2388,15 @@ static void spin(struct pktgen_dev *pkt_dev, ktime_t spin_until)
 	hrtimer_init_on_stack(&t.timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	hrtimer_set_expires(&t.timer, spin_until);
 
-	remaining = ktime_to_us(hrtimer_expires_remaining(&t.timer));
+	remaining = ktime_to_ns(hrtimer_expires_remaining(&t.timer));
 	if (remaining <= 0) {
 		pkt_dev->next_tx = ktime_add_ns(spin_until, pkt_dev->delay);
 		return;
 	}
 
 	start_time = ktime_now();
-	if (remaining < 100)
-		udelay(remaining); 	/* really small just spin */
+	if (remaining < 100000)
+		ndelay(remaining); 	/* really small just spin */
 	else {
 		/* see do_nanosleep */
 		hrtimer_init_sleeper(&t, current);
@@ -2170,7 +2416,7 @@ static void spin(struct pktgen_dev *pkt_dev, ktime_t spin_until)
 	end_time = ktime_now();
 
 	pkt_dev->idle_acc += ktime_to_ns(ktime_sub(end_time, start_time));
-	pkt_dev->next_tx = ktime_add_ns(end_time, pkt_dev->delay);
+	pkt_dev->next_tx = ktime_add_ns(spin_until, pkt_dev->delay);
 }
 
 static inline void set_pkt_overhead(struct pktgen_dev *pkt_dev)
@@ -3852,6 +4098,92 @@ static int pktgen_remove_device(struct pktgen_thread *t,
 	return 0;
 }
 
+static void pg_reset_rx(void)
+{
+	int cpu;
+	for_each_online_cpu(cpu) {
+		per_cpu(pktgen_rx_data,cpu).rx_packets=0;
+		per_cpu(pktgen_rx_data,cpu).rx_bytes=0;
+		per_cpu(pktgen_rx_data,cpu).last_time.tv64=0;
+		per_cpu(pktgen_rx_data,cpu).start_time.tv64=0;
+	}		
+}
+
+static int pktgen_add_rx(const char *ifname)
+{
+	int err=0;
+	struct net_device *idev=NULL;
+
+	pg_reset_rx();
+
+	idev = pktgen_dev_get_by_name(NULL, ifname);
+	if (!idev)
+		printk(KERN_INFO 
+			"pktgen: device not present %s. Using all\n", ifname);
+
+	if(!pg_initialized){
+		pktgen_packet_type.dev=idev;
+		dev_add_pack(&pktgen_packet_type);
+		err=0;
+		net_disable_timestamp();
+		pg_initialized=1;
+	}else{
+		dev_remove_pack(&pktgen_packet_type);
+		pktgen_packet_type.dev=idev;
+		dev_add_pack(&pktgen_packet_type);
+		err=0;
+	}
+	if(idev)
+		dev_put(idev);
+	return err;
+}
+
+static int pktgen_clean_rx(void)
+{
+	if(pg_initialized){
+		dev_remove_pack(&pktgen_packet_type);
+		pg_initialized=0;
+	}
+	return 0;
+}
+
+int pktgen_rcv_basic(struct sk_buff *skb, struct net_device *dev,
+			 struct packet_type *pt, struct net_device *orig_dev)
+{
+	/* Check magic*/
+	struct iphdr *iph=ip_hdr(skb);
+	struct pktgen_hdr *pgh;
+	void *vaddr;
+	if(skb_is_nonlinear(skb)){
+		vaddr=kmap_skb_frag(&skb_shinfo(skb)->frags[0]);
+		pgh= (struct pktgen_hdr *)
+			(vaddr+skb_shinfo(skb)->frags[0].page_offset);
+	}else{
+		pgh= (struct pktgen_hdr *)(((char *)(iph)) + 28);
+	}
+
+	if(unlikely(pgh->pgh_magic!= PKTGEN_MAGIC_NET)){
+		if(debug)
+			if(printk_ratelimit())
+				printk(KERN_INFO "pkgten: INVALID HEADER\n");
+		goto end;
+	}
+	
+	if(unlikely(__get_cpu_var(pktgen_rx_data).rx_packets==0))
+		__get_cpu_var(pktgen_rx_data).start_time=ktime_now();
+
+	__get_cpu_var(pktgen_rx_data).last_time=ktime_now();
+
+	/* Update counter of packets*/
+	__get_cpu_var(pktgen_rx_data).rx_packets++;
+	__get_cpu_var(pktgen_rx_data).rx_bytes+=skb->len+14;
+end:
+	if(skb_is_nonlinear(skb))
+		kunmap_skb_frag(vaddr);
+	kfree_skb(skb);
+	return 0;
+}
+
 static int __init pg_init(void)
 {
 	int cpu;
@@ -3874,6 +4206,15 @@ static int __init pg_init(void)
 	/* Register us to receive netdevice events */
 	register_netdevice_notifier(&pktgen_notifier_block);
 
+	/*Create proc rx*/	
+	pe = proc_create(PGRX, 0600, pg_proc_dir, &pktgen_rx_fops);
+	if (pe == NULL) {
+		printk(KERN_ERR "pktgen: ERROR: cannot create %s "
+		       "procfs entry.\n", PGRX);
+		proc_net_remove(&init_net, PG_PROC_DIR);
+		return -EINVAL;
+	}
+
 	for_each_online_cpu(cpu) {
 		int err;
 
@@ -3887,6 +4228,8 @@ static int __init pg_init(void)
 		printk(KERN_ERR "pktgen: ERROR: Initialization failed for "
 		       "all threads\n");
 		unregister_netdevice_notifier(&pktgen_notifier_block);
+		pktgen_clean_rx();
+		remove_proc_entry(PGRX, pg_proc_dir);
 		remove_proc_entry(PGCTRL, pg_proc_dir);
 		proc_net_remove(&init_net, PG_PROC_DIR);
 		return -ENODEV;
@@ -3912,6 +4255,9 @@ static void __exit pg_cleanup(void)
 
 	/* Un-register us from receiving netdevice events */
 	unregister_netdevice_notifier(&pktgen_notifier_block);
+
+	pktgen_clean_rx();
+	remove_proc_entry(PGRX, pg_proc_dir);
 
 	/* Clean up proc file system */
 	remove_proc_entry(PGCTRL, pg_proc_dir);
