@@ -2128,6 +2128,8 @@ static inline void netdev_rx_csum_fault(struct net_device *dev)
 extern void		net_enable_timestamp(void);
 extern void		net_disable_timestamp(void);
 
+extern void set_pktgen_hook(int (*f)(struct sk_buff *skb));
+
 #ifdef CONFIG_PROC_FS
 extern void *dev_seq_start(struct seq_file *seq, loff_t *pos);
 extern void *dev_seq_next(struct seq_file *seq, void *v, loff_t *pos);

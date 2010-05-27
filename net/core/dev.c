@@ -2793,6 +2793,13 @@ int __skb_bond_should_drop(struct sk_buff *skb, struct net_device *master)
 }
 EXPORT_SYMBOL(__skb_bond_should_drop);
 
+int (*pktgen_hook)(struct sk_buff *skb) = 0;
+
+void set_pktgen_hook(int (*f)(struct sk_buff *skb))
+{
+       pktgen_hook = f;
+}
+EXPORT_SYMBOL(set_pktgen_hook);
 static int __netif_receive_skb(struct sk_buff *skb)
 {
 	struct packet_type *ptype, *pt_prev;
@@ -2831,6 +2838,13 @@ static int __netif_receive_skb(struct sk_buff *skb)
 	skb_reset_network_header(skb);
 	skb_reset_transport_header(skb);
 	skb->mac_len = skb->network_header - skb->mac_header;
+       /* call hook if defined */
+       if (pktgen_hook) {
+               if ((*pktgen_hook)(skb)) {
+                       return NET_RX_SUCCESS;
+               }
+               /* otherwise let kernel do the job */
+       }
 
 	pt_prev = NULL;
 
@@ -2904,6 +2918,8 @@ out:
 	rcu_read_unlock();
 	return ret;
 }
+
+
 
 /**
  *	netif_receive_skb - process receive buffer from network
