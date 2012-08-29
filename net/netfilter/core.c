@@ -37,7 +37,7 @@ int nf_register_afinfo(const struct nf_afinfo *afinfo)
 	err = mutex_lock_interruptible(&afinfo_mutex);
 	if (err < 0)
 		return err;
-	rcu_assign_pointer(nf_afinfo[afinfo->family], afinfo);
+	RCU_INIT_POINTER(nf_afinfo[afinfo->family], afinfo);
 	mutex_unlock(&afinfo_mutex);
 	return 0;
 }
@@ -46,7 +46,7 @@ EXPORT_SYMBOL_GPL(nf_register_afinfo);
 void nf_unregister_afinfo(const struct nf_afinfo *afinfo)
 {
 	mutex_lock(&afinfo_mutex);
-	rcu_assign_pointer(nf_afinfo[afinfo->family], NULL);
+	RCU_INIT_POINTER(nf_afinfo[afinfo->family], NULL);
 	mutex_unlock(&afinfo_mutex);
 	synchronize_rcu();
 }
@@ -54,6 +54,12 @@ EXPORT_SYMBOL_GPL(nf_unregister_afinfo);
 
 struct list_head nf_hooks[NFPROTO_NUMPROTO][NF_MAX_HOOKS] __read_mostly;
 EXPORT_SYMBOL(nf_hooks);
+
+#if defined(CONFIG_JUMP_LABEL)
+struct static_key nf_hooks_needed[NFPROTO_NUMPROTO][NF_MAX_HOOKS];
+EXPORT_SYMBOL(nf_hooks_needed);
+#endif
+
 static DEFINE_MUTEX(nf_hook_mutex);
 
 int nf_register_hook(struct nf_hook_ops *reg)
@@ -70,6 +76,9 @@ int nf_register_hook(struct nf_hook_ops *reg)
 	}
 	list_add_rcu(&reg->list, elem->list.prev);
 	mutex_unlock(&nf_hook_mutex);
+#if defined(CONFIG_JUMP_LABEL)
+	static_key_slow_inc(&nf_hooks_needed[reg->pf][reg->hooknum]);
+#endif
 	return 0;
 }
 EXPORT_SYMBOL(nf_register_hook);
@@ -79,7 +88,9 @@ void nf_unregister_hook(struct nf_hook_ops *reg)
 	mutex_lock(&nf_hook_mutex);
 	list_del_rcu(&reg->list);
 	mutex_unlock(&nf_hook_mutex);
-
+#if defined(CONFIG_JUMP_LABEL)
+	static_key_slow_dec(&nf_hooks_needed[reg->pf][reg->hooknum]);
+#endif
 	synchronize_net();
 }
 EXPORT_SYMBOL(nf_unregister_hook);
@@ -120,14 +131,13 @@ unsigned int nf_iterate(struct list_head *head,
 			int hook_thresh)
 {
 	unsigned int verdict;
+	struct nf_hook_ops *elem = list_entry_rcu(*i, struct nf_hook_ops, list);
 
 	/*
 	 * The caller must not block between calls to this
 	 * function because of risk of continuing from deleted element.
 	 */
-	list_for_each_continue_rcu(*i, head) {
-		struct nf_hook_ops *elem = (struct nf_hook_ops *)*i;
-
+	list_for_each_entry_continue_rcu(elem, head, list) {
 		if (hook_thresh > elem->priority)
 			continue;
 
@@ -144,11 +154,14 @@ repeat:
 				continue;
 			}
 #endif
-			if (verdict != NF_REPEAT)
+			if (verdict != NF_REPEAT) {
+				*i = &elem->list;
 				return verdict;
+			}
 			goto repeat;
 		}
 	}
+	*i = &elem->list;
 	return NF_ACCEPT;
 }
 
@@ -180,17 +193,16 @@ next_hook:
 		if (ret == 0)
 			ret = -EPERM;
 	} else if ((verdict & NF_VERDICT_MASK) == NF_QUEUE) {
-		ret = nf_queue(skb, elem, pf, hook, indev, outdev, okfn,
-			       verdict >> NF_VERDICT_QBITS);
-		if (ret < 0) {
-			if (ret == -ECANCELED)
+		int err = nf_queue(skb, elem, pf, hook, indev, outdev, okfn,
+						verdict >> NF_VERDICT_QBITS);
+		if (err < 0) {
+			if (err == -ECANCELED)
 				goto next_hook;
-			if (ret == -ESRCH &&
+			if (err == -ESRCH &&
 			   (verdict & NF_VERDICT_FLAG_QUEUE_BYPASS))
 				goto next_hook;
 			kfree_skb(skb);
 		}
-		ret = 0;
 	}
 	rcu_read_unlock();
 	return ret;
@@ -219,7 +231,7 @@ int skb_make_writable(struct sk_buff *skb, unsigned int writable_len)
 }
 EXPORT_SYMBOL(skb_make_writable);
 
-#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+#if IS_ENABLED(CONFIG_NF_CONNTRACK)
 /* This does not belong here, but locally generated errors need it if connection
    tracking in use: without this, connection may not be in hash table, and hence
    manufactured ICMP or RST packets will not be associated with it. */
@@ -254,6 +266,13 @@ void nf_conntrack_destroy(struct nf_conntrack *nfct)
 	rcu_read_unlock();
 }
 EXPORT_SYMBOL(nf_conntrack_destroy);
+
+struct nfq_ct_hook __rcu *nfq_ct_hook __read_mostly;
+EXPORT_SYMBOL_GPL(nfq_ct_hook);
+
+struct nfq_ct_nat_hook __rcu *nfq_ct_nat_hook __read_mostly;
+EXPORT_SYMBOL_GPL(nfq_ct_nat_hook);
+
 #endif /* CONFIG_NF_CONNTRACK */
 
 #ifdef CONFIG_PROC_FS
@@ -280,12 +299,3 @@ void __init netfilter_init(void)
 	if (netfilter_log_init() < 0)
 		panic("cannot initialize nf_log");
 }
-
-#ifdef CONFIG_SYSCTL
-struct ctl_path nf_net_netfilter_sysctl_path[] = {
-	{ .procname = "net", },
-	{ .procname = "netfilter", },
-	{ }
-};
-EXPORT_SYMBOL_GPL(nf_net_netfilter_sysctl_path);
-#endif /* CONFIG_SYSCTL */

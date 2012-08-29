@@ -57,12 +57,10 @@ static unsigned long direct_pages_count[PG_LEVEL_NUM];
 
 void update_page_count(int level, unsigned long pages)
 {
-	unsigned long flags;
-
 	/* Protect against CPA */
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 	direct_pages_count[level] += pages;
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 }
 
 static void split_page_count(int level)
@@ -124,7 +122,7 @@ within(unsigned long addr, unsigned long start, unsigned long end)
 
 /**
  * clflush_cache_range - flush a cache range with clflush
- * @addr:	virtual start address
+ * @vaddr:	virtual start address
  * @size:	number of bytes to flush
  *
  * clflush is an unordered instruction which needs fencing with mfence
@@ -312,7 +310,7 @@ static inline pgprot_t static_protections(pgprot_t prot, unsigned long address,
 		 * these shared mappings are made of small page mappings.
 		 * Thus this don't enforce !RW mapping for small page kernel
 		 * text mapping logic will help Linux Xen parvirt guest boot
-		 * aswell.
+		 * as well.
 		 */
 		if (lookup_address(address, &level) && (level != PG_LEVEL_4K))
 			pgprot_val(forbidden) |= _PAGE_RW;
@@ -394,7 +392,7 @@ static int
 try_preserve_large_page(pte_t *kpte, unsigned long address,
 			struct cpa_data *cpa)
 {
-	unsigned long nextpage_addr, numpages, pmask, psize, flags, addr, pfn;
+	unsigned long nextpage_addr, numpages, pmask, psize, addr, pfn;
 	pte_t new_pte, old_pte, *tmp;
 	pgprot_t old_prot, new_prot, req_prot;
 	int i, do_split = 1;
@@ -403,7 +401,7 @@ try_preserve_large_page(pte_t *kpte, unsigned long address,
 	if (cpa->force_split)
 		return 1;
 
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 	/*
 	 * Check for races, another CPU might have split this page
 	 * up already:
@@ -498,14 +496,14 @@ try_preserve_large_page(pte_t *kpte, unsigned long address,
 	}
 
 out_unlock:
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 
 	return do_split;
 }
 
 static int split_large_page(pte_t *kpte, unsigned long address)
 {
-	unsigned long flags, pfn, pfninc = 1;
+	unsigned long pfn, pfninc = 1;
 	unsigned int i, level;
 	pte_t *pbase, *tmp;
 	pgprot_t ref_prot;
@@ -519,7 +517,7 @@ static int split_large_page(pte_t *kpte, unsigned long address)
 	if (!base)
 		return -ENOMEM;
 
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 	/*
 	 * Check for races, another CPU might have split this page
 	 * up for us already:
@@ -591,7 +589,7 @@ out_unlock:
 	 */
 	if (base)
 		__free_page(base);
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 
 	return 0;
 }
@@ -1000,7 +998,7 @@ out_err:
 }
 EXPORT_SYMBOL(set_memory_uc);
 
-int _set_memory_array(unsigned long *addr, int addrinarray,
+static int _set_memory_array(unsigned long *addr, int addrinarray,
 		unsigned long new_type)
 {
 	int i, j;
@@ -1334,12 +1332,6 @@ void kernel_map_pages(struct page *page, int numpages, int enable)
 		debug_check_no_locks_freed(page_address(page),
 					   numpages * PAGE_SIZE);
 	}
-
-	/*
-	 * If page allocator is not up yet then do not call c_p_a():
-	 */
-	if (!debug_pagealloc_enabled)
-		return;
 
 	/*
 	 * The return value is ignored as the calls cannot fail.

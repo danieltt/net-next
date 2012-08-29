@@ -73,21 +73,21 @@ void __init gemini_init_irq(void)
 	unsigned int i, mode = 0, level = 0;
 
 	/*
-	 * Disable arch_idle() by default since it is buggy
-	 * For more info see arch/arm/mach-gemini/include/mach/system.h
+	 * Disable the idle handler by default since it is buggy
+	 * For more info see arch/arm/mach-gemini/idle.c
 	 */
 	disable_hlt();
 
 	request_resource(&iomem_resource, &irq_resource);
 
 	for (i = 0; i < NR_IRQS; i++) {
-		set_irq_chip(i, &gemini_irq_chip);
+		irq_set_chip(i, &gemini_irq_chip);
 		if((i >= IRQ_TIMER1 && i <= IRQ_TIMER3) || (i >= IRQ_SERIRQ0 && i <= IRQ_SERIRQ1)) {
-			set_irq_handler(i, handle_edge_irq);
+			irq_set_handler(i, handle_edge_irq);
 			mode |= 1 << i;
 			level |= 1 << i;
 		} else {			
-			set_irq_handler(i, handle_level_irq);
+			irq_set_handler(i, handle_level_irq);
 		}
 		set_irq_flags(i, IRQF_VALID | IRQF_PROBE);
 	}

@@ -19,6 +19,7 @@
 #include <linux/if_arp.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/netfilter/xt_AUDIT.h>
+#include <linux/netfilter_bridge/ebtables.h>
 #include <net/ipv6.h>
 #include <net/ip.h>
 
@@ -97,6 +98,7 @@ static void audit_ip6(struct audit_buffer *ab, struct sk_buff *skb)
 	struct ipv6hdr _ip6h;
 	const struct ipv6hdr *ih;
 	u8 nexthdr;
+	__be16 frag_off;
 	int offset;
 
 	ih = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ip6h), &_ip6h);
@@ -107,7 +109,7 @@ static void audit_ip6(struct audit_buffer *ab, struct sk_buff *skb)
 
 	nexthdr = ih->nexthdr;
 	offset = ipv6_skip_exthdr(skb, skb_network_offset(skb) + sizeof(_ip6h),
-				  &nexthdr);
+				  &nexthdr, &frag_off);
 
 	audit_log_format(ab, " saddr=%pI6c daddr=%pI6c proto=%hhu",
 			 &ih->saddr, &ih->daddr, nexthdr);
@@ -162,10 +164,22 @@ audit_tg(struct sk_buff *skb, const struct xt_action_param *par)
 		break;
 	}
 
+#ifdef CONFIG_NETWORK_SECMARK
+	if (skb->secmark)
+		audit_log_secctx(ab, skb->secmark);
+#endif
+
 	audit_log_end(ab);
 
 errout:
 	return XT_CONTINUE;
+}
+
+static unsigned int
+audit_tg_ebt(struct sk_buff *skb, const struct xt_action_param *par)
+{
+	audit_tg(skb, par);
+	return EBT_CONTINUE;
 }
 
 static int audit_tg_check(const struct xt_tgchk_param *par)
@@ -181,23 +195,33 @@ static int audit_tg_check(const struct xt_tgchk_param *par)
 	return 0;
 }
 
-static struct xt_target audit_tg_reg __read_mostly = {
-	.name		= "AUDIT",
-	.family		= NFPROTO_UNSPEC,
-	.target		= audit_tg,
-	.targetsize	= sizeof(struct xt_audit_info),
-	.checkentry	= audit_tg_check,
-	.me		= THIS_MODULE,
+static struct xt_target audit_tg_reg[] __read_mostly = {
+	{
+		.name		= "AUDIT",
+		.family		= NFPROTO_UNSPEC,
+		.target		= audit_tg,
+		.targetsize	= sizeof(struct xt_audit_info),
+		.checkentry	= audit_tg_check,
+		.me		= THIS_MODULE,
+	},
+	{
+		.name		= "AUDIT",
+		.family		= NFPROTO_BRIDGE,
+		.target		= audit_tg_ebt,
+		.targetsize	= sizeof(struct xt_audit_info),
+		.checkentry	= audit_tg_check,
+		.me		= THIS_MODULE,
+	},
 };
 
 static int __init audit_tg_init(void)
 {
-	return xt_register_target(&audit_tg_reg);
+	return xt_register_targets(audit_tg_reg, ARRAY_SIZE(audit_tg_reg));
 }
 
 static void __exit audit_tg_exit(void)
 {
-	xt_unregister_target(&audit_tg_reg);
+	xt_unregister_targets(audit_tg_reg, ARRAY_SIZE(audit_tg_reg));
 }
 
 module_init(audit_tg_init);

@@ -41,10 +41,6 @@ struct zoran_sync {
 };
 
 
-#define MAJOR_VERSION 0		/* driver major version */
-#define MINOR_VERSION 10	/* driver minor version */
-#define RELEASE_VERSION 0	/* release version */
-
 #define ZORAN_NAME    "ZORAN"	/* name of the device */
 
 #define ZR_DEVNAME(zr) ((zr)->name)
@@ -176,8 +172,10 @@ struct zoran_jpg_settings {
 	struct v4l2_jpegcompression jpg_comp;	/* JPEG-specific capture settings */
 };
 
+struct zoran_fh;
+
 struct zoran_mapping {
-	struct file *file;
+	struct zoran_fh *fh;
 	int count;
 };
 
@@ -259,7 +257,7 @@ struct card_info {
 	struct vfe_polarity vfe_pol;
 	u8 gpio_pol[ZR_GPIO_MAX];
 
-	/* is the /GWS line conected? */
+	/* is the /GWS line connected? */
 	u8 gws_not_connected;
 
 	/* avs6eyes mux setting */

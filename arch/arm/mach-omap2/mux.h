@@ -59,6 +59,7 @@
 #define OMAP_PIN_OFF_WAKEUPENABLE	OMAP_WAKEUP_EN
 
 #define OMAP_MODE_GPIO(x)	(((x) & OMAP_MUX_MODE7) == OMAP_MUX_MODE4)
+#define OMAP_MODE_UART(x)	(((x) & OMAP_MUX_MODE7) == OMAP_MUX_MODE0)
 
 /* Flags for omapX_mux_init */
 #define OMAP_PACKAGE_MASK		0xffff
@@ -159,7 +160,6 @@ struct omap_board_mux {
 	u16	value;
 };
 
-#define OMAP_DEVICE_PAD_ENABLED		BIT(7)	/* Not needed for board-*.c */
 #define OMAP_DEVICE_PAD_REMUX		BIT(1)	/* Dynamically remux a pad,
 						   needs enable, idle and off
 						   values */
@@ -186,6 +186,12 @@ struct omap_device_pad {
 };
 
 struct omap_hwmod_mux_info;
+
+#define OMAP_MUX_STATIC(signal, mode)					\
+{									\
+	.name	= (signal),						\
+	.enable	= (mode),						\
+}
 
 #if defined(CONFIG_OMAP_MUX)
 
@@ -220,7 +226,17 @@ omap_hwmod_mux_init(struct omap_device_pad *bpads, int nr_pads);
  */
 void omap_hwmod_mux(struct omap_hwmod_mux_info *hmux, u8 state);
 
+int omap_mux_get_by_name(const char *muxname,
+		struct omap_mux_partition **found_partition,
+		struct omap_mux **found_mux);
 #else
+
+static inline int omap_mux_get_by_name(const char *muxname,
+		struct omap_mux_partition **found_partition,
+		struct omap_mux **found_mux)
+{
+	return 0;
+}
 
 static inline int omap_mux_init_gpio(int gpio, int val)
 {
@@ -241,7 +257,7 @@ static inline void omap_hwmod_mux(struct omap_hwmod_mux_info *hmux, u8 state)
 {
 }
 
-static struct omap_board_mux *board_mux __initdata __maybe_unused;
+static struct omap_board_mux *board_mux __maybe_unused;
 
 #endif
 
@@ -318,10 +334,12 @@ int omap3_mux_init(struct omap_board_mux *board_mux, int flags);
 
 /**
  * omap4_mux_init() - initialize mux system with board specific set
- * @board_mux:		Board specific mux table
+ * @board_subset:	Board specific mux table
+ * @board_wkup_subset:	Board specific mux table for wakeup instance
  * @flags:		OMAP package type used for the board
  */
-int omap4_mux_init(struct omap_board_mux *board_mux, int flags);
+int omap4_mux_init(struct omap_board_mux *board_subset,
+	struct omap_board_mux *board_wkup_subset, int flags);
 
 /**
  * omap_mux_init - private mux init function, do not call

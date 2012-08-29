@@ -8,6 +8,8 @@
  */
 
 #include "../codecs/wm8994.h"
+#include <sound/pcm_params.h>
+#include <linux/module.h>
 
  /*
   * Default CFG switch settings to use this driver:
@@ -44,7 +46,9 @@ static int smdk_hw_params(struct snd_pcm_substream *substream,
 	int ret;
 
 	/* AIF1CLK should be >=3MHz for optimal performance */
-	if (params_rate(params) == 8000 || params_rate(params) == 11025)
+	if (params_format(params) == SNDRV_PCM_FORMAT_S24_LE)
+		pll_out = params_rate(params) * 384;
+	else if (params_rate(params) == 8000 || params_rate(params) == 11025)
 		pll_out = params_rate(params) * 512;
 	else
 		pll_out = params_rate(params) * 256;
@@ -114,8 +118,6 @@ static int smdk_wm8994_init_paiftx(struct snd_soc_pcm_runtime *rtd)
 	snd_soc_dapm_nc_pin(dapm, "IN1RP");
 	snd_soc_dapm_nc_pin(dapm, "IN2RP:VXRP");
 
-	snd_soc_dapm_sync(dapm);
-
 	return 0;
 }
 
@@ -142,35 +144,46 @@ static struct snd_soc_dai_link smdk_dai[] = {
 
 static struct snd_soc_card smdk = {
 	.name = "SMDK-I2S",
+	.owner = THIS_MODULE,
 	.dai_link = smdk_dai,
 	.num_links = ARRAY_SIZE(smdk_dai),
 };
 
-static struct platform_device *smdk_snd_device;
 
-static int __init smdk_audio_init(void)
+static int __devinit smdk_audio_probe(struct platform_device *pdev)
 {
 	int ret;
+	struct snd_soc_card *card = &smdk;
 
-	smdk_snd_device = platform_device_alloc("soc-audio", -1);
-	if (!smdk_snd_device)
-		return -ENOMEM;
+	card->dev = &pdev->dev;
+	ret = snd_soc_register_card(card);
 
-	platform_set_drvdata(smdk_snd_device, &smdk);
-
-	ret = platform_device_add(smdk_snd_device);
 	if (ret)
-		platform_device_put(smdk_snd_device);
+		dev_err(&pdev->dev, "snd_soc_register_card() failed:%d\n", ret);
 
 	return ret;
 }
-module_init(smdk_audio_init);
 
-static void __exit smdk_audio_exit(void)
+static int __devexit smdk_audio_remove(struct platform_device *pdev)
 {
-	platform_device_unregister(smdk_snd_device);
+	struct snd_soc_card *card = platform_get_drvdata(pdev);
+
+	snd_soc_unregister_card(card);
+
+	return 0;
 }
-module_exit(smdk_audio_exit);
+
+static struct platform_driver smdk_audio_driver = {
+	.driver		= {
+		.name	= "smdk-audio",
+		.owner	= THIS_MODULE,
+	},
+	.probe		= smdk_audio_probe,
+	.remove		= __devexit_p(smdk_audio_remove),
+};
+
+module_platform_driver(smdk_audio_driver);
 
 MODULE_DESCRIPTION("ALSA SoC SMDK WM8994");
 MODULE_LICENSE("GPL");
+MODULE_ALIAS("platform:smdk-audio");

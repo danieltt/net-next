@@ -12,7 +12,19 @@
 #define __ARCH_ARM_OMAP_SRAM_H
 
 #ifndef __ASSEMBLY__
-extern void * omap_sram_push(void * start, unsigned long size);
+#include <asm/fncpy.h>
+
+extern void *omap_sram_push_address(unsigned long size);
+
+/* Macro to push a function to the internal SRAM, using the fncpy API */
+#define omap_sram_push(funcp, size) ({				\
+	typeof(&(funcp)) _res = NULL;				\
+	void *_sram_address = omap_sram_push_address(size);	\
+	if (_sram_address)					\
+		_res = fncpy(_sram_address, &(funcp), size);	\
+	_res;							\
+})
+
 extern void omap_sram_reprogram_clock(u32 dpllctl, u32 ckctl);
 
 extern void omap2_sram_ddr_init(u32 *slow_dll_ctrl, u32 fast_dll_ctrl,
@@ -83,6 +95,11 @@ static inline void omap_push_sram_idle(void) {}
  */
 #define OMAP2_SRAM_PA		0x40200000
 #define OMAP3_SRAM_PA           0x40200000
+#ifdef CONFIG_OMAP4_ERRATA_I688
+#define OMAP4_SRAM_PA		0x40304000
+#define OMAP4_SRAM_VA		0xfe404000
+#else
 #define OMAP4_SRAM_PA		0x40300000
-
+#endif
+#define AM33XX_SRAM_PA		0x40300000
 #endif

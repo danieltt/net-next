@@ -10,6 +10,7 @@
  * published by the Free Software Foundation.
  */
 
+#include <linux/module.h>
 #include <linux/platform_device.h>
 
 #include <plat/iommu.h>
@@ -67,24 +68,22 @@ static struct iommu_device omap4_devices[] = {
 		.pdata = {
 			.name = "ducati",
 			.nr_tlb_entries = 32,
-			.clk_name = "ducati_ick",
+			.clk_name = "ipu_fck",
 			.da_start = 0x0,
 			.da_end = 0xFFFFF000,
 		},
 	},
-#if defined(CONFIG_MPU_TESLA_IOMMU)
 	{
 		.base = OMAP4_MMU2_BASE,
-		.irq = INT_44XX_DSP_MMU,
+		.irq = OMAP44XX_IRQ_TESLA_MMU,
 		.pdata = {
 			.name = "tesla",
 			.nr_tlb_entries = 32,
-			.clk_name = "tesla_ick",
+			.clk_name = "dsp_fck",
 			.da_start = 0x0,
 			.da_end = 0xFFFFF000,
 		},
 	},
-#endif
 };
 #define NR_OMAP4_IOMMU_DEVICES ARRAY_SIZE(omap4_devices)
 static struct platform_device *omap4_iommu_pdev[NR_OMAP4_IOMMU_DEVICES];
@@ -149,7 +148,8 @@ err_out:
 		platform_device_put(omap_iommu_pdev[i]);
 	return err;
 }
-module_init(omap_iommu_init);
+/* must be ready before omap3isp is probed */
+subsys_initcall(omap_iommu_init);
 
 static void __exit omap_iommu_exit(void)
 {

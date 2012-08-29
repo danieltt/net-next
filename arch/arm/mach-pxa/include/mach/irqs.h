@@ -88,13 +88,8 @@
 #define IRQ_U2P		PXA_IRQ(93)	/* USB PHY D+/D- Lines (PXA935) */
 
 #define PXA_GPIO_IRQ_BASE	PXA_IRQ(96)
-#define PXA_GPIO_IRQ_NUM	(192)
-
-#define GPIO_2_x_TO_IRQ(x)	(PXA_GPIO_IRQ_BASE + (x))
-#define IRQ_GPIO(x)	(((x) < 2) ? (IRQ_GPIO0 + (x)) : GPIO_2_x_TO_IRQ(x))
-
-#define IRQ_TO_GPIO_2_x(i)	((i) - PXA_GPIO_IRQ_BASE)
-#define IRQ_TO_GPIO(i)	(((i) < IRQ_GPIO(2)) ? ((i) - IRQ_GPIO0) : IRQ_TO_GPIO_2_x(i))
+#define PXA_NR_BUILTIN_GPIO	(192)
+#define PXA_GPIO_TO_IRQ(x)	(PXA_GPIO_IRQ_BASE + (x))
 
 /*
  * The following interrupts are for board specific purposes. Since
@@ -103,8 +98,20 @@
  * By default, no board IRQ is reserved. It should be finished in
  * custom board since sparse IRQ is already enabled.
  */
-#define IRQ_BOARD_START		(PXA_GPIO_IRQ_BASE + PXA_GPIO_IRQ_NUM)
+#define IRQ_BOARD_START		(PXA_GPIO_IRQ_BASE + PXA_NR_BUILTIN_GPIO)
 
-#define NR_IRQS			(IRQ_BOARD_START)
+#define PXA_NR_IRQS		(IRQ_BOARD_START)
+
+#ifndef __ASSEMBLY__
+struct irq_data;
+struct pt_regs;
+
+void pxa_mask_irq(struct irq_data *);
+void pxa_unmask_irq(struct irq_data *);
+void icip_handle_irq(struct pt_regs *);
+void ichp_handle_irq(struct pt_regs *);
+
+void pxa_init_irq(int irq_nr, int (*set_wake)(struct irq_data *, unsigned int));
+#endif
 
 #endif /* __ASM_MACH_IRQS_H */

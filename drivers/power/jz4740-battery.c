@@ -39,7 +39,7 @@ struct jz_battery {
 	int irq;
 	int charge_irq;
 
-	struct mfd_cell *cell;
+	const struct mfd_cell *cell;
 
 	int status;
 	long voltage;
@@ -67,7 +67,7 @@ static irqreturn_t jz_battery_irq_handler(int irq, void *devid)
 
 static long jz_battery_read_voltage(struct jz_battery *battery)
 {
-	unsigned long t;
+	long t;
 	unsigned long val;
 	long voltage;
 
@@ -258,7 +258,7 @@ static int __devinit jz_battery_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	jz_battery->cell = pdev->dev.platform_data;
+	jz_battery->cell = mfd_get_cell(pdev);
 
 	jz_battery->irq = platform_get_irq(pdev, 0);
 	if (jz_battery->irq < 0) {
@@ -441,17 +441,7 @@ static struct platform_driver jz_battery_driver = {
 	},
 };
 
-static int __init jz_battery_init(void)
-{
-	return platform_driver_register(&jz_battery_driver);
-}
-module_init(jz_battery_init);
-
-static void __exit jz_battery_exit(void)
-{
-	platform_driver_unregister(&jz_battery_driver);
-}
-module_exit(jz_battery_exit);
+module_platform_driver(jz_battery_driver);
 
 MODULE_ALIAS("platform:jz4740-battery");
 MODULE_LICENSE("GPL");

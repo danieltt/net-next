@@ -150,7 +150,6 @@ static int vidioc_querycap(struct file *file, void *fh,
 	strcpy(cap->driver, "tele-video");
 	strcpy(cap->card, "Telegent Poseidon");
 	usb_make_path(p->udev, cap->bus_info, sizeof(cap->bus_info));
-	cap->version = KERNEL_VERSION(0, 0, 1);
 	cap->capabilities = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_TUNER |
 				V4L2_CAP_AUDIO | V4L2_CAP_STREAMING |
 				V4L2_CAP_READWRITE | V4L2_CAP_VBI_CAPTURE;
@@ -764,10 +763,8 @@ static int pd_vidioc_s_fmt(struct poseidon *pd, struct v4l2_pix_format *pix)
 	}
 	ret |= send_set_req(pd, VIDEO_ROSOLU_SEL,
 				vid_resol, &cmd_status);
-	if (ret || cmd_status) {
-		mutex_unlock(&pd->lock);
+	if (ret || cmd_status)
 		return -EBUSY;
-	}
 
 	pix_def->pixelformat = pix->pixelformat; /* save it */
 	pix->height = (context->tvnormid & V4L2_STD_525_60) ?  480 : 576;

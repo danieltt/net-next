@@ -101,6 +101,19 @@ static int platform_pci_resume(struct pci_dev *pdev)
 	return 0;
 }
 
+static void __devinit prepare_shared_info(void)
+{
+#ifdef CONFIG_KEXEC
+	unsigned long addr;
+	struct shared_info *hvm_shared_info;
+
+	addr = alloc_xen_mmio(PAGE_SIZE);
+	hvm_shared_info = ioremap(addr, PAGE_SIZE);
+	memset(hvm_shared_info, 0, PAGE_SIZE);
+	xen_hvm_prepare_kexec(hvm_shared_info, addr >> PAGE_SHIFT);
+#endif
+}
+
 static int __devinit platform_pci_init(struct pci_dev *pdev,
 				       const struct pci_device_id *ent)
 {
@@ -108,6 +121,9 @@ static int __devinit platform_pci_init(struct pci_dev *pdev,
 	long ioaddr;
 	long mmio_addr, mmio_len;
 	unsigned int max_nr_gframes;
+
+	if (!xen_domain())
+		return -ENODEV;
 
 	i = pci_enable_device(pdev);
 	if (i)
@@ -135,6 +151,8 @@ static int __devinit platform_pci_init(struct pci_dev *pdev,
 	platform_mmio = mmio_addr;
 	platform_mmiolen = mmio_len;
 
+	prepare_shared_info();
+
 	if (!xen_have_vector_callback) {
 		ret = xen_allocate_irq(pdev);
 		if (ret) {
@@ -156,9 +174,6 @@ static int __devinit platform_pci_init(struct pci_dev *pdev,
 	if (ret)
 		goto out;
 	xenbus_probe(NULL);
-	ret = xen_setup_shutdown_event();
-	if (ret)
-		goto out;
 	return 0;
 
 out:
@@ -189,11 +204,6 @@ static struct pci_driver platform_driver = {
 
 static int __init platform_pci_module_init(void)
 {
-	/* no unplug has been done, IGNORE hasn't been specified: just
-	 * return now */
-	if (!xen_platform_pci_unplug)
-		return -ENODEV;
-
 	return pci_register_driver(&platform_driver);
 }
 

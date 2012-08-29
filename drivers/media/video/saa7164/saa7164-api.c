@@ -743,7 +743,7 @@ int saa7164_api_configure_dif(struct saa7164_port *port, u32 std)
 int saa7164_api_initialize_dif(struct saa7164_port *port)
 {
 	struct saa7164_dev *dev = port->dev;
-	struct saa7164_port *p = 0;
+	struct saa7164_port *p = NULL;
 	int ret = -EINVAL;
 	u32 std = 0;
 
@@ -926,9 +926,9 @@ int saa7164_api_configure_port_mpeg2ps(struct saa7164_dev *dev,
 
 int saa7164_api_dump_subdevs(struct saa7164_dev *dev, u8 *buf, int len)
 {
-	struct saa7164_port *tsport = 0;
-	struct saa7164_port *encport = 0;
-	struct saa7164_port *vbiport = 0;
+	struct saa7164_port *tsport = NULL;
+	struct saa7164_port *encport = NULL;
+	struct saa7164_port *vbiport = NULL;
 	u32 idx, next_offset;
 	int i;
 	struct tmComResDescrHeader *hdr, *t;
@@ -1340,7 +1340,7 @@ int saa7164_api_enum_subdevs(struct saa7164_dev *dev)
 
 	/* Allocate enough storage for all of the descs */
 	buf = kzalloc(buflen, GFP_KERNEL);
-	if (buf == NULL)
+	if (!buf)
 		return SAA_ERR_NO_RESOURCES;
 
 	/* Retrieve them */
@@ -1367,7 +1367,6 @@ int saa7164_api_i2c_read(struct saa7164_i2c *bus, u8 addr, u32 reglen, u8 *reg,
 	struct saa7164_dev *dev = bus->dev;
 	u16 len = 0;
 	int unitid;
-	u32 regval;
 	u8 buf[256];
 	int ret;
 
@@ -1375,19 +1374,6 @@ int saa7164_api_i2c_read(struct saa7164_i2c *bus, u8 addr, u32 reglen, u8 *reg,
 
 	if (reglen > 4)
 		return -EIO;
-
-	if (reglen == 1)
-		regval = *(reg);
-	else
-	if (reglen == 2)
-		regval = ((*(reg) << 8) || *(reg+1));
-	else
-	if (reglen == 3)
-		regval = ((*(reg) << 16) | (*(reg+1) << 8) | *(reg+2));
-	else
-	if (reglen == 4)
-		regval = ((*(reg) << 24) | (*(reg+1) << 16) |
-			(*(reg+2) << 8) | *(reg+3));
 
 	/* Prepare the send buffer */
 	/* Bytes 00-03 source register length

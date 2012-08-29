@@ -46,7 +46,7 @@
 #include <net/xfrm.h>
 #include <net/checksum.h>
 #include <net/udp.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 
 #include "avc.h"
 #include "objsec.h"
@@ -208,7 +208,7 @@ static int selinux_xfrm_sec_ctx_alloc(struct xfrm_sec_ctx **ctxp,
 	if (!uctx)
 		goto not_from_user;
 
-	if (uctx->ctx_doi != XFRM_SC_ALG_SELINUX)
+	if (uctx->ctx_alg != XFRM_SC_ALG_SELINUX)
 		return -EINVAL;
 
 	str_len = uctx->ctx_len;

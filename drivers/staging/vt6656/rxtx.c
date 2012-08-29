@@ -73,8 +73,6 @@ static int          msglevel                = MSG_LEVEL_INFO;
 /*---------------------  Static Functions  --------------------------*/
 
 /*---------------------  Static Definitions -------------------------*/
-#define CRITICAL_PACKET_LEN      256    // if packet size < 256 -> in-direct send
-                                        //    packet size >= 256 -> direct send
 
 const WORD wTimeStampOff[2][MAX_RATE] = {
         {384, 288, 226, 209, 54, 43, 37, 31, 28, 25, 24, 23}, // Long Preamble
@@ -1938,7 +1936,7 @@ s_vGenerateMACHeader (
  *  Out:
  *      none
  *
- * Return Value: CMD_STATUS_PENDING if MAC Tx resource avaliable; otherwise FALSE
+ * Return Value: CMD_STATUS_PENDING if MAC Tx resource available; otherwise FALSE
  *
 -*/
 
@@ -2441,13 +2439,13 @@ vDMA0_tx_80211(PSDevice  pDevice, struct sk_buff *skb) {
         if (pDevice->bEnableHostWEP) {
             uNodeIndex = 0;
             bNodeExist = TRUE;
-        };
+        }
     }
     else {
         if (pDevice->bEnableHostWEP) {
             if (BSSbIsSTAInNodeDB(pDevice, (PBYTE)(p80211Header->sA3.abyAddr1), &uNodeIndex))
                 bNodeExist = TRUE;
-        };
+        }
         bNeedACK = TRUE;
         pTxBufHead->wFIFOCtl |= FIFOCTL_NEEDACK;
     };

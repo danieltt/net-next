@@ -10,13 +10,16 @@
  *
  * 	Changes:
  */
-#ifdef __KERNEL__
 
 struct dst_entry;
+struct neighbour;
 
 struct netevent_redirect {
 	struct dst_entry *old;
+	struct neighbour *old_neigh;
 	struct dst_entry *new;
+	struct neighbour *new_neigh;
+	const void *daddr;
 };
 
 enum netevent_notif_type {
@@ -28,5 +31,4 @@ extern int register_netevent_notifier(struct notifier_block *nb);
 extern int unregister_netevent_notifier(struct notifier_block *nb);
 extern int call_netevent_notifiers(unsigned long val, void *v);
 
-#endif
 #endif

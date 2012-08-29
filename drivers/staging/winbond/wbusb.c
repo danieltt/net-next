@@ -11,6 +11,7 @@
  */
 #include <net/mac80211.h>
 #include <linux/usb.h>
+#include <linux/module.h>
 
 #include "core.h"
 #include "mds_f.h"
@@ -24,7 +25,7 @@ MODULE_DESCRIPTION("IS89C35 802.11bg WLAN USB Driver");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.1");
 
-static const struct usb_device_id wb35_table[] __devinitconst = {
+static const struct usb_device_id wb35_table[] = {
 	{ USB_DEVICE(0x0416, 0x0035) },
 	{ USB_DEVICE(0x18E8, 0x6201) },
 	{ USB_DEVICE(0x18E8, 0x6206) },
@@ -118,7 +119,9 @@ static void wbsoft_configure_filter(struct ieee80211_hw *dev,
 	*total_flags = new_flags;
 }
 
-static void wbsoft_tx(struct ieee80211_hw *dev, struct sk_buff *skb)
+static void wbsoft_tx(struct ieee80211_hw *dev,
+		      struct ieee80211_tx_control *control,
+		      struct sk_buff *skb)
 {
 	struct wbsoft_priv *priv = dev->priv;
 
@@ -277,7 +280,7 @@ static int wbsoft_config(struct ieee80211_hw *dev, u32 changed)
 	return 0;
 }
 
-static u64 wbsoft_get_tsf(struct ieee80211_hw *dev)
+static u64 wbsoft_get_tsf(struct ieee80211_hw *dev, struct ieee80211_vif *vif)
 {
 	printk("wbsoft_get_tsf called\n");
 	return 0;
@@ -746,20 +749,18 @@ static int wb35_probe(struct usb_interface *intf,
 	struct usb_host_interface *interface;
 	struct ieee80211_hw *dev;
 	struct wbsoft_priv *priv;
-	int nr, err;
+	int err;
 	u32 ltmp;
 
 	usb_get_dev(udev);
 
 	/* Check the device if it already be opened */
-	nr = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
+	err = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
 			     0x01,
 			     USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
 			     0x0, 0x400, &ltmp, 4, HZ * 100);
-	if (nr < 0) {
-		err = nr;
+	if (err < 0)
 		goto error;
-	}
 
 	/* Is already initialized? */
 	ltmp = cpu_to_le32(ltmp);
@@ -864,15 +865,4 @@ static struct usb_driver wb35_driver = {
 	.disconnect	= wb35_disconnect,
 };
 
-static int __init wb35_init(void)
-{
-	return usb_register(&wb35_driver);
-}
-
-static void __exit wb35_exit(void)
-{
-	usb_deregister(&wb35_driver);
-}
-
-module_init(wb35_init);
-module_exit(wb35_exit);
+module_usb_driver(wb35_driver);

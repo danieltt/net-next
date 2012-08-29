@@ -28,12 +28,13 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/vmalloc.h>
-#include <asm/div64.h>
+#include <linux/math64.h>
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/nand.h>
+#include <linux/mtd/nand_bch.h>
 #include <linux/mtd/partitions.h>
 #include <linux/delay.h>
 #include <linux/list.h>
@@ -108,6 +109,7 @@ static unsigned int rptwear = 0;
 static unsigned int overridesize = 0;
 static char *cache_file = NULL;
 static unsigned int bbt;
+static unsigned int bch;
 
 module_param(first_id_byte,  uint, 0400);
 module_param(second_id_byte, uint, 0400);
@@ -132,6 +134,7 @@ module_param(rptwear,        uint, 0400);
 module_param(overridesize,   uint, 0400);
 module_param(cache_file,     charp, 0400);
 module_param(bbt,	     uint, 0400);
+module_param(bch,	     uint, 0400);
 
 MODULE_PARM_DESC(first_id_byte,  "The first byte returned by NAND Flash 'read ID' command (manufacturer ID)");
 MODULE_PARM_DESC(second_id_byte, "The second byte returned by NAND Flash 'read ID' command (chip ID)");
@@ -159,12 +162,14 @@ MODULE_PARM_DESC(bitflips,       "Maximum number of random bit flips per page (z
 MODULE_PARM_DESC(gravepages,     "Pages that lose data [: maximum reads (defaults to 3)]"
 				 " separated by commas e.g. 1401:2 means page 1401"
 				 " can be read only twice before failing");
-MODULE_PARM_DESC(rptwear,        "Number of erases inbetween reporting wear, if not zero");
+MODULE_PARM_DESC(rptwear,        "Number of erases between reporting wear, if not zero");
 MODULE_PARM_DESC(overridesize,   "Specifies the NAND Flash size overriding the ID bytes. "
 				 "The size is specified in erase blocks and as the exponent of a power of two"
 				 " e.g. 5 means a size of 32 erase blocks");
 MODULE_PARM_DESC(cache_file,     "File to use to cache nand pages instead of memory");
 MODULE_PARM_DESC(bbt,		 "0 OOB, 1 BBT with marker in OOB, 2 BBT with marker in data area");
+MODULE_PARM_DESC(bch,		 "Enable BCH ecc and set how many bits should "
+				 "be correctable in 512-byte blocks");
 
 /* The largest possible page size */
 #define NS_LARGEST_PAGE_SIZE	4096
@@ -263,7 +268,6 @@ MODULE_PARM_DESC(bbt,		 "0 OOB, 1 BBT with marker in OOB, 2 BBT with marker in d
 #define OPT_PAGE512      0x00000002 /* 512-byte  page chips */
 #define OPT_PAGE2048     0x00000008 /* 2048-byte page chips */
 #define OPT_SMARTMEDIA   0x00000010 /* SmartMedia technology chips */
-#define OPT_AUTOINCR     0x00000020 /* page number auto incrementation is possible */
 #define OPT_PAGE512_8BIT 0x00000040 /* 512-byte page chips with 8-bit bus width */
 #define OPT_PAGE4096     0x00000080 /* 4096-byte page chips */
 #define OPT_LARGEPAGE    (OPT_PAGE2048 | OPT_PAGE4096) /* 2048 & 4096-byte page chips */
@@ -542,12 +546,6 @@ static char *get_partition_name(int i)
 	return kstrdup(buf, GFP_KERNEL);
 }
 
-static uint64_t divide(uint64_t n, uint32_t d)
-{
-	do_div(n, d);
-	return n;
-}
-
 /*
  * Initialize the nandsim structure.
  *
@@ -576,7 +574,7 @@ static int init_nandsim(struct mtd_info *mtd)
 	ns->geom.oobsz    = mtd->oobsize;
 	ns->geom.secsz    = mtd->erasesize;
 	ns->geom.pgszoob  = ns->geom.pgsz + ns->geom.oobsz;
-	ns->geom.pgnum    = divide(ns->geom.totsz, ns->geom.pgsz);
+	ns->geom.pgnum    = div_u64(ns->geom.totsz, ns->geom.pgsz);
 	ns->geom.totszoob = ns->geom.totsz + (uint64_t)ns->geom.pgnum * ns->geom.oobsz;
 	ns->geom.secshift = ffs(ns->geom.secsz) - 1;
 	ns->geom.pgshift  = chip->page_shift;
@@ -589,7 +587,7 @@ static int init_nandsim(struct mtd_info *mtd)
 		ns->options |= OPT_PAGE256;
 	}
 	else if (ns->geom.pgsz == 512) {
-		ns->options |= (OPT_PAGE512 | OPT_AUTOINCR);
+		ns->options |= OPT_PAGE512;
 		if (ns->busw == 8)
 			ns->options |= OPT_PAGE512_8BIT;
 	} else if (ns->geom.pgsz == 2048) {
@@ -658,8 +656,6 @@ static int init_nandsim(struct mtd_info *mtd)
         for (i = 0; nand_flash_ids[i].name != NULL; i++) {
                 if (second_id_byte != nand_flash_ids[i].id)
                         continue;
-		if (!(nand_flash_ids[i].options & NAND_NO_AUTOINCR))
-			ns->options |= OPT_AUTOINCR;
 	}
 
 	if (ns->busw == 16)
@@ -732,7 +728,7 @@ static int parse_badblocks(struct nandsim *ns, struct mtd_info *mtd)
 			return -EINVAL;
 		}
 		offset = erase_block_no * ns->geom.secsz;
-		if (mtd->block_markbad(mtd, offset)) {
+		if (mtd_block_markbad(mtd, offset)) {
 			NS_ERR("invalid badblocks.\n");
 			return -EINVAL;
 		}
@@ -919,7 +915,7 @@ static int setup_wear_reporting(struct mtd_info *mtd)
 
 	if (!rptwear)
 		return 0;
-	wear_eb_count = divide(mtd->size, mtd->erasesize);
+	wear_eb_count = div_u64(mtd->size, mtd->erasesize);
 	mem = wear_eb_count * sizeof(unsigned long);
 	if (mem / sizeof(unsigned long) != wear_eb_count) {
 		NS_ERR("Too many erase blocks for wear reporting\n");
@@ -1931,20 +1927,8 @@ static u_char ns_nand_read_byte(struct mtd_info *mtd)
 	if (ns->regs.count == ns->regs.num) {
 		NS_DBG("read_byte: all bytes were read\n");
 
-		/*
-		 * The OPT_AUTOINCR allows to read next consecutive pages without
-		 * new read operation cycle.
-		 */
-		if ((ns->options & OPT_AUTOINCR) && NS_STATE(ns->state) == STATE_DATAOUT) {
-			ns->regs.count = 0;
-			if (ns->regs.row + 1 < ns->geom.pgnum)
-				ns->regs.row += 1;
-			NS_DBG("read_byte: switch to the next page (%#x)\n", ns->regs.row);
-			do_state_action(ns, ACTION_CPY);
-		}
-		else if (NS_STATE(ns->nxstate) == STATE_READY)
+		if (NS_STATE(ns->nxstate) == STATE_READY)
 			switch_state(ns);
-
 	}
 
 	return outb;
@@ -2198,14 +2182,7 @@ static void ns_nand_read_buf(struct mtd_info *mtd, u_char *buf, int len)
 	ns->regs.count += len;
 
 	if (ns->regs.count == ns->regs.num) {
-		if ((ns->options & OPT_AUTOINCR) && NS_STATE(ns->state) == STATE_DATAOUT) {
-			ns->regs.count = 0;
-			if (ns->regs.row + 1 < ns->geom.pgnum)
-				ns->regs.row += 1;
-			NS_DBG("read_buf: switch to the next page (%#x)\n", ns->regs.row);
-			do_state_action(ns, ACTION_CPY);
-		}
-		else if (NS_STATE(ns->nxstate) == STATE_READY)
+		if (NS_STATE(ns->nxstate) == STATE_READY)
 			switch_state(ns);
 	}
 
@@ -2268,9 +2245,9 @@ static int __init ns_init_module(void)
 
 	switch (bbt) {
 	case 2:
-		 chip->options |= NAND_USE_FLASH_BBT_NO_OOB;
+		 chip->bbt_options |= NAND_BBT_NO_OOB;
 	case 1:
-		 chip->options |= NAND_USE_FLASH_BBT;
+		 chip->bbt_options |= NAND_BBT_USE_FLASH;
 	case 0:
 		break;
 	default:
@@ -2309,7 +2286,43 @@ static int __init ns_init_module(void)
 	if ((retval = parse_gravepages()) != 0)
 		goto error;
 
-	if ((retval = nand_scan(nsmtd, 1)) != 0) {
+	retval = nand_scan_ident(nsmtd, 1, NULL);
+	if (retval) {
+		NS_ERR("cannot scan NAND Simulator device\n");
+		if (retval > 0)
+			retval = -ENXIO;
+		goto error;
+	}
+
+	if (bch) {
+		unsigned int eccsteps, eccbytes;
+		if (!mtd_nand_has_bch()) {
+			NS_ERR("BCH ECC support is disabled\n");
+			retval = -EINVAL;
+			goto error;
+		}
+		/* use 512-byte ecc blocks */
+		eccsteps = nsmtd->writesize/512;
+		eccbytes = (bch*13+7)/8;
+		/* do not bother supporting small page devices */
+		if ((nsmtd->oobsize < 64) || !eccsteps) {
+			NS_ERR("bch not available on small page devices\n");
+			retval = -EINVAL;
+			goto error;
+		}
+		if ((eccbytes*eccsteps+2) > nsmtd->oobsize) {
+			NS_ERR("invalid bch value %u\n", bch);
+			retval = -EINVAL;
+			goto error;
+		}
+		chip->ecc.mode = NAND_ECC_SOFT_BCH;
+		chip->ecc.size = 512;
+		chip->ecc.bytes = eccbytes;
+		NS_INFO("using %u-bit/%u bytes BCH ECC\n", bch, chip->ecc.size);
+	}
+
+	retval = nand_scan_tail(nsmtd);
+	if (retval) {
 		NS_ERR("can't register NAND Simulator\n");
 		if (retval > 0)
 			retval = -ENXIO;
@@ -2342,7 +2355,9 @@ static int __init ns_init_module(void)
 		goto err_exit;
 
 	/* Register NAND partitions */
-	if ((retval = add_mtd_partitions(nsmtd, &nand->partitions[0], nand->nbparts)) != 0)
+	retval = mtd_device_register(nsmtd, &nand->partitions[0],
+				     nand->nbparts);
+	if (retval != 0)
 		goto err_exit;
 
         return 0;

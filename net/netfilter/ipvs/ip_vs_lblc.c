@@ -63,6 +63,8 @@
 #define CHECK_EXPIRE_INTERVAL   (60*HZ)
 #define ENTRY_TIMEOUT           (6*60*HZ)
 
+#define DEFAULT_EXPIRATION	(24*60*60*HZ)
+
 /*
  *    It is for full expiration check.
  *    When there is no partial expiration check (garbage collection)
@@ -112,7 +114,7 @@ struct ip_vs_lblc_table {
 /*
  *      IPVS LBLC sysctl table
  */
-
+#ifdef CONFIG_SYSCTL
 static ctl_table vs_vars_table[] = {
 	{
 		.procname	= "lblc_expiration",
@@ -123,12 +125,13 @@ static ctl_table vs_vars_table[] = {
 	},
 	{ }
 };
+#endif
 
 static inline void ip_vs_lblc_free(struct ip_vs_lblc_entry *en)
 {
 	list_del(&en->list);
 	/*
-	 * We don't kfree dest because it is refered either by its service
+	 * We don't kfree dest because it is referred either by its service
 	 * or the trash dest list.
 	 */
 	atomic_dec(&en->dest->refcnt);
@@ -139,7 +142,7 @@ static inline void ip_vs_lblc_free(struct ip_vs_lblc_entry *en)
 /*
  *	Returns hash value for IPVS LBLC entry
  */
-static inline unsigned
+static inline unsigned int
 ip_vs_lblc_hashkey(int af, const union nf_inet_addr *addr)
 {
 	__be32 addr_fold = addr->ip;
@@ -160,7 +163,7 @@ ip_vs_lblc_hashkey(int af, const union nf_inet_addr *addr)
 static void
 ip_vs_lblc_hash(struct ip_vs_lblc_table *tbl, struct ip_vs_lblc_entry *en)
 {
-	unsigned hash = ip_vs_lblc_hashkey(en->af, &en->addr);
+	unsigned int hash = ip_vs_lblc_hashkey(en->af, &en->addr);
 
 	list_add(&en->list, &tbl->bucket[hash]);
 	atomic_inc(&tbl->entries);
@@ -175,7 +178,7 @@ static inline struct ip_vs_lblc_entry *
 ip_vs_lblc_get(int af, struct ip_vs_lblc_table *tbl,
 	       const union nf_inet_addr *addr)
 {
-	unsigned hash = ip_vs_lblc_hashkey(af, addr);
+	unsigned int hash = ip_vs_lblc_hashkey(af, addr);
 	struct ip_vs_lblc_entry *en;
 
 	list_for_each_entry(en, &tbl->bucket[hash], list)
@@ -199,10 +202,8 @@ ip_vs_lblc_new(struct ip_vs_lblc_table *tbl, const union nf_inet_addr *daddr,
 	en = ip_vs_lblc_get(dest->af, tbl, daddr);
 	if (!en) {
 		en = kmalloc(sizeof(*en), GFP_ATOMIC);
-		if (!en) {
-			pr_err("%s(): no memory\n", __func__);
+		if (!en)
 			return NULL;
-		}
 
 		en->af = dest->af;
 		ip_vs_addr_copy(dest->af, &en->addr, daddr);
@@ -238,6 +239,15 @@ static void ip_vs_lblc_flush(struct ip_vs_lblc_table *tbl)
 	}
 }
 
+static int sysctl_lblc_expiration(struct ip_vs_service *svc)
+{
+#ifdef CONFIG_SYSCTL
+	struct netns_ipvs *ipvs = net_ipvs(svc->net);
+	return ipvs->sysctl_lblc_expiration;
+#else
+	return DEFAULT_EXPIRATION;
+#endif
+}
 
 static inline void ip_vs_lblc_full_check(struct ip_vs_service *svc)
 {
@@ -245,7 +255,6 @@ static inline void ip_vs_lblc_full_check(struct ip_vs_service *svc)
 	struct ip_vs_lblc_entry *en, *nxt;
 	unsigned long now = jiffies;
 	int i, j;
-	struct netns_ipvs *ipvs = net_ipvs(svc->net);
 
 	for (i=0, j=tbl->rover; i<IP_VS_LBLC_TAB_SIZE; i++) {
 		j = (j + 1) & IP_VS_LBLC_TAB_MASK;
@@ -254,7 +263,7 @@ static inline void ip_vs_lblc_full_check(struct ip_vs_service *svc)
 		list_for_each_entry_safe(en, nxt, &tbl->bucket[j], list) {
 			if (time_before(now,
 					en->lastuse +
-					ipvs->sysctl_lblc_expiration))
+					sysctl_lblc_expiration(svc)))
 				continue;
 
 			ip_vs_lblc_free(en);
@@ -333,11 +342,10 @@ static int ip_vs_lblc_init_svc(struct ip_vs_service *svc)
 	/*
 	 *    Allocate the ip_vs_lblc_table for this service
 	 */
-	tbl = kmalloc(sizeof(*tbl), GFP_ATOMIC);
-	if (tbl == NULL) {
-		pr_err("%s(): no memory\n", __func__);
+	tbl = kmalloc(sizeof(*tbl), GFP_KERNEL);
+	if (tbl == NULL)
 		return -ENOMEM;
-	}
+
 	svc->sched_data = tbl;
 	IP_VS_DBG(6, "LBLC hash table (memory=%Zdbytes) allocated for "
 		  "current service\n", sizeof(*tbl));
@@ -538,9 +546,13 @@ static struct ip_vs_scheduler ip_vs_lblc_scheduler =
 /*
  *  per netns init.
  */
+#ifdef CONFIG_SYSCTL
 static int __net_init __ip_vs_lblc_init(struct net *net)
 {
 	struct netns_ipvs *ipvs = net_ipvs(net);
+
+	if (!ipvs)
+		return -ENOENT;
 
 	if (!net_eq(net, &init_net)) {
 		ipvs->lblc_ctl_table = kmemdup(vs_vars_table,
@@ -550,19 +562,16 @@ static int __net_init __ip_vs_lblc_init(struct net *net)
 			return -ENOMEM;
 	} else
 		ipvs->lblc_ctl_table = vs_vars_table;
-	ipvs->sysctl_lblc_expiration = 24*60*60*HZ;
+	ipvs->sysctl_lblc_expiration = DEFAULT_EXPIRATION;
 	ipvs->lblc_ctl_table[0].data = &ipvs->sysctl_lblc_expiration;
 
-#ifdef CONFIG_SYSCTL
 	ipvs->lblc_ctl_header =
-		register_net_sysctl_table(net, net_vs_ctl_path,
-					  ipvs->lblc_ctl_table);
+		register_net_sysctl(net, "net/ipv4/vs", ipvs->lblc_ctl_table);
 	if (!ipvs->lblc_ctl_header) {
 		if (!net_eq(net, &init_net))
 			kfree(ipvs->lblc_ctl_table);
 		return -ENOMEM;
 	}
-#endif
 
 	return 0;
 }
@@ -571,13 +580,18 @@ static void __net_exit __ip_vs_lblc_exit(struct net *net)
 {
 	struct netns_ipvs *ipvs = net_ipvs(net);
 
-#ifdef CONFIG_SYSCTL
 	unregister_net_sysctl_table(ipvs->lblc_ctl_header);
-#endif
 
 	if (!net_eq(net, &init_net))
 		kfree(ipvs->lblc_ctl_table);
 }
+
+#else
+
+static int __net_init __ip_vs_lblc_init(struct net *net) { return 0; }
+static void __net_exit __ip_vs_lblc_exit(struct net *net) { }
+
+#endif
 
 static struct pernet_operations ip_vs_lblc_ops = {
 	.init = __ip_vs_lblc_init,

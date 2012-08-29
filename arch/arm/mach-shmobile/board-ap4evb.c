@@ -24,9 +24,9 @@
 #include <linux/irq.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
-#include <linux/mfd/sh_mobile_sdhi.h>
 #include <linux/mfd/tmio.h>
 #include <linux/mmc/host.h>
+#include <linux/mmc/sh_mobile_sdhi.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/partitions.h>
 #include <linux/mtd/physmap.h>
@@ -34,6 +34,8 @@
 #include <linux/i2c.h>
 #include <linux/i2c/tsc2007.h>
 #include <linux/io.h>
+#include <linux/regulator/fixed.h>
+#include <linux/regulator/machine.h>
 #include <linux/smsc911x.h>
 #include <linux/sh_intc.h>
 #include <linux/sh_clk.h>
@@ -42,12 +44,15 @@
 #include <linux/leds.h>
 #include <linux/input/sh_keysc.h>
 #include <linux/usb/r8a66597.h>
+#include <linux/pm_clock.h>
+#include <linux/dma-mapping.h>
 
 #include <media/sh_mobile_ceu.h>
 #include <media/sh_mobile_csi2.h>
 #include <media/soc_camera.h>
 
 #include <sound/sh_fsi.h>
+#include <sound/simple_card.h>
 
 #include <video/sh_mobile_hdmi.h>
 #include <video/sh_mobile_lcdc.h>
@@ -59,8 +64,6 @@
 
 #include <asm/mach-types.h>
 #include <asm/mach/arch.h>
-#include <asm/mach/map.h>
-#include <asm/mach/time.h>
 #include <asm/setup.h>
 
 /*
@@ -158,6 +161,27 @@
  * CN12: 3.3v
  */
 
+/* Dummy supplies, where voltage doesn't matter */
+static struct regulator_consumer_supply fixed1v8_power_consumers[] =
+{
+	/* J22 default position: 1.8V */
+	REGULATOR_SUPPLY("vmmc", "sh_mobile_sdhi.1"),
+	REGULATOR_SUPPLY("vqmmc", "sh_mobile_sdhi.1"),
+	REGULATOR_SUPPLY("vmmc", "sh_mmcif.0"),
+	REGULATOR_SUPPLY("vqmmc", "sh_mmcif.0"),
+};
+
+static struct regulator_consumer_supply fixed3v3_power_consumers[] =
+{
+	REGULATOR_SUPPLY("vmmc", "sh_mobile_sdhi.0"),
+	REGULATOR_SUPPLY("vqmmc", "sh_mobile_sdhi.0"),
+};
+
+static struct regulator_consumer_supply dummy_supplies[] = {
+	REGULATOR_SUPPLY("vddvario", "smsc911x"),
+	REGULATOR_SUPPLY("vdd33a", "smsc911x"),
+};
+
 /* MTD */
 static struct mtd_partition nor_flash_partitions[] = {
 	{
@@ -198,8 +222,8 @@ static struct physmap_flash_data nor_flash_data = {
 
 static struct resource nor_flash_resources[] = {
 	[0]	= {
-		.start	= 0x00000000,
-		.end	= 0x08000000 - 1,
+		.start	= 0x20000000, /* CS0 shadow instead of regular CS0 */
+		.end	= 0x28000000 - 1, /* needed by USB MASK ROM boot */
 		.flags	= IORESOURCE_MEM,
 	}
 };
@@ -249,6 +273,35 @@ static int slot_cn7_get_cd(struct platform_device *pdev)
 {
 	return !gpio_get_value(GPIO_PORT41);
 }
+/* MERAM */
+static struct sh_mobile_meram_info meram_info = {
+	.addr_mode      = SH_MOBILE_MERAM_MODE1,
+};
+
+static struct resource meram_resources[] = {
+	[0] = {
+		.name	= "regs",
+		.start	= 0xe8000000,
+		.end	= 0xe807ffff,
+		.flags	= IORESOURCE_MEM,
+	},
+	[1] = {
+		.name	= "meram",
+		.start	= 0xe8080000,
+		.end	= 0xe81fffff,
+		.flags	= IORESOURCE_MEM,
+	},
+};
+
+static struct platform_device meram_device = {
+	.name           = "sh_mobile_meram",
+	.id             = 0,
+	.num_resources  = ARRAY_SIZE(meram_resources),
+	.resource       = meram_resources,
+	.dev            = {
+		.platform_data = &meram_info,
+	},
+};
 
 /* SH_MMCIF */
 static struct resource sh_mmcif_resources[] = {
@@ -270,15 +323,6 @@ static struct resource sh_mmcif_resources[] = {
 	},
 };
 
-static struct sh_mmcif_dma sh_mmcif_dma = {
-	.chan_priv_rx	= {
-		.slave_id	= SHDMA_SLAVE_MMCIF_RX,
-	},
-	.chan_priv_tx	= {
-		.slave_id	= SHDMA_SLAVE_MMCIF_TX,
-	},
-};
-
 static struct sh_mmcif_plat_data sh_mmcif_plat = {
 	.sup_pclk	= 0,
 	.ocr		= MMC_VDD_165_195 | MMC_VDD_32_33 | MMC_VDD_33_34,
@@ -286,7 +330,8 @@ static struct sh_mmcif_plat_data sh_mmcif_plat = {
 			  MMC_CAP_8_BIT_DATA |
 			  MMC_CAP_NEEDS_POLL,
 	.get_cd		= slot_cn7_get_cd,
-	.dma		= &sh_mmcif_dma,
+	.slave_id_tx	= SHDMA_SLAVE_MMCIF_TX,
+	.slave_id_rx	= SHDMA_SLAVE_MMCIF_RX,
 };
 
 static struct platform_device sh_mmcif_device = {
@@ -312,12 +357,20 @@ static struct resource sdhi0_resources[] = {
 	[0] = {
 		.name	= "SDHI0",
 		.start  = 0xe6850000,
-		.end    = 0xe68501ff,
+		.end    = 0xe68500ff,
 		.flags  = IORESOURCE_MEM,
 	},
 	[1] = {
-		.start  = evt2irq(0x0e00) /* SDHI0 */,
-		.flags  = IORESOURCE_IRQ,
+		.start	= evt2irq(0x0e00) /* SDHI0_SDHI0I0 */,
+		.flags	= IORESOURCE_IRQ,
+	},
+	[2] = {
+		.start	= evt2irq(0x0e20) /* SDHI0_SDHI0I1 */,
+		.flags	= IORESOURCE_IRQ,
+	},
+	[3] = {
+		.start	= evt2irq(0x0e40) /* SDHI0_SDHI0I2 */,
+		.flags	= IORESOURCE_IRQ,
 	},
 };
 
@@ -345,12 +398,20 @@ static struct resource sdhi1_resources[] = {
 	[0] = {
 		.name	= "SDHI1",
 		.start  = 0xe6860000,
-		.end    = 0xe68601ff,
+		.end    = 0xe68600ff,
 		.flags  = IORESOURCE_MEM,
 	},
 	[1] = {
-		.start  = evt2irq(0x0e80),
-		.flags  = IORESOURCE_IRQ,
+		.start	= evt2irq(0x0e80), /* SDHI1_SDHI1I0 */
+		.flags	= IORESOURCE_IRQ,
+	},
+	[2] = {
+		.start	= evt2irq(0x0ea0), /* SDHI1_SDHI1I1 */
+		.flags	= IORESOURCE_IRQ,
+	},
+	[3] = {
+		.start	= evt2irq(0x0ec0), /* SDHI1_SDHI1I2 */
+		.flags	= IORESOURCE_IRQ,
 	},
 };
 
@@ -404,66 +465,6 @@ static struct platform_device usb1_host_device = {
 	.resource	= usb1_host_resources,
 };
 
-const static struct fb_videomode ap4evb_lcdc_modes[] = {
-	{
-#ifdef CONFIG_AP4EVB_QHD
-		.name		= "R63302(QHD)",
-		.xres		= 544,
-		.yres		= 961,
-		.left_margin	= 72,
-		.right_margin	= 600,
-		.hsync_len	= 16,
-		.upper_margin	= 8,
-		.lower_margin	= 8,
-		.vsync_len	= 2,
-		.sync		= FB_SYNC_VERT_HIGH_ACT | FB_SYNC_HOR_HIGH_ACT,
-#else
-		.name		= "WVGA Panel",
-		.xres		= 800,
-		.yres		= 480,
-		.left_margin	= 220,
-		.right_margin	= 110,
-		.hsync_len	= 70,
-		.upper_margin	= 20,
-		.lower_margin	= 5,
-		.vsync_len	= 5,
-		.sync		= 0,
-#endif
-	},
-};
-
-static struct sh_mobile_lcdc_info lcdc_info = {
-	.ch[0] = {
-		.chan = LCDC_CHAN_MAINLCD,
-		.bpp = 16,
-		.lcd_cfg = ap4evb_lcdc_modes,
-		.num_cfg = ARRAY_SIZE(ap4evb_lcdc_modes),
-	}
-};
-
-static struct resource lcdc_resources[] = {
-	[0] = {
-		.name	= "LCDC",
-		.start	= 0xfe940000, /* P4-only space */
-		.end	= 0xfe943fff,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= intcs_evt2irq(0x580),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct platform_device lcdc_device = {
-	.name		= "sh_mobile_lcdc_fb",
-	.num_resources	= ARRAY_SIZE(lcdc_resources),
-	.resource	= lcdc_resources,
-	.dev	= {
-		.platform_data	= &lcdc_info,
-		.coherent_dma_mask = ~0,
-	},
-};
-
 /*
  * QHD display
  */
@@ -507,6 +508,35 @@ static struct platform_device keysc_device = {
 };
 
 /* MIPI-DSI */
+static int sh_mipi_set_dot_clock(struct platform_device *pdev,
+				 void __iomem *base,
+				 int enable)
+{
+	struct clk *pck = clk_get(&pdev->dev, "dsip_clk");
+
+	if (IS_ERR(pck))
+		return PTR_ERR(pck);
+
+	if (enable) {
+		/*
+		 * DSIPCLK	= 24MHz
+		 * D-PHY	= DSIPCLK * ((0x6*2)+1) = 312MHz (see .phyctrl)
+		 * HsByteCLK	= D-PHY/8 = 39MHz
+		 *
+		 *  X * Y * FPS =
+		 * (544+72+600+16) * (961+8+8+2) * 30 = 36.1MHz
+		 */
+		clk_set_rate(pck, clk_round_rate(pck, 24000000));
+		clk_enable(pck);
+	} else {
+		clk_disable(pck);
+	}
+
+	clk_put(pck);
+
+	return 0;
+}
+
 static struct resource mipidsi0_resources[] = {
 	[0] = {
 		.start  = 0xffc60000,
@@ -520,10 +550,17 @@ static struct resource mipidsi0_resources[] = {
 	},
 };
 
+static struct sh_mobile_lcdc_info lcdc_info;
+
 static struct sh_mipi_dsi_info mipidsi0_info = {
 	.data_format	= MIPI_RGB888,
 	.lcd_chan	= &lcdc_info.ch[0],
+	.lane		= 2,
 	.vsynw_offset	= 17,
+	.phyctrl	= 0x6 << 8,
+	.flags		= SH_MIPI_DSI_SYNC_PULSES_MODE |
+			  SH_MIPI_DSI_HSbyteCLK,
+	.set_dot_clock	= sh_mipi_set_dot_clock,
 };
 
 static struct platform_device mipidsi0_device = {
@@ -541,6 +578,81 @@ static struct platform_device *qhd_devices[] __initdata = {
 	&keysc_device,
 };
 #endif /* CONFIG_AP4EVB_QHD */
+
+/* LCDC0 */
+static const struct fb_videomode ap4evb_lcdc_modes[] = {
+	{
+#ifdef CONFIG_AP4EVB_QHD
+		.name		= "R63302(QHD)",
+		.xres		= 544,
+		.yres		= 961,
+		.left_margin	= 72,
+		.right_margin	= 600,
+		.hsync_len	= 16,
+		.upper_margin	= 8,
+		.lower_margin	= 8,
+		.vsync_len	= 2,
+		.sync		= FB_SYNC_VERT_HIGH_ACT | FB_SYNC_HOR_HIGH_ACT,
+#else
+		.name		= "WVGA Panel",
+		.xres		= 800,
+		.yres		= 480,
+		.left_margin	= 220,
+		.right_margin	= 110,
+		.hsync_len	= 70,
+		.upper_margin	= 20,
+		.lower_margin	= 5,
+		.vsync_len	= 5,
+		.sync		= 0,
+#endif
+	},
+};
+
+static const struct sh_mobile_meram_cfg lcd_meram_cfg = {
+	.icb[0] = {
+		.meram_size     = 0x40,
+	},
+	.icb[1] = {
+		.meram_size     = 0x40,
+	},
+};
+
+static struct sh_mobile_lcdc_info lcdc_info = {
+	.meram_dev = &meram_info,
+	.ch[0] = {
+		.chan = LCDC_CHAN_MAINLCD,
+		.fourcc = V4L2_PIX_FMT_RGB565,
+		.lcd_modes = ap4evb_lcdc_modes,
+		.num_modes = ARRAY_SIZE(ap4evb_lcdc_modes),
+		.meram_cfg = &lcd_meram_cfg,
+#ifdef CONFIG_AP4EVB_QHD
+		.tx_dev = &mipidsi0_device,
+#endif
+	}
+};
+
+static struct resource lcdc_resources[] = {
+	[0] = {
+		.name	= "LCDC",
+		.start	= 0xfe940000, /* P4-only space */
+		.end	= 0xfe943fff,
+		.flags	= IORESOURCE_MEM,
+	},
+	[1] = {
+		.start	= intcs_evt2irq(0x580),
+		.flags	= IORESOURCE_IRQ,
+	},
+};
+
+static struct platform_device lcdc_device = {
+	.name		= "sh_mobile_lcdc_fb",
+	.num_resources	= ARRAY_SIZE(lcdc_resources),
+	.resource	= lcdc_resources,
+	.dev	= {
+		.platform_data	= &lcdc_info,
+		.coherent_dma_mask = ~0,
+	},
+};
 
 /* FSI */
 #define IRQ_FSI		evt2irq(0x1840)
@@ -660,30 +772,18 @@ fsi_set_rate_end:
 	return ret;
 }
 
-static int fsi_set_rate(struct device *dev, int is_porta, int rate, int enable)
-{
-	int ret;
-
-	if (is_porta)
-		ret = fsi_ak4642_set_rate(dev, rate, enable);
-	else
-		ret = fsi_hdmi_set_rate(dev, rate, enable);
-
-	return ret;
-}
-
 static struct sh_fsi_platform_info fsi_info = {
-	.porta_flags = SH_FSI_BRS_INV |
-		       SH_FSI_OUT_SLAVE_MODE |
-		       SH_FSI_IN_SLAVE_MODE |
-		       SH_FSI_OFMT(PCM) |
-		       SH_FSI_IFMT(PCM),
-
-	.portb_flags = SH_FSI_BRS_INV |
-		       SH_FSI_BRM_INV |
-		       SH_FSI_LRS_INV |
-		       SH_FSI_OFMT(SPDIF),
-	.set_rate = fsi_set_rate,
+	.port_a = {
+		.flags		= SH_FSI_BRS_INV,
+		.set_rate	= fsi_ak4642_set_rate,
+	},
+	.port_b = {
+		.flags		= SH_FSI_BRS_INV |
+				  SH_FSI_BRM_INV |
+				  SH_FSI_LRS_INV |
+				  SH_FSI_FMT_SPDIF,
+		.set_rate	= fsi_hdmi_set_rate,
+	},
 };
 
 static struct resource fsi_resources[] = {
@@ -709,52 +809,35 @@ static struct platform_device fsi_device = {
 	},
 };
 
+static struct asoc_simple_dai_init_info fsi2_ak4643_init_info = {
+	.fmt		= SND_SOC_DAIFMT_LEFT_J,
+	.codec_daifmt	= SND_SOC_DAIFMT_CBM_CFM,
+	.cpu_daifmt	= SND_SOC_DAIFMT_CBS_CFS,
+	.sysclk		= 11289600,
+};
+
+static struct asoc_simple_card_info fsi2_ak4643_info = {
+	.name		= "AK4643",
+	.card		= "FSI2A-AK4643",
+	.cpu_dai	= "fsia-dai",
+	.codec		= "ak4642-codec.0-0013",
+	.platform	= "sh_fsi2",
+	.codec_dai	= "ak4642-hifi",
+	.init		= &fsi2_ak4643_init_info,
+};
+
 static struct platform_device fsi_ak4643_device = {
-	.name		= "sh_fsi2_a_ak4643",
-};
-
-static struct sh_mobile_lcdc_info sh_mobile_lcdc1_info = {
-	.clock_source = LCDC_CLK_EXTERNAL,
-	.ch[0] = {
-		.chan = LCDC_CHAN_MAINLCD,
-		.bpp = 16,
-		.interface_type = RGB24,
-		.clock_divider = 1,
-		.flags = LCDC_FLAGS_DWPOL,
-	}
-};
-
-static struct resource lcdc1_resources[] = {
-	[0] = {
-		.name	= "LCDC1",
-		.start	= 0xfe944000,
-		.end	= 0xfe947fff,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= intcs_evt2irq(0x1780),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct platform_device lcdc1_device = {
-	.name		= "sh_mobile_lcdc_fb",
-	.num_resources	= ARRAY_SIZE(lcdc1_resources),
-	.resource	= lcdc1_resources,
-	.id             = 1,
+	.name	= "asoc-simple-card",
 	.dev	= {
-		.platform_data	= &sh_mobile_lcdc1_info,
-		.coherent_dma_mask = ~0,
+		.platform_data	= &fsi2_ak4643_info,
 	},
 };
 
+/* LCDC1 */
 static long ap4evb_clk_optimize(unsigned long target, unsigned long *best_freq,
 				unsigned long *parent_freq);
 
-
 static struct sh_mobile_hdmi_info hdmi_info = {
-	.lcd_chan = &sh_mobile_lcdc1_info.ch[0],
-	.lcd_dev = &lcdc1_device.dev,
 	.flags = HDMI_SND_SRC_SPDIF,
 	.clk_optimize_parent = ap4evb_clk_optimize,
 };
@@ -802,6 +885,75 @@ static long ap4evb_clk_optimize(unsigned long target, unsigned long *best_freq,
 	return error;
 }
 
+static const struct sh_mobile_meram_cfg hdmi_meram_cfg = {
+	.icb[0] = {
+		.meram_size     = 0x100,
+	},
+	.icb[1] = {
+		.meram_size     = 0x100,
+	},
+};
+
+static struct sh_mobile_lcdc_info sh_mobile_lcdc1_info = {
+	.clock_source = LCDC_CLK_EXTERNAL,
+	.meram_dev = &meram_info,
+	.ch[0] = {
+		.chan = LCDC_CHAN_MAINLCD,
+		.fourcc = V4L2_PIX_FMT_RGB565,
+		.interface_type = RGB24,
+		.clock_divider = 1,
+		.flags = LCDC_FLAGS_DWPOL,
+		.meram_cfg = &hdmi_meram_cfg,
+		.tx_dev = &hdmi_device,
+	}
+};
+
+static struct resource lcdc1_resources[] = {
+	[0] = {
+		.name	= "LCDC1",
+		.start	= 0xfe944000,
+		.end	= 0xfe947fff,
+		.flags	= IORESOURCE_MEM,
+	},
+	[1] = {
+		.start	= intcs_evt2irq(0x1780),
+		.flags	= IORESOURCE_IRQ,
+	},
+};
+
+static struct platform_device lcdc1_device = {
+	.name		= "sh_mobile_lcdc_fb",
+	.num_resources	= ARRAY_SIZE(lcdc1_resources),
+	.resource	= lcdc1_resources,
+	.id             = 1,
+	.dev	= {
+		.platform_data	= &sh_mobile_lcdc1_info,
+		.coherent_dma_mask = ~0,
+	},
+};
+
+static struct asoc_simple_dai_init_info fsi2_hdmi_init_info = {
+	.cpu_daifmt	= SND_SOC_DAIFMT_CBM_CFM,
+};
+
+static struct asoc_simple_card_info fsi2_hdmi_info = {
+	.name		= "HDMI",
+	.card		= "FSI2B-HDMI",
+	.cpu_dai	= "fsib-dai",
+	.codec		= "sh-mobile-hdmi",
+	.platform	= "sh_fsi2",
+	.codec_dai	= "sh_mobile_hdmi-hifi",
+	.init		= &fsi2_hdmi_init_info,
+};
+
+static struct platform_device fsi_hdmi_device = {
+	.name	= "asoc-simple-card",
+	.id	= 1,
+	.dev	= {
+		.platform_data	= &fsi2_hdmi_info,
+	},
+};
+
 static struct gpio_led ap4evb_leds[] = {
 	{
 		.name			= "led4",
@@ -842,7 +994,7 @@ static struct i2c_board_info imx074_info = {
 	I2C_BOARD_INFO("imx074", 0x1a),
 };
 
-struct soc_camera_link imx074_link = {
+static struct soc_camera_link imx074_link = {
 	.bus_id		= 0,
 	.board_info	= &imx074_info,
 	.i2c_adapter_id	= 0,
@@ -860,7 +1012,7 @@ static struct platform_device ap4evb_camera = {
 static struct sh_csi2_client_config csi2_clients[] = {
 	{
 		.phy		= SH_CSI2_PHY_MAIN,
-		.lanes		= 3,
+		.lanes		= 0,		/* default: 2 lanes */
 		.channel	= 0,
 		.pdev		= &ap4evb_camera,
 	},
@@ -886,19 +1038,18 @@ static struct resource csi2_resources[] = {
 	},
 };
 
-static struct platform_device csi2_device = {
-	.name   = "sh-mobile-csi2",
-	.id     = 0,
+static struct sh_mobile_ceu_companion csi2 = {
+	.id		= 0,
 	.num_resources	= ARRAY_SIZE(csi2_resources),
 	.resource	= csi2_resources,
-	.dev    = {
-		.platform_data = &csi2_info,
-	},
+	.platform_data	= &csi2_info,
 };
 
 static struct sh_mobile_ceu_info sh_mobile_ceu_info = {
 	.flags = SH_CEU_FLAG_USE_8BIT_BUS,
-	.csi2_dev = &csi2_device.dev,
+	.max_width = 8188,
+	.max_height = 8188,
+	.csi2 = &csi2,
 };
 
 static struct resource ceu_resources[] = {
@@ -923,7 +1074,8 @@ static struct platform_device ceu_device = {
 	.num_resources	= ARRAY_SIZE(ceu_resources),
 	.resource	= ceu_resources,
 	.dev	= {
-		.platform_data	= &sh_mobile_ceu_info,
+		.platform_data		= &sh_mobile_ceu_info,
+		.coherent_dma_mask	= 0xffffffff,
 	},
 };
 
@@ -936,16 +1088,17 @@ static struct platform_device *ap4evb_devices[] __initdata = {
 	&usb1_host_device,
 	&fsi_device,
 	&fsi_ak4643_device,
+	&fsi_hdmi_device,
 	&sh_mmcif_device,
-	&lcdc1_device,
-	&lcdc_device,
 	&hdmi_device,
-	&csi2_device,
+	&lcdc_device,
+	&lcdc1_device,
 	&ceu_device,
 	&ap4evb_camera,
+	&meram_device,
 };
 
-static int __init hdmi_init_pm_clock(void)
+static void __init hdmi_init_pm_clock(void)
 {
 	struct clk *hdmi_ick = clk_get(&hdmi_device.dev, "ick");
 	int ret;
@@ -978,28 +1131,18 @@ static int __init hdmi_init_pm_clock(void)
 		goto out;
 	}
 
-	ret = clk_enable(&sh7372_pllc2_clk);
-	if (ret < 0) {
-		pr_err("Cannot enable pllc2 clock\n");
-		goto out;
-	}
 	pr_debug("PLLC2 set frequency %lu\n", rate);
 
 	ret = clk_set_parent(hdmi_ick, &sh7372_pllc2_clk);
-	if (ret < 0) {
+	if (ret < 0)
 		pr_err("Cannot set HDMI parent: %d\n", ret);
-		goto out;
-	}
 
 out:
 	if (!IS_ERR(hdmi_ick))
 		clk_put(hdmi_ick);
-	return ret;
 }
 
-device_initcall(hdmi_init_pm_clock);
-
-static int __init fsi_init_pm_clock(void)
+static void __init fsi_init_pm_clock(void)
 {
 	struct clk *fsia_ick;
 	int ret;
@@ -1008,7 +1151,7 @@ static int __init fsi_init_pm_clock(void)
 	if (IS_ERR(fsia_ick)) {
 		ret = PTR_ERR(fsia_ick);
 		pr_err("Cannot get FSI ICK: %d\n", ret);
-		return ret;
+		return;
 	}
 
 	ret = clk_set_parent(fsia_ick, &sh7372_fsiack_clk);
@@ -1016,24 +1159,6 @@ static int __init fsi_init_pm_clock(void)
 		pr_err("Cannot set FSI-A parent: %d\n", ret);
 
 	clk_put(fsia_ick);
-
-	return ret;
-}
-device_initcall(fsi_init_pm_clock);
-
-/*
- * FIXME !!
- *
- * gpio_no_direction
- * are quick_hack.
- *
- * current gpio frame work doesn't have
- * the method to control only pull up/down/free.
- * this function should be replaced by correct gpio function
- */
-static void __init gpio_no_direction(u32 addr)
-{
-	__raw_writeb(0x00, addr);
 }
 
 /* TouchScreen */
@@ -1098,26 +1223,6 @@ static struct i2c_board_info i2c1_devices[] = {
 	},
 };
 
-static struct map_desc ap4evb_io_desc[] __initdata = {
-	/* create a 1:1 entity map for 0xe6xxxxxx
-	 * used by CPGA, INTC and PFC.
-	 */
-	{
-		.virtual	= 0xe6000000,
-		.pfn		= __phys_to_pfn(0xe6000000),
-		.length		= 256 << 20,
-		.type		= MT_DEVICE_NONSHARED
-	},
-};
-
-static void __init ap4evb_map_io(void)
-{
-	iotable_init(ap4evb_io_desc, ARRAY_SIZE(ap4evb_io_desc));
-
-	/* setup early devices and console here as well */
-	sh7372_add_early_devices();
-	shmobile_setup_console();
-}
 
 #define GPIO_PORT9CR	0xE6051009
 #define GPIO_PORT10CR	0xE605100A
@@ -1126,6 +1231,15 @@ static void __init ap4evb_init(void)
 {
 	u32 srcr4;
 	struct clk *clk;
+
+	regulator_register_always_on(0, "fixed-1.8V", fixed1v8_power_consumers,
+				     ARRAY_SIZE(fixed1v8_power_consumers), 1800000);
+	regulator_register_always_on(1, "fixed-3.3V", fixed3v3_power_consumers,
+				     ARRAY_SIZE(fixed3v3_power_consumers), 3300000);
+	regulator_register_fixed(2, dummy_supplies, ARRAY_SIZE(dummy_supplies));
+
+	/* External clock source */
+	clk_set_rate(&sh7372_dv_clki_clk, 27000000);
 
 	sh7372_pinmux_init();
 
@@ -1202,8 +1316,8 @@ static void __init ap4evb_init(void)
 
 	gpio_request(GPIO_PORT9, NULL);
 	gpio_request(GPIO_PORT10, NULL);
-	gpio_no_direction(GPIO_PORT9CR);  /* FSIAOBT needs no direction */
-	gpio_no_direction(GPIO_PORT10CR); /* FSIAOLR needs no direction */
+	gpio_direction_none(GPIO_PORT9CR);  /* FSIAOBT needs no direction */
+	gpio_direction_none(GPIO_PORT10CR); /* FSIAOLR needs no direction */
 
 	/* card detect pin for MMC slot (CN7) */
 	gpio_request(GPIO_PORT41, NULL);
@@ -1253,7 +1367,7 @@ static void __init ap4evb_init(void)
 	gpio_request(GPIO_FN_KEYIN4,     NULL);
 
 	/* enable TouchScreen */
-	set_irq_type(IRQ28, IRQ_TYPE_LEVEL_LOW);
+	irq_set_irq_type(IRQ28, IRQ_TYPE_LEVEL_LOW);
 
 	tsc_device.irq = IRQ28;
 	i2c_register_board_info(1, &tsc_device, 1);
@@ -1263,8 +1377,8 @@ static void __init ap4evb_init(void)
 	lcdc_info.ch[0].interface_type		= RGB24;
 	lcdc_info.ch[0].clock_divider		= 1;
 	lcdc_info.ch[0].flags			= LCDC_FLAGS_DWPOL;
-	lcdc_info.ch[0].lcd_size_cfg.width	= 44;
-	lcdc_info.ch[0].lcd_size_cfg.height	= 79;
+	lcdc_info.ch[0].panel_cfg.width		= 44;
+	lcdc_info.ch[0].panel_cfg.height	= 79;
 
 	platform_add_devices(qhd_devices, ARRAY_SIZE(qhd_devices));
 
@@ -1305,11 +1419,11 @@ static void __init ap4evb_init(void)
 	lcdc_info.ch[0].interface_type		= RGB18;
 	lcdc_info.ch[0].clock_divider		= 3;
 	lcdc_info.ch[0].flags			= 0;
-	lcdc_info.ch[0].lcd_size_cfg.width	= 152;
-	lcdc_info.ch[0].lcd_size_cfg.height	= 91;
+	lcdc_info.ch[0].panel_cfg.width		= 152;
+	lcdc_info.ch[0].panel_cfg.height	= 91;
 
 	/* enable TouchScreen */
-	set_irq_type(IRQ7, IRQ_TYPE_LEVEL_LOW);
+	irq_set_irq_type(IRQ7, IRQ_TYPE_LEVEL_LOW);
 
 	tsc_device.irq = IRQ7;
 	i2c_register_board_info(0, &tsc_device, 1);
@@ -1346,25 +1460,29 @@ static void __init ap4evb_init(void)
 	__raw_writel(srcr4 & ~(1 << 13), SRCR4);
 
 	platform_add_devices(ap4evb_devices, ARRAY_SIZE(ap4evb_devices));
+
+	rmobile_add_device_to_domain(&sh7372_pd_a4lc, &lcdc1_device);
+	rmobile_add_device_to_domain(&sh7372_pd_a4lc, &lcdc_device);
+	rmobile_add_device_to_domain(&sh7372_pd_a4mp, &fsi_device);
+
+	rmobile_add_device_to_domain(&sh7372_pd_a3sp, &sh_mmcif_device);
+	rmobile_add_device_to_domain(&sh7372_pd_a3sp, &sdhi0_device);
+	rmobile_add_device_to_domain(&sh7372_pd_a3sp, &sdhi1_device);
+	rmobile_add_device_to_domain(&sh7372_pd_a4r, &ceu_device);
+
+	hdmi_init_pm_clock();
+	fsi_init_pm_clock();
+	sh7372_pm_init();
+	pm_clk_add(&fsi_device.dev, "spu2");
+	pm_clk_add(&lcdc1_device.dev, "hdmi");
 }
-
-static void __init ap4evb_timer_init(void)
-{
-	sh7372_clock_init();
-	shmobile_timer.init();
-
-	/* External clock source */
-	clk_set_rate(&sh7372_dv_clki_clk, 27000000);
-}
-
-static struct sys_timer ap4evb_timer = {
-	.init		= ap4evb_timer_init,
-};
 
 MACHINE_START(AP4EVB, "ap4evb")
-	.map_io		= ap4evb_map_io,
+	.map_io		= sh7372_map_io,
+	.init_early	= sh7372_add_early_devices,
 	.init_irq	= sh7372_init_irq,
 	.handle_irq	= shmobile_handle_irq_intc,
 	.init_machine	= ap4evb_init,
-	.timer		= &ap4evb_timer,
+	.init_late	= shmobile_init_late,
+	.timer		= &shmobile_timer,
 MACHINE_END

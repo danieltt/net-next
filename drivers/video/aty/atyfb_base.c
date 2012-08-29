@@ -248,10 +248,6 @@ static int atyfb_sync(struct fb_info *info);
 
 static int aty_init(struct fb_info *info);
 
-#ifdef CONFIG_ATARI
-static int store_video_par(char *videopar, unsigned char m64_num);
-#endif
-
 static void aty_get_crtc(const struct atyfb_par *par, struct crtc *crtc);
 
 static void aty_set_crtc(const struct atyfb_par *par, const struct crtc *crtc);
@@ -305,9 +301,9 @@ static struct fb_ops atyfb_ops = {
 	.fb_sync	= atyfb_sync,
 };
 
-static int noaccel;
+static bool noaccel;
 #ifdef CONFIG_MTRR
-static int nomtrr;
+static bool nomtrr;
 #endif
 static int vram;
 static int pll;
@@ -867,7 +863,7 @@ static int aty_var_to_crtc(const struct fb_info *info,
 
 	if ((xres > 1600) || (yres > 1200)) {
 		FAIL("MACH64 chips are designed for max 1600x1200\n"
-		     "select anoter resolution.");
+		     "select another resolution.");
 	}
 	h_sync_strt = h_disp + var->right_margin;
 	h_sync_end = h_sync_strt + var->hsync_len;
@@ -2241,6 +2237,7 @@ static void aty_bl_init(struct atyfb_par *par)
 	snprintf(name, sizeof(name), "atybl%d", info->node);
 
 	memset(&props, 0, sizeof(struct backlight_properties));
+	props.type = BACKLIGHT_RAW;
 	props.max_brightness = FB_BACKLIGHT_LEVELS - 1;
 	bd = backlight_device_register(name, info->dev, par, &aty_bl_data,
 				       &props);
@@ -2267,11 +2264,13 @@ error:
 	return;
 }
 
+#ifdef CONFIG_PCI
 static void aty_bl_exit(struct backlight_device *bd)
 {
 	backlight_device_unregister(bd);
 	printk("aty: Backlight unloaded\n");
 }
+#endif /* CONFIG_PCI */
 
 #endif /* CONFIG_FB_ATY_BACKLIGHT */
 
@@ -2788,7 +2787,7 @@ aty_init_exit:
 	return ret;
 }
 
-#ifdef CONFIG_ATARI
+#if defined(CONFIG_ATARI) && !defined(MODULE)
 static int __devinit store_video_par(char *video_str, unsigned char m64_num)
 {
 	char *p;
@@ -2817,7 +2816,7 @@ static int __devinit store_video_par(char *video_str, unsigned char m64_num)
 	phys_vmembase[m64_num] = 0;
 	return -1;
 }
-#endif /* CONFIG_ATARI */
+#endif /* CONFIG_ATARI && !MODULE */
 
 /*
  * Blank the display.
@@ -3123,12 +3122,12 @@ static int __devinit atyfb_setup_sparc(struct pci_dev *pdev,
 		M = pll_regs[2];
 
 		/*
-		 * PLL Feedback Divider N (Dependant on CLOCK_CNTL):
+		 * PLL Feedback Divider N (Dependent on CLOCK_CNTL):
 		 */
 		N = pll_regs[7 + (clock_cntl & 3)];
 
 		/*
-		 * PLL Post Divider P (Dependant on CLOCK_CNTL):
+		 * PLL Post Divider P (Dependent on CLOCK_CNTL):
 		 */
 		P = 1 << (pll_regs[6] >> ((clock_cntl & 3) << 1));
 
@@ -3459,9 +3458,10 @@ static int __devinit atyfb_setup_generic(struct pci_dev *pdev,
 
 	raddr = addr + 0x7ff000UL;
 	rrp = &pdev->resource[2];
-	if ((rrp->flags & IORESOURCE_MEM) && request_mem_region(rrp->start, rrp->end - rrp->start + 1, "atyfb")) {
+	if ((rrp->flags & IORESOURCE_MEM) &&
+	    request_mem_region(rrp->start, resource_size(rrp), "atyfb")) {
 		par->aux_start = rrp->start;
-		par->aux_size = rrp->end - rrp->start + 1;
+		par->aux_size = resource_size(rrp);
 		raddr = rrp->start;
 		PRINTKI("using auxiliary register aperture\n");
 	}
@@ -3551,7 +3551,7 @@ static int __devinit atyfb_pci_probe(struct pci_dev *pdev,
 
 	/* Reserve space */
 	res_start = rp->start;
-	res_size = rp->end - rp->start + 1;
+	res_size = resource_size(rp);
 	if (!request_mem_region(res_start, res_size, "atyfb"))
 		return -EBUSY;
 

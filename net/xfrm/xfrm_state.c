@@ -415,8 +415,17 @@ static enum hrtimer_restart xfrm_timer_handler(struct hrtimer * me)
 	if (x->lft.hard_add_expires_seconds) {
 		long tmo = x->lft.hard_add_expires_seconds +
 			x->curlft.add_time - now;
-		if (tmo <= 0)
-			goto expired;
+		if (tmo <= 0) {
+			if (x->xflags & XFRM_SOFT_EXPIRE) {
+				/* enter hard expire without soft expire first?!
+				 * setting a new date could trigger this.
+				 * workarbound: fix x->curflt.add_time by below:
+				 */
+				x->curlft.add_time = now - x->saved_tmo - 1;
+				tmo = x->lft.hard_add_expires_seconds - x->saved_tmo;
+			} else
+				goto expired;
+		}
 		if (tmo < next)
 			next = tmo;
 	}
@@ -433,10 +442,14 @@ static enum hrtimer_restart xfrm_timer_handler(struct hrtimer * me)
 	if (x->lft.soft_add_expires_seconds) {
 		long tmo = x->lft.soft_add_expires_seconds +
 			x->curlft.add_time - now;
-		if (tmo <= 0)
+		if (tmo <= 0) {
 			warn = 1;
-		else if (tmo < next)
+			x->xflags &= ~XFRM_SOFT_EXPIRE;
+		} else if (tmo < next) {
 			next = tmo;
+			x->xflags |= XFRM_SOFT_EXPIRE;
+			x->saved_tmo = tmo;
+		}
 	}
 	if (x->lft.soft_use_expires_seconds) {
 		long tmo = x->lft.soft_use_expires_seconds +
@@ -1035,16 +1048,12 @@ static struct xfrm_state *__find_acq_core(struct net *net, struct xfrm_mark *m,
 			break;
 
 		case AF_INET6:
-			ipv6_addr_copy((struct in6_addr *)x->sel.daddr.a6,
-				       (struct in6_addr *)daddr);
-			ipv6_addr_copy((struct in6_addr *)x->sel.saddr.a6,
-				       (struct in6_addr *)saddr);
+			*(struct in6_addr *)x->sel.daddr.a6 = *(struct in6_addr *)daddr;
+			*(struct in6_addr *)x->sel.saddr.a6 = *(struct in6_addr *)saddr;
 			x->sel.prefixlen_d = 128;
 			x->sel.prefixlen_s = 128;
-			ipv6_addr_copy((struct in6_addr *)x->props.saddr.a6,
-				       (struct in6_addr *)saddr);
-			ipv6_addr_copy((struct in6_addr *)x->id.daddr.a6,
-				       (struct in6_addr *)daddr);
+			*(struct in6_addr *)x->props.saddr.a6 = *(struct in6_addr *)saddr;
+			*(struct in6_addr *)x->id.daddr.a6 = *(struct in6_addr *)daddr;
 			break;
 		}
 
@@ -1178,6 +1187,12 @@ static struct xfrm_state *xfrm_state_clone(struct xfrm_state *orig, int *errp)
 		x->coaddr = kmemdup(orig->coaddr, sizeof(*x->coaddr),
 				    GFP_KERNEL);
 		if (!x->coaddr)
+			goto error;
+	}
+
+	if (orig->replay_esn) {
+		err = xfrm_replay_clone(x, orig);
+		if (err)
 			goto error;
 	}
 
@@ -1339,6 +1354,8 @@ out:
 			xfrm_state_check_expire(x1);
 
 		err = 0;
+		x->km.state = XFRM_STATE_DEAD;
+		__xfrm_state_put(x);
 	}
 	spin_unlock_bh(&x1->lock);
 
@@ -1683,7 +1700,7 @@ int km_query(struct xfrm_state *x, struct xfrm_tmpl *t, struct xfrm_policy *pol)
 
 	read_lock(&xfrm_km_lock);
 	list_for_each_entry(km, &xfrm_km_list, list) {
-		acqret = km->acquire(x, t, pol, XFRM_POLICY_OUT);
+		acqret = km->acquire(x, t, pol);
 		if (!acqret)
 			err = acqret;
 	}
@@ -1907,7 +1924,7 @@ int xfrm_state_mtu(struct xfrm_state *x, int mtu)
 	return res;
 }
 
-int xfrm_init_state(struct xfrm_state *x)
+int __xfrm_init_state(struct xfrm_state *x, bool init_replay)
 {
 	struct xfrm_state_afinfo *afinfo;
 	struct xfrm_mode *inner_mode;
@@ -1980,10 +1997,23 @@ int xfrm_init_state(struct xfrm_state *x)
 	if (x->outer_mode == NULL)
 		goto error;
 
+	if (init_replay) {
+		err = xfrm_init_replay(x);
+		if (err)
+			goto error;
+	}
+
 	x->km.state = XFRM_STATE_VALID;
 
 error:
 	return err;
+}
+
+EXPORT_SYMBOL(__xfrm_init_state);
+
+int xfrm_init_state(struct xfrm_state *x)
+{
+	return __xfrm_init_state(x, true);
 }
 
 EXPORT_SYMBOL(xfrm_init_state);
@@ -2073,8 +2103,8 @@ static void xfrm_audit_helper_sainfo(struct xfrm_state *x,
 static void xfrm_audit_helper_pktinfo(struct sk_buff *skb, u16 family,
 				      struct audit_buffer *audit_buf)
 {
-	struct iphdr *iph4;
-	struct ipv6hdr *iph6;
+	const struct iphdr *iph4;
+	const struct ipv6hdr *iph6;
 
 	switch (family) {
 	case AF_INET:

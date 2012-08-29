@@ -11,6 +11,7 @@
 #include <asm/machvec.h>
 #include <asm/dma.h>
 #include <asm/perf_event.h>
+#include <asm/mce.h>
 
 #include "proto.h"
 #include "irq_impl.h"
@@ -228,7 +229,7 @@ struct irqaction timer_irqaction = {
 void __init
 init_rtc_irq(void)
 {
-	set_irq_chip_and_handler_name(RTC_IRQ, &no_irq_chip,
+	irq_set_chip_and_handler_name(RTC_IRQ, &dummy_irq_chip,
 				      handle_simple_irq, "RTC");
 	setup_irq(RTC_IRQ, &timer_irqaction);
 }

@@ -6,6 +6,7 @@
  *
  * This file is released under the GPLv2.
  */
+#include <linux/export.h>
 #include <linux/init.h>
 #include <linux/list.h>
 #include <linux/device.h>
@@ -38,6 +39,7 @@ int register_acpi_bus_type(struct acpi_bus_type *type)
 	}
 	return -ENODEV;
 }
+EXPORT_SYMBOL_GPL(register_acpi_bus_type);
 
 int unregister_acpi_bus_type(struct acpi_bus_type *type)
 {
@@ -53,6 +55,7 @@ int unregister_acpi_bus_type(struct acpi_bus_type *type)
 	}
 	return -ENODEV;
 }
+EXPORT_SYMBOL_GPL(unregister_acpi_bus_type);
 
 static struct acpi_bus_type *acpi_get_bus_type(struct bus_type *type)
 {

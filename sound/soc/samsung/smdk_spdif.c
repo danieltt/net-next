@@ -10,15 +10,11 @@
  *
  */
 
-#include <linux/module.h>
-#include <linux/device.h>
 #include <linux/clk.h>
-
-#include <plat/devs.h>
+#include <linux/module.h>
 
 #include <sound/soc.h>
 
-#include "dma.h"
 #include "spdif.h"
 
 /* Audio clock settings are belonged to board specific part. Every
@@ -164,6 +160,7 @@ static struct snd_soc_dai_link smdk_dai = {
 
 static struct snd_soc_card smdk = {
 	.name = "SMDK-S/PDIF",
+	.owner = THIS_MODULE,
 	.dai_link = &smdk_dai,
 	.num_links = 1,
 };

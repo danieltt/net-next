@@ -15,9 +15,11 @@
 #include <linux/kernel.h>
 #include <linux/io.h>
 
-#include <plat/common.h>
+#include <plat/hardware.h>
 #include <plat/sdrc.h>
 
+#include "iomap.h"
+#include "common.h"
 #include "cm-regbits-34xx.h"
 #include "prm-regbits-34xx.h"
 #include "prm2xxx_3xxx.h"
@@ -149,17 +151,11 @@ static struct omap3_control_regs control_context;
 
 void __init omap2_set_globals_control(struct omap_globals *omap2_globals)
 {
-	/* Static mapping, never released */
-	if (omap2_globals->ctrl) {
-		omap2_ctrl_base = ioremap(omap2_globals->ctrl, SZ_4K);
-		WARN_ON(!omap2_ctrl_base);
-	}
+	if (omap2_globals->ctrl)
+		omap2_ctrl_base = omap2_globals->ctrl;
 
-	/* Static mapping, never released */
-	if (omap2_globals->ctrl_pad) {
-		omap4_ctrl_pad_base = ioremap(omap2_globals->ctrl_pad, SZ_4K);
-		WARN_ON(!omap4_ctrl_pad_base);
-	}
+	if (omap2_globals->ctrl_pad)
+		omap4_ctrl_pad_base = omap2_globals->ctrl_pad;
 }
 
 void __iomem *omap_ctrl_base_get(void)
@@ -245,6 +241,49 @@ void omap3_ctrl_write_boot_mode(u8 bootmode)
 
 #endif
 
+/**
+ * omap_ctrl_write_dsp_boot_addr - set boot address for a remote processor
+ * @bootaddr: physical address of the boot loader
+ *
+ * Set boot address for the boot loader of a supported processor
+ * when a power ON sequence occurs.
+ */
+void omap_ctrl_write_dsp_boot_addr(u32 bootaddr)
+{
+	u32 offset = cpu_is_omap243x() ? OMAP243X_CONTROL_IVA2_BOOTADDR :
+		     cpu_is_omap34xx() ? OMAP343X_CONTROL_IVA2_BOOTADDR :
+		     cpu_is_omap44xx() ? OMAP4_CTRL_MODULE_CORE_DSP_BOOTADDR :
+		     0;
+
+	if (!offset) {
+		pr_err("%s: unsupported omap type\n", __func__);
+		return;
+	}
+
+	omap_ctrl_writel(bootaddr, offset);
+}
+
+/**
+ * omap_ctrl_write_dsp_boot_mode - set boot mode for a remote processor
+ * @bootmode: 8-bit value to pass to some boot code
+ *
+ * Sets boot mode for the boot loader of a supported processor
+ * when a power ON sequence occurs.
+ */
+void omap_ctrl_write_dsp_boot_mode(u8 bootmode)
+{
+	u32 offset = cpu_is_omap243x() ? OMAP243X_CONTROL_IVA2_BOOTMOD :
+		     cpu_is_omap34xx() ? OMAP343X_CONTROL_IVA2_BOOTMOD :
+		     0;
+
+	if (!offset) {
+		pr_err("%s: unsupported omap type\n", __func__);
+		return;
+	}
+
+	omap_ctrl_writel(bootmode, offset);
+}
+
 #if defined(CONFIG_ARCH_OMAP3) && defined(CONFIG_PM)
 /*
  * Clears the scratchpad contents in case of cold boot-
@@ -286,14 +325,15 @@ void omap3_save_scratchpad_contents(void)
 	scratchpad_contents.boot_config_ptr = 0x0;
 	if (cpu_is_omap3630())
 		scratchpad_contents.public_restore_ptr =
-			virt_to_phys(get_omap3630_restore_pointer());
+			virt_to_phys(omap3_restore_3630);
 	else if (omap_rev() != OMAP3430_REV_ES3_0 &&
 					omap_rev() != OMAP3430_REV_ES3_1)
 		scratchpad_contents.public_restore_ptr =
-			virt_to_phys(get_restore_pointer());
+			virt_to_phys(omap3_restore);
 	else
 		scratchpad_contents.public_restore_ptr =
-			virt_to_phys(get_es3_restore_pointer());
+			virt_to_phys(omap3_restore_es3);
+
 	if (omap_type() == OMAP2_DEVICE_TYPE_GP)
 		scratchpad_contents.secure_ram_restore_ptr = 0x0;
 	else
@@ -316,8 +356,14 @@ void omap3_save_scratchpad_contents(void)
 			omap2_cm_read_mod_reg(WKUP_MOD, CM_CLKSEL);
 	prcm_block_contents.cm_clken_pll =
 			omap2_cm_read_mod_reg(PLL_MOD, CM_CLKEN);
+	/*
+	 * As per erratum i671, ROM code does not respect the PER DPLL
+	 * programming scheme if CM_AUTOIDLE_PLL..AUTO_PERIPH_DPLL == 1.
+	 * Then,  in anycase, clear these bits to avoid extra latencies.
+	 */
 	prcm_block_contents.cm_autoidle_pll =
-			omap2_cm_read_mod_reg(PLL_MOD, OMAP3430_CM_AUTOIDLE_PLL);
+			omap2_cm_read_mod_reg(PLL_MOD, CM_AUTOIDLE) &
+			~OMAP3430_AUTO_PERIPH_DPLL_MASK;
 	prcm_block_contents.cm_clksel1_pll =
 			omap2_cm_read_mod_reg(PLL_MOD, OMAP3430_CM_CLKSEL1_PLL);
 	prcm_block_contents.cm_clksel2_pll =

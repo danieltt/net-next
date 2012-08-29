@@ -4,9 +4,10 @@
 #ifndef __NET_NET_NAMESPACE_H
 #define __NET_NET_NAMESPACE_H
 
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 #include <linux/workqueue.h>
 #include <linux/list.h>
+#include <linux/sysctl.h>
 
 #include <net/netns/core.h>
 #include <net/netns/mib.h>
@@ -14,13 +15,13 @@
 #include <net/netns/packet.h>
 #include <net/netns/ipv4.h>
 #include <net/netns/ipv6.h>
+#include <net/netns/sctp.h>
 #include <net/netns/dccp.h>
 #include <net/netns/x_tables.h>
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 #include <net/netns/conntrack.h>
 #endif
 #include <net/netns/xfrm.h>
-#include <net/netns/ip_vs.h>
 
 struct proc_dir_entry;
 struct net_device;
@@ -28,14 +29,18 @@ struct sock;
 struct ctl_table_header;
 struct net_generic;
 struct sock;
+struct netns_ipvs;
 
 
 #define NETDEV_HASHBITS    8
 #define NETDEV_HASHENTRIES (1 << NETDEV_HASHBITS)
 
 struct net {
+	atomic_t		passive;	/* To decided when the network
+						 * namespace should be freed.
+						 */
 	atomic_t		count;		/* To decided when the network
-						 *  namespace should be freed.
+						 *  namespace should be shut down.
 						 */
 #ifdef NETNS_REFCNT_DEBUG
 	atomic_t		use_count;	/* To track references we
@@ -61,6 +66,8 @@ struct net {
 	struct list_head 	dev_base_head;
 	struct hlist_head 	*dev_name_head;
 	struct hlist_head	*dev_index_head;
+	unsigned int		dev_base_seq;	/* protected by rtnl_mutex */
+	int			ifindex;
 
 	/* core fib_rules */
 	struct list_head	rules_ops;
@@ -72,8 +79,11 @@ struct net {
 	struct netns_packet	packet;
 	struct netns_unix	unx;
 	struct netns_ipv4	ipv4;
-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
+#if IS_ENABLED(CONFIG_IPV6)
 	struct netns_ipv6	ipv6;
+#endif
+#if defined(CONFIG_IP_SCTP) || defined(CONFIG_IP_SCTP_MODULE)
+	struct netns_sctp	sctp;
 #endif
 #if defined(CONFIG_IP_DCCP) || defined(CONFIG_IP_DCCP_MODULE)
 	struct netns_dccp	dccp;
@@ -96,8 +106,16 @@ struct net {
 	struct netns_xfrm	xfrm;
 #endif
 	struct netns_ipvs	*ipvs;
+	struct sock		*diag_nlsk;
 };
 
+/*
+ * ifindex generation is per-net namespace, and loopback is
+ * always the 1st device in ns (see net_dev_init), thus any
+ * loopback device should get ifindex 1
+ */
+
+#define LOOPBACK_IFINDEX	1
 
 #include <linux/seq_file_net.h>
 
@@ -119,6 +137,7 @@ static inline struct net *copy_net_ns(unsigned long flags, struct net *net_ns)
 extern struct list_head net_namespace_list;
 
 extern struct net *get_net_ns_by_pid(pid_t pid);
+extern struct net *get_net_ns_by_fd(int pid);
 
 #ifdef CONFIG_NET_NS
 extern void __put_net(struct net *net);
@@ -152,6 +171,9 @@ int net_eq(const struct net *net1, const struct net *net2)
 {
 	return net1 == net2;
 }
+
+extern void net_drop_ns(void *);
+
 #else
 
 static inline struct net *get_net(struct net *net)
@@ -173,6 +195,8 @@ int net_eq(const struct net *net1, const struct net *net2)
 {
 	return 1;
 }
+
+#define net_drop_ns NULL
 #endif
 
 
@@ -268,14 +292,25 @@ extern void unregister_pernet_subsys(struct pernet_operations *);
 extern int register_pernet_device(struct pernet_operations *);
 extern void unregister_pernet_device(struct pernet_operations *);
 
-struct ctl_path;
 struct ctl_table;
 struct ctl_table_header;
 
-extern struct ctl_table_header *register_net_sysctl_table(struct net *net,
-	const struct ctl_path *path, struct ctl_table *table);
-extern struct ctl_table_header *register_net_sysctl_rotable(
-	const struct ctl_path *path, struct ctl_table *table);
+#ifdef CONFIG_SYSCTL
+extern int net_sysctl_init(void);
+extern struct ctl_table_header *register_net_sysctl(struct net *net,
+	const char *path, struct ctl_table *table);
 extern void unregister_net_sysctl_table(struct ctl_table_header *header);
+#else
+static inline int net_sysctl_init(void) { return 0; }
+static inline struct ctl_table_header *register_net_sysctl(struct net *net,
+	const char *path, struct ctl_table *table)
+{
+	return NULL;
+}
+static inline void unregister_net_sysctl_table(struct ctl_table_header *header)
+{
+}
+#endif
+
 
 #endif /* __NET_NET_NAMESPACE_H */

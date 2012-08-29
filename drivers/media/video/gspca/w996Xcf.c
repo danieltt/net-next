@@ -31,6 +31,8 @@
    the sensor drivers to v4l2 sub drivers, and properly split of this
    driver from ov519.c */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #define W9968CF_I2C_BUS_DELAY    4 /* delay in us for I2C bit r/w operations */
 
 #define Y_QUANTABLE (&sd->jpeg_hdr[JPEG_QT0_OFFSET])
@@ -81,7 +83,7 @@ static void w9968cf_write_fsb(struct sd *sd, u16* data)
 			      USB_TYPE_VENDOR | USB_DIR_OUT | USB_RECIP_DEVICE,
 			      value, 0x06, sd->gspca_dev.usb_buf, 6, 500);
 	if (ret < 0) {
-		err("Write FSB registers failed (%d)", ret);
+		pr_err("Write FSB registers failed (%d)\n", ret);
 		sd->gspca_dev.usb_err = ret;
 	}
 }
@@ -108,7 +110,7 @@ static void w9968cf_write_sb(struct sd *sd, u16 value)
 	udelay(W9968CF_I2C_BUS_DELAY);
 
 	if (ret < 0) {
-		err("Write SB reg [01] %04x failed", value);
+		pr_err("Write SB reg [01] %04x failed\n", value);
 		sd->gspca_dev.usb_err = ret;
 	}
 }
@@ -135,7 +137,7 @@ static int w9968cf_read_sb(struct sd *sd)
 		ret = sd->gspca_dev.usb_buf[0] |
 		      (sd->gspca_dev.usb_buf[1] << 8);
 	} else {
-		err("Read SB reg [01] failed");
+		pr_err("Read SB reg [01] failed\n");
 		sd->gspca_dev.usb_err = ret;
 	}
 
@@ -402,9 +404,14 @@ static void w9968cf_set_crop_window(struct sd *sd)
 	}
 
 	if (sd->sensor == SEN_OV7620) {
-		/* Sigh, this is dependend on the clock / framerate changes
-		   made by the frequency control, sick. */
-		if (sd->ctrls[FREQ].val == 1) {
+		/*
+		 * Sigh, this is dependend on the clock / framerate changes
+		 * made by the frequency control, sick.
+		 *
+		 * Note we cannot use v4l2_ctrl_g_ctrl here, as we get called
+		 * from ov519.c:setfreq() with the ctrl lock held!
+		 */
+		if (sd->freq->val == 1) {
 			start_cropx = 277;
 			start_cropy = 37;
 		} else {
@@ -472,8 +479,9 @@ static void w9968cf_mode_init_regs(struct sd *sd)
 		/* We may get called multiple times (usb isoc bw negotiat.) */
 		jpeg_define(sd->jpeg_hdr, sd->gspca_dev.height,
 			    sd->gspca_dev.width, 0x22); /* JPEG 420 */
-		jpeg_set_qual(sd->jpeg_hdr, sd->quality);
+		jpeg_set_qual(sd->jpeg_hdr, v4l2_ctrl_g_ctrl(sd->jpegqual));
 		w9968cf_upload_quantizationtables(sd);
+		v4l2_ctrl_grab(sd->jpegqual, true);
 	}
 
 	/* Video Capture Control Register */
@@ -512,6 +520,7 @@ static void w9968cf_mode_init_regs(struct sd *sd)
 
 static void w9968cf_stop0(struct sd *sd)
 {
+	v4l2_ctrl_grab(sd->jpegqual, false);
 	reg_w(sd, 0x39, 0x0000); /* disable JPEG encoder */
 	reg_w(sd, 0x16, 0x0000); /* stop video capture */
 }

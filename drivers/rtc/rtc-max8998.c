@@ -265,6 +265,8 @@ static int __devinit max8998_rtc_probe(struct platform_device *pdev)
 	info->rtc = max8998->rtc;
 	info->irq = max8998->irq_base + MAX8998_IRQ_ALARM0;
 
+	platform_set_drvdata(pdev, info);
+
 	info->rtc_dev = rtc_device_register("max8998-rtc", &pdev->dev,
 			&max8998_rtc_ops, THIS_MODULE);
 
@@ -273,8 +275,6 @@ static int __devinit max8998_rtc_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Failed to register RTC device: %d\n", ret);
 		goto out_rtc;
 	}
-
-	platform_set_drvdata(pdev, info);
 
 	ret = request_threaded_irq(info->irq, NULL, max8998_rtc_alarm_irq, 0,
 			"rtc-alarm0", info);
@@ -293,6 +293,7 @@ static int __devinit max8998_rtc_probe(struct platform_device *pdev)
 	return 0;
 
 out_rtc:
+	platform_set_drvdata(pdev, NULL);
 	kfree(info);
 	return ret;
 }
@@ -326,17 +327,7 @@ static struct platform_driver max8998_rtc_driver = {
 	.id_table	= max8998_rtc_id,
 };
 
-static int __init max8998_rtc_init(void)
-{
-	return platform_driver_register(&max8998_rtc_driver);
-}
-module_init(max8998_rtc_init);
-
-static void __exit max8998_rtc_exit(void)
-{
-	platform_driver_unregister(&max8998_rtc_driver);
-}
-module_exit(max8998_rtc_exit);
+module_platform_driver(max8998_rtc_driver);
 
 MODULE_AUTHOR("Minkyu Kang <mk7.kang@samsung.com>");
 MODULE_AUTHOR("Joonyoung Shim <jy0922.shim@samsung.com>");

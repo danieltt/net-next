@@ -109,7 +109,7 @@ struct usb_req_rfwrite {
 	__le16 bits;
 	/* RF2595: 24 */
 	__le16 bit_values[0];
-	/* (CR203 & ~(RF_IF_LE | RF_CLK | RF_DATA)) | (bit ? RF_DATA : 0) */
+	/* (ZD_CR203 & ~(RF_IF_LE | RF_CLK | RF_DATA)) | (bit ? RF_DATA : 0) */
 } __packed;
 
 /* USB interrupt */
@@ -144,6 +144,8 @@ struct usb_int_retry_fail {
 
 struct read_regs_int {
 	struct completion completion;
+	struct usb_req_read_regs *req;
+	unsigned int req_count;
 	/* Stores the USB int structure and contains the USB address of the
 	 * first requested register before request.
 	 */
@@ -169,7 +171,8 @@ struct zd_usb_interrupt {
 	void *buffer;
 	dma_addr_t buffer_dma;
 	int interval;
-	u8 read_regs_enabled:1;
+	atomic_t read_regs_enabled;
+	u8 read_regs_int_overridden:1;
 };
 
 static inline struct usb_int_regs *get_read_regs(struct zd_usb_interrupt *intr)
@@ -183,6 +186,7 @@ struct zd_usb_rx {
 	spinlock_t lock;
 	struct mutex setup_mutex;
 	struct delayed_work idle_work;
+	struct tasklet_struct reset_timer_tasklet;
 	u8 fragment[2 * USB_MAX_RX_SIZE];
 	unsigned int fragment_length;
 	unsigned int usb_packet_size;
@@ -270,7 +274,7 @@ int zd_usb_ioread16v(struct zd_usb *usb, u16 *values,
 static inline int zd_usb_ioread16(struct zd_usb *usb, u16 *value,
 	                      const zd_addr_t addr)
 {
-	return zd_usb_ioread16v(usb, value, (const zd_addr_t *)&addr, 1);
+	return zd_usb_ioread16v(usb, value, &addr, 1);
 }
 
 void zd_usb_iowrite16v_async_start(struct zd_usb *usb);

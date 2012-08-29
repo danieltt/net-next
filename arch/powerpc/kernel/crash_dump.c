@@ -28,10 +28,7 @@
 #define DBG(fmt...)
 #endif
 
-/* Stores the physical address of elf header of crash image. */
-unsigned long long elfcorehdr_addr = ELFCORE_ADDR_MAX;
-
-#ifndef CONFIG_RELOCATABLE
+#ifndef CONFIG_NONSTATIC_KERNEL
 void __init reserve_kdump_trampoline(void)
 {
 	memblock_reserve(0, KDUMP_RESERVE_LIMIT);
@@ -70,21 +67,7 @@ void __init setup_kdump_trampoline(void)
 
 	DBG(" <- setup_kdump_trampoline()\n");
 }
-#endif /* CONFIG_RELOCATABLE */
-
-/*
- * Note: elfcorehdr_addr is not just limited to vmcore. It is also used by
- * is_kdump_kernel() to determine if we are booting after a panic. Hence
- * ifdef it under CONFIG_CRASH_DUMP and not CONFIG_PROC_VMCORE.
- */
-static int __init parse_elfcorehdr(char *p)
-{
-	if (p)
-		elfcorehdr_addr = memparse(p, &p);
-
-	return 1;
-}
-__setup("elfcorehdr=", parse_elfcorehdr);
+#endif /* CONFIG_NONSTATIC_KERNEL */
 
 static int __init parse_savemaxmem(char *p)
 {

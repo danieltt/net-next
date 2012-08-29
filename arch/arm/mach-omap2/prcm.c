@@ -23,8 +23,9 @@
 #include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/delay.h>
+#include <linux/export.h>
 
-#include <plat/common.h>
+#include "common.h"
 #include <plat/prcm.h>
 #include <plat/irqs.h>
 
@@ -34,6 +35,7 @@
 #include "prm2xxx_3xxx.h"
 #include "prm44xx.h"
 #include "prminst44xx.h"
+#include "cminst44xx.h"
 #include "prm-regbits-24xx.h"
 #include "prm-regbits-44xx.h"
 #include "control.h"
@@ -41,6 +43,7 @@
 void __iomem *prm_base;
 void __iomem *cm_base;
 void __iomem *cm2_base;
+void __iomem *prcm_mpu_base;
 
 #define MAX_MODULE_ENABLE_WAIT		100000
 
@@ -57,7 +60,7 @@ u32 omap_prcm_get_reset_sources(void)
 EXPORT_SYMBOL(omap_prcm_get_reset_sources);
 
 /* Resets clock rates and reboots the system. Only called from system.h */
-void omap_prcm_arch_reset(char mode, const char *cmd)
+void omap_prcm_restart(char mode, const char *cmd)
 {
 	s16 prcm_offs = 0;
 
@@ -69,7 +72,7 @@ void omap_prcm_arch_reset(char mode, const char *cmd)
 		prcm_offs = OMAP3430_GR_MOD;
 		omap3_ctrl_write_boot_mode((cmd ? (u8)*cmd : 0));
 	} else if (cpu_is_omap44xx()) {
-		omap4_prm_global_warm_sw_reset(); /* never returns */
+		omap4_prminst_global_warm_sw_reset(); /* never returns */
 	} else {
 		WARN_ON(1);
 	}
@@ -148,17 +151,39 @@ int omap2_cm_wait_idlest(void __iomem *reg, u32 mask, u8 idlest,
 
 void __init omap2_set_globals_prcm(struct omap_globals *omap2_globals)
 {
-	/* Static mapping, never released */
-	if (omap2_globals->prm) {
-		prm_base = ioremap(omap2_globals->prm, SZ_8K);
-		WARN_ON(!prm_base);
+	if (omap2_globals->prm)
+		prm_base = omap2_globals->prm;
+	if (omap2_globals->cm)
+		cm_base = omap2_globals->cm;
+	if (omap2_globals->cm2)
+		cm2_base = omap2_globals->cm2;
+	if (omap2_globals->prcm_mpu)
+		prcm_mpu_base = omap2_globals->prcm_mpu;
+
+	if (cpu_is_omap44xx() || soc_is_omap54xx()) {
+		omap_prm_base_init();
+		omap_cm_base_init();
 	}
-	if (omap2_globals->cm) {
-		cm_base = ioremap(omap2_globals->cm, SZ_8K);
-		WARN_ON(!cm_base);
-	}
-	if (omap2_globals->cm2) {
-		cm2_base = ioremap(omap2_globals->cm2, SZ_8K);
-		WARN_ON(!cm2_base);
-	}
+}
+
+/*
+ * Stubbed functions so that common files continue to build when
+ * custom builds are used
+ * XXX These are temporary and should be removed at the earliest possible
+ * opportunity
+ */
+int __weak omap4_cminst_wait_module_idle(u8 part, u16 inst, s16 cdoffs,
+					u16 clkctrl_offs)
+{
+	return 0;
+}
+
+void __weak omap4_cminst_module_enable(u8 mode, u8 part, u16 inst,
+				s16 cdoffs, u16 clkctrl_offs)
+{
+}
+
+void __weak omap4_cminst_module_disable(u8 part, u16 inst, s16 cdoffs,
+				 u16 clkctrl_offs)
+{
 }

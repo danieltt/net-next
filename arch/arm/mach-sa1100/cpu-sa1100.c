@@ -68,7 +68,7 @@
  * clock change in ROM and jump to that code from the kernel. The main
  * disadvantage is that the ROM has to be modified, which is not
  * possible on all SA-1100 platforms. Another disadvantage is that
- * jumping to ROM makes clock switching unecessary complicated.
+ * jumping to ROM makes clock switching unnecessary complicated.
  *
  * The idea behind this driver is that the memory configuration can be
  * changed while running from DRAM (even with interrupts turned on!)
@@ -87,6 +87,7 @@
 #include <linux/types.h>
 #include <linux/init.h>
 #include <linux/cpufreq.h>
+#include <linux/io.h>
 
 #include <asm/cputype.h>
 
@@ -228,7 +229,7 @@ static int __init sa1100_cpu_init(struct cpufreq_policy *policy)
 	return 0;
 }
 
-static struct cpufreq_driver sa1100_driver = {
+static struct cpufreq_driver sa1100_driver __refdata = {
 	.flags		= CPUFREQ_STICKY,
 	.verify		= sa11x0_verify_speed,
 	.target		= sa1100_target,

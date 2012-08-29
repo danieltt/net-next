@@ -15,7 +15,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
- * Copyright (C) IBM Corporation, 2002, 2006
+ * Copyright IBM Corp. 2002, 2006
  *
  * s390 port, used ppc64 as template. Mike Grundy <grundym@us.ibm.com>
  */
@@ -635,7 +635,7 @@ void __kprobes jprobe_return(void)
 	asm volatile(".word 0x0002");
 }
 
-void __kprobes jprobe_return_end(void)
+static void __used __kprobes jprobe_return_end(void)
 {
 	asm volatile("bcr 0,0");
 }

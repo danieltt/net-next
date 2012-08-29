@@ -201,7 +201,7 @@ static const struct dentry_operations msdos_dentry_operations = {
 
 /***** Get inode using directory and name */
 static struct dentry *msdos_lookup(struct inode *dir, struct dentry *dentry,
-				   struct nameidata *nd)
+				   unsigned int flags)
 {
 	struct super_block *sb = dir->i_sb;
 	struct fat_slot_info sinfo;
@@ -209,29 +209,20 @@ static struct dentry *msdos_lookup(struct inode *dir, struct dentry *dentry,
 	int err;
 
 	lock_super(sb);
-
 	err = msdos_find(dir, dentry->d_name.name, dentry->d_name.len, &sinfo);
-	if (err) {
-		if (err == -ENOENT) {
-			inode = NULL;
-			goto out;
-		}
-		goto error;
+	switch (err) {
+	case -ENOENT:
+		inode = NULL;
+		break;
+	case 0:
+		inode = fat_build_inode(sb, sinfo.de, sinfo.i_pos);
+		brelse(sinfo.bh);
+		break;
+	default:
+		inode = ERR_PTR(err);
 	}
-
-	inode = fat_build_inode(sb, sinfo.de, sinfo.i_pos);
-	brelse(sinfo.bh);
-	if (IS_ERR(inode)) {
-		err = PTR_ERR(inode);
-		goto error;
-	}
-out:
 	unlock_super(sb);
 	return d_splice_alias(inode, dentry);
-
-error:
-	unlock_super(sb);
-	return ERR_PTR(err);
 }
 
 /***** Creates a directory entry (name is already formatted). */
@@ -255,8 +246,7 @@ static int msdos_add_entry(struct inode *dir, const unsigned char *name,
 	de.ctime_cs = 0;
 	de.time = time;
 	de.date = date;
-	de.start = cpu_to_le16(cluster);
-	de.starthi = cpu_to_le16(cluster >> 16);
+	fat_set_start(&de, cluster);
 	de.size = 0;
 
 	err = fat_add_entries(dir, &de, 1, sinfo);
@@ -273,8 +263,8 @@ static int msdos_add_entry(struct inode *dir, const unsigned char *name,
 }
 
 /***** Create a file */
-static int msdos_create(struct inode *dir, struct dentry *dentry, int mode,
-			struct nameidata *nd)
+static int msdos_create(struct inode *dir, struct dentry *dentry, umode_t mode,
+			bool excl)
 {
 	struct super_block *sb = dir->i_sb;
 	struct inode *inode = NULL;
@@ -355,7 +345,7 @@ out:
 }
 
 /***** Make a directory */
-static int msdos_mkdir(struct inode *dir, struct dentry *dentry, int mode)
+static int msdos_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	struct super_block *sb = dir->i_sb;
 	struct fat_slot_info sinfo;
@@ -396,7 +386,7 @@ static int msdos_mkdir(struct inode *dir, struct dentry *dentry, int mode)
 		/* the directory was completed, just return a error */
 		goto out;
 	}
-	inode->i_nlink = 2;
+	set_nlink(inode, 2);
 	inode->i_mtime = inode->i_atime = inode->i_ctime = ts;
 	/* timestamp is already written, so mark_inode_dirty() is unneeded. */
 
@@ -539,9 +529,7 @@ static int do_msdos_rename(struct inode *old_dir, unsigned char *old_name,
 		mark_inode_dirty(old_inode);
 
 	if (update_dotdot) {
-		int start = MSDOS_I(new_dir)->i_logstart;
-		dotdot_de->start = cpu_to_le16(start);
-		dotdot_de->starthi = cpu_to_le16(start >> 16);
+		fat_set_start(dotdot_de, MSDOS_I(new_dir)->i_logstart);
 		mark_buffer_dirty_inode(dotdot_bh, old_inode);
 		if (IS_DIRSYNC(new_dir)) {
 			err = sync_dirty_buffer(dotdot_bh);
@@ -581,9 +569,7 @@ error_dotdot:
 	corrupt = 1;
 
 	if (update_dotdot) {
-		int start = MSDOS_I(old_dir)->i_logstart;
-		dotdot_de->start = cpu_to_le16(start);
-		dotdot_de->starthi = cpu_to_le16(start >> 16);
+		fat_set_start(dotdot_de, MSDOS_I(old_dir)->i_logstart);
 		mark_buffer_dirty_inode(dotdot_bh, old_inode);
 		corrupt |= sync_dirty_buffer(dotdot_bh);
 	}
@@ -659,14 +645,14 @@ static const struct inode_operations msdos_dir_inode_operations = {
 
 static void setup(struct super_block *sb)
 {
+	MSDOS_SB(sb)->dir_ops = &msdos_dir_inode_operations;
 	sb->s_d_op = &msdos_dentry_operations;
 	sb->s_flags |= MS_NOATIME;
 }
 
 static int msdos_fill_super(struct super_block *sb, void *data, int silent)
 {
-	return fat_fill_super(sb, data, silent, &msdos_dir_inode_operations,
-			     0, setup);
+	return fat_fill_super(sb, data, silent, 0, setup);
 }
 
 static struct dentry *msdos_mount(struct file_system_type *fs_type,

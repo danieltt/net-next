@@ -12,7 +12,7 @@
  *
  *   Hans Liss <hans.liss@its.uu.se>  Uppsala Universitet
  *
- * This work is based on the LPC-trie which is originally descibed in:
+ * This work is based on the LPC-trie which is originally described in:
  *
  * An experimental study of compression methods for dynamic tries
  * Stefan Nilsson and Matti Tikkanen. Algorithmica, 33(1):19-33, 2002.
@@ -51,7 +51,6 @@
 #define VERSION "0.409"
 
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <linux/bitops.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
@@ -72,6 +71,8 @@
 #include <linux/init.h>
 #include <linux/list.h>
 #include <linux/slab.h>
+#include <linux/prefetch.h>
+#include <linux/export.h>
 #include <net/net_namespace.h>
 #include <net/ip.h>
 #include <net/protocol.h>
@@ -109,9 +110,10 @@ struct leaf {
 
 struct leaf_info {
 	struct hlist_node hlist;
-	struct rcu_head rcu;
 	int plen;
+	u32 mask_plen; /* ntohl(inet_make_mask(plen)) */
 	struct list_head falh;
+	struct rcu_head rcu;
 };
 
 struct tnode {
@@ -126,7 +128,7 @@ struct tnode {
 		struct work_struct work;
 		struct tnode *tnode_free;
 	};
-	struct rt_trie_node *child[0];
+	struct rt_trie_node __rcu *child[0];
 };
 
 #ifdef CONFIG_IP_FIB_TRIE_STATS
@@ -151,13 +153,12 @@ struct trie_stat {
 };
 
 struct trie {
-	struct rt_trie_node *trie;
+	struct rt_trie_node __rcu *trie;
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 	struct trie_use_stats stats;
 #endif
 };
 
-static void put_child(struct trie *t, struct tnode *tn, int i, struct rt_trie_node *n);
 static void tnode_put_child_reorg(struct tnode *tn, int i, struct rt_trie_node *n,
 				  int wasfull);
 static struct rt_trie_node *resize(struct trie *t, struct tnode *tn);
@@ -177,16 +178,29 @@ static const int sync_pages = 128;
 static struct kmem_cache *fn_alias_kmem __read_mostly;
 static struct kmem_cache *trie_leaf_kmem __read_mostly;
 
-static inline struct tnode *node_parent(struct rt_trie_node *node)
+/*
+ * caller must hold RTNL
+ */
+static inline struct tnode *node_parent(const struct rt_trie_node *node)
 {
-	return (struct tnode *)(node->parent & ~NODE_TYPE_MASK);
+	unsigned long parent;
+
+	parent = rcu_dereference_index_check(node->parent, lockdep_rtnl_is_held());
+
+	return (struct tnode *)(parent & ~NODE_TYPE_MASK);
 }
 
-static inline struct tnode *node_parent_rcu(struct rt_trie_node *node)
+/*
+ * caller must hold RCU read lock or RTNL
+ */
+static inline struct tnode *node_parent_rcu(const struct rt_trie_node *node)
 {
-	struct tnode *ret = node_parent(node);
+	unsigned long parent;
 
-	return rcu_dereference_rtnl(ret);
+	parent = rcu_dereference_index_check(node->parent, rcu_read_lock_held() ||
+							   lockdep_rtnl_is_held());
+
+	return (struct tnode *)(parent & ~NODE_TYPE_MASK);
 }
 
 /* Same as rcu_assign_pointer
@@ -198,18 +212,24 @@ static inline void node_set_parent(struct rt_trie_node *node, struct tnode *ptr)
 	node->parent = (unsigned long)ptr | NODE_TYPE(node);
 }
 
-static inline struct rt_trie_node *tnode_get_child(struct tnode *tn, unsigned int i)
+/*
+ * caller must hold RTNL
+ */
+static inline struct rt_trie_node *tnode_get_child(const struct tnode *tn, unsigned int i)
 {
 	BUG_ON(i >= 1U << tn->bits);
 
-	return tn->child[i];
+	return rtnl_dereference(tn->child[i]);
 }
 
-static inline struct rt_trie_node *tnode_get_child_rcu(struct tnode *tn, unsigned int i)
+/*
+ * caller must hold RCU read lock or RTNL
+ */
+static inline struct rt_trie_node *tnode_get_child_rcu(const struct tnode *tn, unsigned int i)
 {
-	struct rt_trie_node *ret = tnode_get_child(tn, i);
+	BUG_ON(i >= 1U << tn->bits);
 
-	return rcu_dereference_rtnl(ret);
+	return rcu_dereference_rtnl(tn->child[i]);
 }
 
 static inline int tnode_child_length(const struct tnode *tn)
@@ -347,17 +367,12 @@ static void __leaf_free_rcu(struct rcu_head *head)
 
 static inline void free_leaf(struct leaf *l)
 {
-	call_rcu_bh(&l->rcu, __leaf_free_rcu);
-}
-
-static void __leaf_info_free_rcu(struct rcu_head *head)
-{
-	kfree(container_of(head, struct leaf_info, rcu));
+	call_rcu(&l->rcu, __leaf_free_rcu);
 }
 
 static inline void free_leaf_info(struct leaf_info *leaf)
 {
-	call_rcu(&leaf->rcu, __leaf_info_free_rcu);
+	kfree_rcu(leaf, rcu);
 }
 
 static struct tnode *tnode_alloc(size_t size)
@@ -436,6 +451,7 @@ static struct leaf_info *leaf_info_new(int plen)
 	struct leaf_info *li = kmalloc(sizeof(struct leaf_info),  GFP_KERNEL);
 	if (li) {
 		li->plen = plen;
+		li->mask_plen = ntohl(inet_make_mask(plen));
 		INIT_LIST_HEAD(&li->falh);
 	}
 	return li;
@@ -456,7 +472,7 @@ static struct tnode *tnode_new(t_key key, int pos, int bits)
 	}
 
 	pr_debug("AT %p s=%zu %zu\n", tn, sizeof(struct tnode),
-		 sizeof(struct rt_trie_node) << bits);
+		 sizeof(struct rt_trie_node *) << bits);
 	return tn;
 }
 
@@ -473,7 +489,7 @@ static inline int tnode_full(const struct tnode *tn, const struct rt_trie_node *
 	return ((struct tnode *) n)->pos == tn->pos + tn->bits;
 }
 
-static inline void put_child(struct trie *t, struct tnode *tn, int i,
+static inline void put_child(struct tnode *tn, int i,
 			     struct rt_trie_node *n)
 {
 	tnode_put_child_reorg(tn, i, n, -1);
@@ -487,7 +503,7 @@ static inline void put_child(struct trie *t, struct tnode *tn, int i,
 static void tnode_put_child_reorg(struct tnode *tn, int i, struct rt_trie_node *n,
 				  int wasfull)
 {
-	struct rt_trie_node *chi = tn->child[i];
+	struct rt_trie_node *chi = rtnl_dereference(tn->child[i]);
 	int isfull;
 
 	BUG_ON(i >= 1<<tn->bits);
@@ -665,7 +681,7 @@ one_child:
 		for (i = 0; i < tnode_child_length(tn); i++) {
 			struct rt_trie_node *n;
 
-			n = tn->child[i];
+			n = rtnl_dereference(tn->child[i]);
 			if (!n)
 				continue;
 
@@ -677,6 +693,20 @@ one_child:
 		}
 	}
 	return (struct rt_trie_node *) tn;
+}
+
+
+static void tnode_clean_free(struct tnode *tn)
+{
+	int i;
+	struct tnode *tofree;
+
+	for (i = 0; i < tnode_child_length(tn); i++) {
+		tofree = (struct tnode *)rtnl_dereference(tn->child[i]);
+		if (tofree)
+			tnode_free(tofree);
+	}
+	tnode_free(tn);
 }
 
 static struct tnode *inflate(struct trie *t, struct tnode *tn)
@@ -723,8 +753,8 @@ static struct tnode *inflate(struct trie *t, struct tnode *tn)
 				goto nomem;
 			}
 
-			put_child(t, tn, 2*i, (struct rt_trie_node *) left);
-			put_child(t, tn, 2*i+1, (struct rt_trie_node *) right);
+			put_child(tn, 2*i, (struct rt_trie_node *) left);
+			put_child(tn, 2*i+1, (struct rt_trie_node *) right);
 		}
 	}
 
@@ -745,9 +775,9 @@ static struct tnode *inflate(struct trie *t, struct tnode *tn)
 			if (tkey_extract_bits(node->key,
 					      oldtnode->pos + oldtnode->bits,
 					      1) == 0)
-				put_child(t, tn, 2*i, node);
+				put_child(tn, 2*i, node);
 			else
-				put_child(t, tn, 2*i+1, node);
+				put_child(tn, 2*i+1, node);
 			continue;
 		}
 
@@ -755,8 +785,8 @@ static struct tnode *inflate(struct trie *t, struct tnode *tn)
 		inode = (struct tnode *) node;
 
 		if (inode->bits == 1) {
-			put_child(t, tn, 2*i, inode->child[0]);
-			put_child(t, tn, 2*i+1, inode->child[1]);
+			put_child(tn, 2*i, rtnl_dereference(inode->child[0]));
+			put_child(tn, 2*i+1, rtnl_dereference(inode->child[1]));
 
 			tnode_free_safe(inode);
 			continue;
@@ -786,40 +816,30 @@ static struct tnode *inflate(struct trie *t, struct tnode *tn)
 		 */
 
 		left = (struct tnode *) tnode_get_child(tn, 2*i);
-		put_child(t, tn, 2*i, NULL);
+		put_child(tn, 2*i, NULL);
 
 		BUG_ON(!left);
 
 		right = (struct tnode *) tnode_get_child(tn, 2*i+1);
-		put_child(t, tn, 2*i+1, NULL);
+		put_child(tn, 2*i+1, NULL);
 
 		BUG_ON(!right);
 
 		size = tnode_child_length(left);
 		for (j = 0; j < size; j++) {
-			put_child(t, left, j, inode->child[j]);
-			put_child(t, right, j, inode->child[j + size]);
+			put_child(left, j, rtnl_dereference(inode->child[j]));
+			put_child(right, j, rtnl_dereference(inode->child[j + size]));
 		}
-		put_child(t, tn, 2*i, resize(t, left));
-		put_child(t, tn, 2*i+1, resize(t, right));
+		put_child(tn, 2*i, resize(t, left));
+		put_child(tn, 2*i+1, resize(t, right));
 
 		tnode_free_safe(inode);
 	}
 	tnode_free_safe(oldtnode);
 	return tn;
 nomem:
-	{
-		int size = tnode_child_length(tn);
-		int j;
-
-		for (j = 0; j < size; j++)
-			if (tn->child[j])
-				tnode_free((struct tnode *)tn->child[j]);
-
-		tnode_free(tn);
-
-		return ERR_PTR(-ENOMEM);
-	}
+	tnode_clean_free(tn);
+	return ERR_PTR(-ENOMEM);
 }
 
 static struct tnode *halve(struct trie *t, struct tnode *tn)
@@ -856,7 +876,7 @@ static struct tnode *halve(struct trie *t, struct tnode *tn)
 			if (!newn)
 				goto nomem;
 
-			put_child(t, tn, i/2, (struct rt_trie_node *)newn);
+			put_child(tn, i/2, (struct rt_trie_node *)newn);
 		}
 
 	}
@@ -871,37 +891,27 @@ static struct tnode *halve(struct trie *t, struct tnode *tn)
 		if (left == NULL) {
 			if (right == NULL)    /* Both are empty */
 				continue;
-			put_child(t, tn, i/2, right);
+			put_child(tn, i/2, right);
 			continue;
 		}
 
 		if (right == NULL) {
-			put_child(t, tn, i/2, left);
+			put_child(tn, i/2, left);
 			continue;
 		}
 
 		/* Two nonempty children */
 		newBinNode = (struct tnode *) tnode_get_child(tn, i/2);
-		put_child(t, tn, i/2, NULL);
-		put_child(t, newBinNode, 0, left);
-		put_child(t, newBinNode, 1, right);
-		put_child(t, tn, i/2, resize(t, newBinNode));
+		put_child(tn, i/2, NULL);
+		put_child(newBinNode, 0, left);
+		put_child(newBinNode, 1, right);
+		put_child(tn, i/2, resize(t, newBinNode));
 	}
 	tnode_free_safe(oldtnode);
 	return tn;
 nomem:
-	{
-		int size = tnode_child_length(tn);
-		int j;
-
-		for (j = 0; j < size; j++)
-			if (tn->child[j])
-				tnode_free((struct tnode *)tn->child[j]);
-
-		tnode_free(tn);
-
-		return ERR_PTR(-ENOMEM);
-	}
+	tnode_clean_free(tn);
+	return ERR_PTR(-ENOMEM);
 }
 
 /* readside must use rcu_read_lock currently dump routines
@@ -996,9 +1006,9 @@ static void trie_rebalance(struct trie *t, struct tnode *tn)
 	while (tn != NULL && (tp = node_parent((struct rt_trie_node *)tn)) != NULL) {
 		cindex = tkey_extract_bits(key, tp->pos, tp->bits);
 		wasfull = tnode_full(tp, tnode_get_child(tp, cindex));
-		tn = (struct tnode *) resize(t, (struct tnode *)tn);
+		tn = (struct tnode *)resize(t, tn);
 
-		tnode_put_child_reorg((struct tnode *)tp, cindex,
+		tnode_put_child_reorg(tp, cindex,
 				      (struct rt_trie_node *)tn, wasfull);
 
 		tp = node_parent((struct rt_trie_node *) tn);
@@ -1013,7 +1023,7 @@ static void trie_rebalance(struct trie *t, struct tnode *tn)
 
 	/* Handle last (top) tnode */
 	if (IS_TNODE(tn))
-		tn = (struct tnode *)resize(t, (struct tnode *)tn);
+		tn = (struct tnode *)resize(t, tn);
 
 	rcu_assign_pointer(t->trie, (struct rt_trie_node *)tn);
 	tnode_free_flush();
@@ -1033,7 +1043,7 @@ static struct list_head *fib_insert_node(struct trie *t, u32 key, int plen)
 	t_key cindex;
 
 	pos = 0;
-	n = t->trie;
+	n = rtnl_dereference(t->trie);
 
 	/* If we point to NULL, stop. Either the tree is empty and we should
 	 * just put a new leaf in if, or we have reached an empty child slot,
@@ -1114,7 +1124,7 @@ static struct list_head *fib_insert_node(struct trie *t, u32 key, int plen)
 		node_set_parent((struct rt_trie_node *)l, tp);
 
 		cindex = tkey_extract_bits(key, tp->pos, tp->bits);
-		put_child(t, (struct tnode *)tp, cindex, (struct rt_trie_node *)l);
+		put_child(tp, cindex, (struct rt_trie_node *)l);
 	} else {
 		/* Case 3: n is a LEAF or a TNODE and the key doesn't match. */
 		/*
@@ -1144,13 +1154,12 @@ static struct list_head *fib_insert_node(struct trie *t, u32 key, int plen)
 		node_set_parent((struct rt_trie_node *)tn, tp);
 
 		missbit = tkey_extract_bits(key, newpos, 1);
-		put_child(t, tn, missbit, (struct rt_trie_node *)l);
-		put_child(t, tn, 1-missbit, n);
+		put_child(tn, missbit, (struct rt_trie_node *)l);
+		put_child(tn, 1-missbit, n);
 
 		if (tp) {
 			cindex = tkey_extract_bits(key, tp->pos, tp->bits);
-			put_child(t, (struct tnode *)tp, cindex,
-				  (struct rt_trie_node *)tn);
+			put_child(tp, cindex, (struct rt_trie_node *)tn);
 		} else {
 			rcu_assign_pointer(t->trie, (struct rt_trie_node *)tn);
 			tp = tn;
@@ -1158,9 +1167,8 @@ static struct list_head *fib_insert_node(struct trie *t, u32 key, int plen)
 	}
 
 	if (tp && tp->pos + tp->bits > 32)
-		pr_warning("fib_trie"
-			   " tp=%p pos=%d, bits=%d, key=%0x plen=%d\n",
-			   tp, tp->pos, tp->bits, key, plen);
+		pr_warn("fib_trie tp=%p pos=%d, bits=%d, key=%0x plen=%d\n",
+			tp, tp->pos, tp->bits, key, plen);
 
 	/* Rebalance the trie */
 
@@ -1245,7 +1253,6 @@ int fib_table_insert(struct fib_table *tb, struct fib_config *cfg)
 			if (fa->fa_info->fib_priority != fi->fib_priority)
 				break;
 			if (fa->fa_type == cfg->fc_type &&
-			    fa->fa_scope == cfg->fc_scope &&
 			    fa->fa_info == fi) {
 				fa_match = fa;
 				break;
@@ -1271,7 +1278,6 @@ int fib_table_insert(struct fib_table *tb, struct fib_config *cfg)
 			new_fa->fa_tos = fa->fa_tos;
 			new_fa->fa_info = fi;
 			new_fa->fa_type = cfg->fc_type;
-			new_fa->fa_scope = cfg->fc_scope;
 			state = fa->fa_state;
 			new_fa->fa_state = state & ~FA_S_ACCESSED;
 
@@ -1308,7 +1314,6 @@ int fib_table_insert(struct fib_table *tb, struct fib_config *cfg)
 	new_fa->fa_info = fi;
 	new_fa->fa_tos = tos;
 	new_fa->fa_type = cfg->fc_type;
-	new_fa->fa_scope = cfg->fc_scope;
 	new_fa->fa_state = 0;
 	/*
 	 * Insert new entry to the list.
@@ -1321,6 +1326,9 @@ int fib_table_insert(struct fib_table *tb, struct fib_config *cfg)
 			goto out_free_new_fa;
 		}
 	}
+
+	if (!plen)
+		tb->tb_num_default++;
 
 	list_add_tail_rcu(&new_fa->fa_list,
 			  (fa ? &fa->fa_list : fa_head));
@@ -1350,10 +1358,8 @@ static int check_leaf(struct fib_table *tb, struct trie *t, struct leaf *l,
 
 	hlist_for_each_entry_rcu(li, node, hhead, hlist) {
 		struct fib_alias *fa;
-		int plen = li->plen;
-		__be32 mask = inet_make_mask(plen);
 
-		if (l->key != (key & ntohl(mask)))
+		if (l->key != (key & li->mask_plen))
 			continue;
 
 		list_for_each_entry_rcu(fa, &li->falh, fa_list) {
@@ -1362,15 +1368,17 @@ static int check_leaf(struct fib_table *tb, struct trie *t, struct leaf *l,
 
 			if (fa->fa_tos && fa->fa_tos != flp->flowi4_tos)
 				continue;
-			if (fa->fa_scope < flp->flowi4_scope)
+			if (fi->fib_dead)
+				continue;
+			if (fa->fa_info->fib_scope < flp->flowi4_scope)
 				continue;
 			fib_alias_accessed(fa);
 			err = fib_props[fa->fa_type].error;
 			if (err) {
 #ifdef CONFIG_IP_FIB_TRIE_STATS
-				t->stats.semantic_match_miss++;
+				t->stats.semantic_match_passed++;
 #endif
-				return 1;
+				return err;
 			}
 			if (fi->fib_flags & RTNH_F_DEAD)
 				continue;
@@ -1385,15 +1393,15 @@ static int check_leaf(struct fib_table *tb, struct trie *t, struct leaf *l,
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 				t->stats.semantic_match_passed++;
 #endif
-				res->prefixlen = plen;
+				res->prefixlen = li->plen;
 				res->nh_sel = nhsel;
 				res->type = fa->fa_type;
-				res->scope = fa->fa_scope;
+				res->scope = fa->fa_info->fib_scope;
 				res->fi = fi;
 				res->table = tb;
 				res->fa_head = &li->falh;
 				if (!(fib_flags & FIB_LOOKUP_NOREF))
-					atomic_inc(&res->fi->fib_clntref);
+					atomic_inc(&fi->fib_clntref);
 				return 0;
 			}
 		}
@@ -1542,7 +1550,8 @@ int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
 		 * state.directly.
 		 */
 		if (pref_mismatch) {
-			int mp = KEYLENGTH - fls(pref_mismatch);
+			/* fls(x) = __fls(x) + 1 */
+			int mp = KEYLENGTH - __fls(pref_mismatch) - 1;
 
 			if (tkey_extract_bits(cn->key, mp, cn->pos - mp) != 0)
 				goto backtrace;
@@ -1597,6 +1606,7 @@ found:
 	rcu_read_unlock();
 	return ret;
 }
+EXPORT_SYMBOL_GPL(fib_table_lookup);
 
 /*
  * Remove the leaf and return parent.
@@ -1609,10 +1619,10 @@ static void trie_leaf_remove(struct trie *t, struct leaf *l)
 
 	if (tp) {
 		t_key cindex = tkey_extract_bits(l->key, tp->pos, tp->bits);
-		put_child(t, (struct tnode *)tp, cindex, NULL);
+		put_child(tp, cindex, NULL);
 		trie_rebalance(t, tp);
 	} else
-		rcu_assign_pointer(t->trie, NULL);
+		RCU_INIT_POINTER(t->trie, NULL);
 
 	free_leaf(l);
 }
@@ -1646,7 +1656,12 @@ int fib_table_delete(struct fib_table *tb, struct fib_config *cfg)
 	if (!l)
 		return -ESRCH;
 
-	fa_head = get_fa_head(l, plen);
+	li = find_leaf_info(l, plen);
+
+	if (!li)
+		return -ESRCH;
+
+	fa_head = &li->falh;
 	fa = fib_find_alias(fa_head, tos, 0);
 
 	if (!fa)
@@ -1664,7 +1679,9 @@ int fib_table_delete(struct fib_table *tb, struct fib_config *cfg)
 
 		if ((!cfg->fc_type || fa->fa_type == cfg->fc_type) &&
 		    (cfg->fc_scope == RT_SCOPE_NOWHERE ||
-		     fa->fa_scope == cfg->fc_scope) &&
+		     fa->fa_info->fib_scope == cfg->fc_scope) &&
+		    (!cfg->fc_prefsrc ||
+		     fi->fib_prefsrc == cfg->fc_prefsrc) &&
 		    (!cfg->fc_protocol ||
 		     fi->fib_protocol == cfg->fc_protocol) &&
 		    fib_nh_match(cfg, fi) == 0) {
@@ -1680,10 +1697,10 @@ int fib_table_delete(struct fib_table *tb, struct fib_config *cfg)
 	rtmsg_fib(RTM_DELROUTE, htonl(key), fa, plen, tb->tb_id,
 		  &cfg->fc_nlinfo, 0);
 
-	l = fib_find_node(t, key);
-	li = find_leaf_info(l, plen);
-
 	list_del_rcu(&fa->fa_list);
+
+	if (!plen)
+		tb->tb_num_default--;
 
 	if (list_empty(fa_head)) {
 		hlist_del_rcu(&li->hlist);
@@ -1757,7 +1774,7 @@ static struct leaf *leaf_walk_rcu(struct tnode *p, struct rt_trie_node *c)
 				continue;
 
 			if (IS_LEAF(c)) {
-				prefetch(p->child[idx]);
+				prefetch(rcu_dereference_rtnl(p->child[idx]));
 				return (struct leaf *) c;
 			}
 
@@ -1861,7 +1878,6 @@ static int fn_trie_dump_fa(t_key key, int plen, struct list_head *fah,
 				  RTM_NEWROUTE,
 				  tb->tb_id,
 				  fa->fa_type,
-				  fa->fa_scope,
 				  xkey,
 				  plen,
 				  fa->fa_tos,
@@ -1976,12 +1992,10 @@ struct fib_table *fib_trie_table(u32 id)
 
 	tb->tb_id = id;
 	tb->tb_default = -1;
+	tb->tb_num_default = 0;
 
 	t = (struct trie *) tb->tb_data;
 	memset(t, 0, sizeof(*t));
-
-	if (id == RT_TABLE_LOCAL)
-		pr_info("IPv4 FIB: Using LC-trie version %s\n", VERSION);
 
 	return tb;
 }
@@ -2274,7 +2288,7 @@ static void *fib_trie_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 
 	/* walk rest of this hash chain */
 	h = tb->tb_id & (FIB_TABLE_HASHSZ - 1);
-	while ( (tb_node = rcu_dereference(tb->tb_hlist.next)) ) {
+	while ((tb_node = rcu_dereference(hlist_next_rcu(&tb->tb_hlist)))) {
 		tb = hlist_entry(tb_node, struct fib_table, tb_hlist);
 		n = fib_trie_get_first(iter, (struct trie *) tb->tb_data);
 		if (n)
@@ -2382,7 +2396,7 @@ static int fib_trie_seq_show(struct seq_file *seq, void *v)
 				seq_indent(seq, iter->depth+1);
 				seq_printf(seq, "  /%d %s %s", li->plen,
 					   rtn_scope(buf1, sizeof(buf1),
-						     fa->fa_scope),
+						     fa->fa_info->fib_scope),
 					   rtn_type(buf2, sizeof(buf2),
 						    fa->fa_type));
 				if (fa->fa_tos)

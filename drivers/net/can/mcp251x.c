@@ -214,7 +214,7 @@ static int mcp251x_enable_dma; /* Enable SPI DMA. Default: 0 (Off) */
 module_param(mcp251x_enable_dma, int, S_IRUGO);
 MODULE_PARM_DESC(mcp251x_enable_dma, "Enable SPI DMA. Default: 0 (Off)");
 
-static struct can_bittiming_const mcp251x_bittiming_const = {
+static const struct can_bittiming_const mcp251x_bittiming_const = {
 	.name = DEVICE_NAME,
 	.tseg1_min = 3,
 	.tseg1_max = 16,
@@ -712,8 +712,7 @@ static void mcp251x_error_skb(struct net_device *net, int can_id, int data1)
 		frame->data[1] = data1;
 		netif_rx_ni(skb);
 	} else {
-		dev_err(&net->dev,
-			"cannot allocate error skb\n");
+		netdev_err(net, "cannot allocate error skb\n");
 	}
 }
 
@@ -931,7 +930,8 @@ static int mcp251x_open(struct net_device *net)
 	priv->tx_len = 0;
 
 	ret = request_threaded_irq(spi->irq, NULL, mcp251x_can_ist,
-			  IRQF_TRIGGER_FALLING, DEVICE_NAME, priv);
+		  pdata->irq_flags ? pdata->irq_flags : IRQF_TRIGGER_FALLING,
+		  DEVICE_NAME, priv);
 	if (ret) {
 		dev_err(&spi->dev, "failed to acquire irq %d\n", spi->irq);
 		if (pdata->transceiver_enable)
@@ -1020,8 +1020,7 @@ static int __devinit mcp251x_can_probe(struct spi_device *spi)
 						      GFP_DMA);
 
 		if (priv->spi_tx_buf) {
-			priv->spi_rx_buf = (u8 *)(priv->spi_tx_buf +
-						  (PAGE_SIZE / 2));
+			priv->spi_rx_buf = (priv->spi_tx_buf + (PAGE_SIZE / 2));
 			priv->spi_rx_dma = (dma_addr_t)(priv->spi_tx_dma +
 							(PAGE_SIZE / 2));
 		} else {

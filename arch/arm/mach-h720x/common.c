@@ -24,6 +24,7 @@
 #include <asm/dma.h>
 #include <mach/hardware.h>
 #include <asm/irq.h>
+#include <asm/system_misc.h>
 #include <asm/mach/irq.h>
 #include <asm/mach/map.h>
 #include <mach/irqs.h>
@@ -199,29 +200,29 @@ void __init h720x_init_irq (void)
 
 	/* Initialize global IRQ's, fast path */
 	for (irq = 0; irq < NR_GLBL_IRQS; irq++) {
-		set_irq_chip(irq, &h720x_global_chip);
-		set_irq_handler(irq, handle_level_irq);
+		irq_set_chip_and_handler(irq, &h720x_global_chip,
+					 handle_level_irq);
 		set_irq_flags(irq, IRQF_VALID | IRQF_PROBE);
 	}
 
 	/* Initialize multiplexed IRQ's, slow path */
 	for (irq = IRQ_CHAINED_GPIOA(0) ; irq <= IRQ_CHAINED_GPIOD(31); irq++) {
-		set_irq_chip(irq, &h720x_gpio_chip);
-		set_irq_handler(irq, handle_edge_irq);
+		irq_set_chip_and_handler(irq, &h720x_gpio_chip,
+					 handle_edge_irq);
 		set_irq_flags(irq, IRQF_VALID );
 	}
-	set_irq_chained_handler(IRQ_GPIOA, h720x_gpioa_demux_handler);
-	set_irq_chained_handler(IRQ_GPIOB, h720x_gpiob_demux_handler);
-	set_irq_chained_handler(IRQ_GPIOC, h720x_gpioc_demux_handler);
-	set_irq_chained_handler(IRQ_GPIOD, h720x_gpiod_demux_handler);
+	irq_set_chained_handler(IRQ_GPIOA, h720x_gpioa_demux_handler);
+	irq_set_chained_handler(IRQ_GPIOB, h720x_gpiob_demux_handler);
+	irq_set_chained_handler(IRQ_GPIOC, h720x_gpioc_demux_handler);
+	irq_set_chained_handler(IRQ_GPIOD, h720x_gpiod_demux_handler);
 
 #ifdef CONFIG_CPU_H7202
 	for (irq = IRQ_CHAINED_GPIOE(0) ; irq <= IRQ_CHAINED_GPIOE(31); irq++) {
-		set_irq_chip(irq, &h720x_gpio_chip);
-		set_irq_handler(irq, handle_edge_irq);
+		irq_set_chip_and_handler(irq, &h720x_gpio_chip,
+					 handle_edge_irq);
 		set_irq_flags(irq, IRQF_VALID );
 	}
-	set_irq_chained_handler(IRQ_GPIOE, h720x_gpioe_demux_handler);
+	irq_set_chained_handler(IRQ_GPIOE, h720x_gpioe_demux_handler);
 #endif
 
 	/* Enable multiplexed irq's */
@@ -242,3 +243,26 @@ void __init h720x_map_io(void)
 {
 	iotable_init(h720x_io_desc,ARRAY_SIZE(h720x_io_desc));
 }
+
+void h720x_restart(char mode, const char *cmd)
+{
+	CPU_REG (PMU_BASE, PMU_STAT) |= PMU_WARMRESET;
+}
+
+static void h720x__idle(void)
+{
+	CPU_REG (PMU_BASE, PMU_MODE) = PMU_MODE_IDLE;
+	nop();
+	nop();
+	CPU_REG (PMU_BASE, PMU_MODE) = PMU_MODE_RUN;
+	nop();
+	nop();
+}
+
+static int __init h720x_idle_init(void)
+{
+	arm_pm_idle = h720x__idle;
+	return 0;
+}
+
+arch_initcall(h720x_idle_init);

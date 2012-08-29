@@ -258,10 +258,14 @@ void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
 	forget->forget_one.nlookup = nlookup;
 
 	spin_lock(&fc->lock);
-	fc->forget_list_tail->next = forget;
-	fc->forget_list_tail = forget;
-	wake_up(&fc->waitq);
-	kill_fasync(&fc->fasync, SIGIO, POLL_IN);
+	if (fc->connected) {
+		fc->forget_list_tail->next = forget;
+		fc->forget_list_tail = forget;
+		wake_up(&fc->waitq);
+		kill_fasync(&fc->fasync, SIGIO, POLL_IN);
+	} else {
+		kfree(forget);
+	}
 	spin_unlock(&fc->lock);
 }
 
@@ -737,14 +741,12 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
 	if (WARN_ON(PageMlocked(oldpage)))
 		goto out_fallback_unlock;
 
-	remove_from_page_cache(oldpage);
-	page_cache_release(oldpage);
-
-	err = add_to_page_cache_locked(newpage, mapping, index, GFP_KERNEL);
+	err = replace_page_cache_page(oldpage, newpage, GFP_KERNEL);
 	if (err) {
-		printk(KERN_WARNING "fuse_try_move_page: failed to add page");
-		goto out_fallback_unlock;
+		unlock_page(newpage);
+		return err;
 	}
+
 	page_cache_get(newpage);
 
 	if (!(buf->flags & PIPE_BUF_FLAG_LRU))
@@ -836,10 +838,10 @@ static int fuse_copy_page(struct fuse_copy_state *cs, struct page **pagep,
 			}
 		}
 		if (page) {
-			void *mapaddr = kmap_atomic(page, KM_USER0);
+			void *mapaddr = kmap_atomic(page);
 			void *buf = mapaddr + offset;
 			offset += fuse_copy_do(cs, &buf, &count);
-			kunmap_atomic(mapaddr, KM_USER0);
+			kunmap_atomic(mapaddr);
 		} else
 			offset += fuse_copy_do(cs, NULL, &count);
 	}
@@ -1360,6 +1362,10 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
 	if (outarg.namelen > FUSE_NAME_MAX)
 		goto err;
 
+	err = -EINVAL;
+	if (size != sizeof(outarg) + outarg.namelen + 1)
+		goto err;
+
 	name.name = buf;
 	name.len = outarg.namelen;
 	err = fuse_copy_one(cs, buf, outarg.namelen + 1);
@@ -1372,7 +1378,59 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
 	down_read(&fc->killsb);
 	err = -ENOENT;
 	if (fc->sb)
-		err = fuse_reverse_inval_entry(fc->sb, outarg.parent, &name);
+		err = fuse_reverse_inval_entry(fc->sb, outarg.parent, 0, &name);
+	up_read(&fc->killsb);
+	kfree(buf);
+	return err;
+
+err:
+	kfree(buf);
+	fuse_copy_finish(cs);
+	return err;
+}
+
+static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
+			      struct fuse_copy_state *cs)
+{
+	struct fuse_notify_delete_out outarg;
+	int err = -ENOMEM;
+	char *buf;
+	struct qstr name;
+
+	buf = kzalloc(FUSE_NAME_MAX + 1, GFP_KERNEL);
+	if (!buf)
+		goto err;
+
+	err = -EINVAL;
+	if (size < sizeof(outarg))
+		goto err;
+
+	err = fuse_copy_one(cs, &outarg, sizeof(outarg));
+	if (err)
+		goto err;
+
+	err = -ENAMETOOLONG;
+	if (outarg.namelen > FUSE_NAME_MAX)
+		goto err;
+
+	err = -EINVAL;
+	if (size != sizeof(outarg) + outarg.namelen + 1)
+		goto err;
+
+	name.name = buf;
+	name.len = outarg.namelen;
+	err = fuse_copy_one(cs, buf, outarg.namelen + 1);
+	if (err)
+		goto err;
+	fuse_copy_finish(cs);
+	buf[outarg.namelen] = 0;
+	name.hash = full_name_hash(name.name, name.len);
+
+	down_read(&fc->killsb);
+	err = -ENOENT;
+	if (fc->sb)
+		err = fuse_reverse_inval_entry(fc->sb, outarg.parent,
+					       outarg.child, &name);
 	up_read(&fc->killsb);
 	kfree(buf);
 	return err;
@@ -1506,7 +1564,7 @@ static int fuse_retrieve(struct fuse_conn *fc, struct inode *inode,
 	else if (outarg->offset + num > file_size)
 		num = file_size - outarg->offset;
 
-	while (num) {
+	while (num && req->num_pages < FUSE_MAX_PAGES_PER_REQ) {
 		struct page *page;
 		unsigned int this_num;
 
@@ -1520,6 +1578,7 @@ static int fuse_retrieve(struct fuse_conn *fc, struct inode *inode,
 
 		num -= this_num;
 		total_len += this_num;
+		index++;
 	}
 	req->misc.retrieve_in.offset = outarg->offset;
 	req->misc.retrieve_in.size = total_len;
@@ -1589,6 +1648,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 
 	case FUSE_NOTIFY_RETRIEVE:
 		return fuse_notify_retrieve(fc, size, cs);
+
+	case FUSE_NOTIFY_DELETE:
+		return fuse_notify_delete(fc, size, cs);
 
 	default:
 		fuse_copy_finish(cs);
@@ -1910,6 +1972,21 @@ __acquires(fc->lock)
 		kfree(dequeue_forget(fc, 1, NULL));
 }
 
+static void end_polls(struct fuse_conn *fc)
+{
+	struct rb_node *p;
+
+	p = rb_first(&fc->polled_files);
+
+	while (p) {
+		struct fuse_file *ff;
+		ff = rb_entry(p, struct fuse_file, polled_node);
+		wake_up_interruptible_all(&ff->poll_wait);
+
+		p = rb_next(p);
+	}
+}
+
 /*
  * Abort all requests.
  *
@@ -1937,6 +2014,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		fc->blocked = 0;
 		end_io_requests(fc);
 		end_queued_requests(fc);
+		end_polls(fc);
 		wake_up_all(&fc->waitq);
 		wake_up_all(&fc->blocked_waitq);
 		kill_fasync(&fc->fasync, SIGIO, POLL_IN);
@@ -1953,6 +2031,7 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 		fc->connected = 0;
 		fc->blocked = 0;
 		end_queued_requests(fc);
+		end_polls(fc);
 		wake_up_all(&fc->blocked_waitq);
 		spin_unlock(&fc->lock);
 		fuse_conn_put(fc);

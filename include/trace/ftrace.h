@@ -205,6 +205,19 @@
 		ftrace_print_symbols_seq(p, value, symbols);		\
 	})
 
+#undef __print_symbolic_u64
+#if BITS_PER_LONG == 32
+#define __print_symbolic_u64(value, symbol_array...)			\
+	({								\
+		static const struct trace_print_flags_u64 symbols[] =	\
+			{ symbol_array, { -1, NULL } };			\
+		ftrace_print_symbols_seq_u64(p, value, symbols);	\
+	})
+#else
+#define __print_symbolic_u64(value, symbol_array...)			\
+			__print_symbolic(value, symbol_array)
+#endif
+
 #undef __print_hex
 #define __print_hex(buf, buf_len) ftrace_print_hex_seq(p, buf, buf_len)
 
@@ -558,6 +571,7 @@ static inline void ftrace_test_probe_##call(void)			\
 
 #undef __print_flags
 #undef __print_symbolic
+#undef __print_hex
 #undef __get_dynamic_array
 #undef __get_str
 
@@ -698,6 +712,12 @@ __attribute__((section("_ftrace_events"))) *__event_##call = &event_##call
 #undef __perf_count
 #define __perf_count(c) __count = (c)
 
+#undef __perf_task
+#define __perf_task(t) __task = (t)
+
+#undef TP_perf_assign
+#define TP_perf_assign(args...) args
+
 #undef DECLARE_EVENT_CLASS
 #define DECLARE_EVENT_CLASS(call, proto, args, tstruct, assign, print)	\
 static notrace void							\
@@ -708,6 +728,7 @@ perf_trace_##call(void *__data, proto)					\
 	struct ftrace_raw_##call *entry;				\
 	struct pt_regs __regs;						\
 	u64 __addr = 0, __count = 1;					\
+	struct task_struct *__task = NULL;				\
 	struct hlist_head *head;					\
 	int __entry_size;						\
 	int __data_size;						\
@@ -735,7 +756,7 @@ perf_trace_##call(void *__data, proto)					\
 									\
 	head = this_cpu_ptr(event_call->perf_events);			\
 	perf_trace_buf_submit(entry, __entry_size, rctx, __addr,	\
-		__count, &__regs, head);				\
+		__count, &__regs, head, __task);			\
 }
 
 /*

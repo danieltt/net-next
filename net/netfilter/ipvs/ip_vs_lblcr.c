@@ -63,6 +63,8 @@
 #define CHECK_EXPIRE_INTERVAL   (60*HZ)
 #define ENTRY_TIMEOUT           (6*60*HZ)
 
+#define DEFAULT_EXPIRATION	(24*60*60*HZ)
+
 /*
  *    It is for full expiration check.
  *    When there is no partial expiration check (garbage collection)
@@ -110,10 +112,8 @@ ip_vs_dest_set_insert(struct ip_vs_dest_set *set, struct ip_vs_dest *dest)
 	}
 
 	e = kmalloc(sizeof(*e), GFP_ATOMIC);
-	if (e == NULL) {
-		pr_err("%s(): no memory\n", __func__);
+	if (e == NULL)
 		return NULL;
-	}
 
 	atomic_inc(&dest->refcnt);
 	e->dest = dest;
@@ -150,7 +150,7 @@ static void ip_vs_dest_set_eraseall(struct ip_vs_dest_set *set)
 	write_lock(&set->lock);
 	list_for_each_entry_safe(e, ep, &set->list, list) {
 		/*
-		 * We don't kfree dest because it is refered either
+		 * We don't kfree dest because it is referred either
 		 * by its service or by the trash dest list.
 		 */
 		atomic_dec(&e->dest->refcnt);
@@ -283,6 +283,7 @@ struct ip_vs_lblcr_table {
 };
 
 
+#ifdef CONFIG_SYSCTL
 /*
  *      IPVS LBLCR sysctl table
  */
@@ -297,6 +298,7 @@ static ctl_table vs_vars_table[] = {
 	},
 	{ }
 };
+#endif
 
 static inline void ip_vs_lblcr_free(struct ip_vs_lblcr_entry *en)
 {
@@ -309,7 +311,7 @@ static inline void ip_vs_lblcr_free(struct ip_vs_lblcr_entry *en)
 /*
  *	Returns hash value for IPVS LBLCR entry
  */
-static inline unsigned
+static inline unsigned int
 ip_vs_lblcr_hashkey(int af, const union nf_inet_addr *addr)
 {
 	__be32 addr_fold = addr->ip;
@@ -330,7 +332,7 @@ ip_vs_lblcr_hashkey(int af, const union nf_inet_addr *addr)
 static void
 ip_vs_lblcr_hash(struct ip_vs_lblcr_table *tbl, struct ip_vs_lblcr_entry *en)
 {
-	unsigned hash = ip_vs_lblcr_hashkey(en->af, &en->addr);
+	unsigned int hash = ip_vs_lblcr_hashkey(en->af, &en->addr);
 
 	list_add(&en->list, &tbl->bucket[hash]);
 	atomic_inc(&tbl->entries);
@@ -345,7 +347,7 @@ static inline struct ip_vs_lblcr_entry *
 ip_vs_lblcr_get(int af, struct ip_vs_lblcr_table *tbl,
 		const union nf_inet_addr *addr)
 {
-	unsigned hash = ip_vs_lblcr_hashkey(af, addr);
+	unsigned int hash = ip_vs_lblcr_hashkey(af, addr);
 	struct ip_vs_lblcr_entry *en;
 
 	list_for_each_entry(en, &tbl->bucket[hash], list)
@@ -369,10 +371,8 @@ ip_vs_lblcr_new(struct ip_vs_lblcr_table *tbl, const union nf_inet_addr *daddr,
 	en = ip_vs_lblcr_get(dest->af, tbl, daddr);
 	if (!en) {
 		en = kmalloc(sizeof(*en), GFP_ATOMIC);
-		if (!en) {
-			pr_err("%s(): no memory\n", __func__);
+		if (!en)
 			return NULL;
-		}
 
 		en->af = dest->af;
 		ip_vs_addr_copy(dest->af, &en->addr, daddr);
@@ -410,6 +410,15 @@ static void ip_vs_lblcr_flush(struct ip_vs_lblcr_table *tbl)
 	}
 }
 
+static int sysctl_lblcr_expiration(struct ip_vs_service *svc)
+{
+#ifdef CONFIG_SYSCTL
+	struct netns_ipvs *ipvs = net_ipvs(svc->net);
+	return ipvs->sysctl_lblcr_expiration;
+#else
+	return DEFAULT_EXPIRATION;
+#endif
+}
 
 static inline void ip_vs_lblcr_full_check(struct ip_vs_service *svc)
 {
@@ -417,15 +426,14 @@ static inline void ip_vs_lblcr_full_check(struct ip_vs_service *svc)
 	unsigned long now = jiffies;
 	int i, j;
 	struct ip_vs_lblcr_entry *en, *nxt;
-	struct netns_ipvs *ipvs = net_ipvs(svc->net);
 
 	for (i=0, j=tbl->rover; i<IP_VS_LBLCR_TAB_SIZE; i++) {
 		j = (j + 1) & IP_VS_LBLCR_TAB_MASK;
 
 		write_lock(&svc->sched_lock);
 		list_for_each_entry_safe(en, nxt, &tbl->bucket[j], list) {
-			if (time_after(en->lastuse
-					+ ipvs->sysctl_lblcr_expiration, now))
+			if (time_after(en->lastuse +
+				       sysctl_lblcr_expiration(svc), now))
 				continue;
 
 			ip_vs_lblcr_free(en);
@@ -503,11 +511,10 @@ static int ip_vs_lblcr_init_svc(struct ip_vs_service *svc)
 	/*
 	 *    Allocate the ip_vs_lblcr_table for this service
 	 */
-	tbl = kmalloc(sizeof(*tbl), GFP_ATOMIC);
-	if (tbl == NULL) {
-		pr_err("%s(): no memory\n", __func__);
+	tbl = kmalloc(sizeof(*tbl), GFP_KERNEL);
+	if (tbl == NULL)
 		return -ENOMEM;
-	}
+
 	svc->sched_data = tbl;
 	IP_VS_DBG(6, "LBLCR hash table (memory=%Zdbytes) allocated for "
 		  "current service\n", sizeof(*tbl));
@@ -650,7 +657,6 @@ ip_vs_lblcr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
 	read_lock(&svc->sched_lock);
 	en = ip_vs_lblcr_get(svc->af, tbl, &iph.daddr);
 	if (en) {
-		struct netns_ipvs *ipvs = net_ipvs(svc->net);
 		/* We only hold a read lock, but this is atomic */
 		en->lastuse = jiffies;
 
@@ -662,7 +668,7 @@ ip_vs_lblcr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
 		/* More than one destination + enough time passed by, cleanup */
 		if (atomic_read(&en->set.size) > 1 &&
 				time_after(jiffies, en->set.lastmod +
-				ipvs->sysctl_lblcr_expiration)) {
+				sysctl_lblcr_expiration(svc))) {
 			struct ip_vs_dest *m;
 
 			write_lock(&en->set.lock);
@@ -734,9 +740,13 @@ static struct ip_vs_scheduler ip_vs_lblcr_scheduler =
 /*
  *  per netns init.
  */
+#ifdef CONFIG_SYSCTL
 static int __net_init __ip_vs_lblcr_init(struct net *net)
 {
 	struct netns_ipvs *ipvs = net_ipvs(net);
+
+	if (!ipvs)
+		return -ENOENT;
 
 	if (!net_eq(net, &init_net)) {
 		ipvs->lblcr_ctl_table = kmemdup(vs_vars_table,
@@ -746,19 +756,16 @@ static int __net_init __ip_vs_lblcr_init(struct net *net)
 			return -ENOMEM;
 	} else
 		ipvs->lblcr_ctl_table = vs_vars_table;
-	ipvs->sysctl_lblcr_expiration = 24*60*60*HZ;
+	ipvs->sysctl_lblcr_expiration = DEFAULT_EXPIRATION;
 	ipvs->lblcr_ctl_table[0].data = &ipvs->sysctl_lblcr_expiration;
 
-#ifdef CONFIG_SYSCTL
 	ipvs->lblcr_ctl_header =
-		register_net_sysctl_table(net, net_vs_ctl_path,
-					  ipvs->lblcr_ctl_table);
+		register_net_sysctl(net, "net/ipv4/vs", ipvs->lblcr_ctl_table);
 	if (!ipvs->lblcr_ctl_header) {
 		if (!net_eq(net, &init_net))
 			kfree(ipvs->lblcr_ctl_table);
 		return -ENOMEM;
 	}
-#endif
 
 	return 0;
 }
@@ -767,13 +774,18 @@ static void __net_exit __ip_vs_lblcr_exit(struct net *net)
 {
 	struct netns_ipvs *ipvs = net_ipvs(net);
 
-#ifdef CONFIG_SYSCTL
 	unregister_net_sysctl_table(ipvs->lblcr_ctl_header);
-#endif
 
 	if (!net_eq(net, &init_net))
 		kfree(ipvs->lblcr_ctl_table);
 }
+
+#else
+
+static int __net_init __ip_vs_lblcr_init(struct net *net) { return 0; }
+static void __net_exit __ip_vs_lblcr_exit(struct net *net) { }
+
+#endif
 
 static struct pernet_operations ip_vs_lblcr_ops = {
 	.init = __ip_vs_lblcr_init,

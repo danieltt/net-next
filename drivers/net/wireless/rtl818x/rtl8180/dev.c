@@ -16,11 +16,13 @@
  */
 
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/eeprom_93cx6.h>
+#include <linux/module.h>
 #include <net/mac80211.h>
 
 #include "rtl8180.h"
@@ -45,6 +47,8 @@ static DEFINE_PCI_DEVICE_TABLE(rtl8180_table) = {
 	{ PCI_DEVICE(0x1799, 0x6001) },
 	{ PCI_DEVICE(0x1799, 0x6020) },
 	{ PCI_DEVICE(PCI_VENDOR_ID_DLINK, 0x3300) },
+	{ PCI_DEVICE(0x1186, 0x3301) },
+	{ PCI_DEVICE(0x1432, 0x7106) },
 	{ }
 };
 
@@ -240,7 +244,9 @@ static irqreturn_t rtl8180_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static void rtl8180_tx(struct ieee80211_hw *dev, struct sk_buff *skb)
+static void rtl8180_tx(struct ieee80211_hw *dev,
+		       struct ieee80211_tx_control *control,
+		       struct sk_buff *skb)
 {
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
@@ -668,7 +674,8 @@ static void rtl8180_stop(struct ieee80211_hw *dev)
 		rtl8180_free_tx_ring(dev, i);
 }
 
-static u64 rtl8180_get_tsf(struct ieee80211_hw *dev)
+static u64 rtl8180_get_tsf(struct ieee80211_hw *dev,
+			   struct ieee80211_vif *vif)
 {
 	struct rtl8180_priv *priv = dev->priv;
 
@@ -700,12 +707,12 @@ static void rtl8180_beacon_work(struct work_struct *work)
 	 * TODO: make hardware update beacon timestamp
 	 */
 	mgmt = (struct ieee80211_mgmt *)skb->data;
-	mgmt->u.beacon.timestamp = cpu_to_le64(rtl8180_get_tsf(dev));
+	mgmt->u.beacon.timestamp = cpu_to_le64(rtl8180_get_tsf(dev, vif));
 
 	/* TODO: use actual beacon queue */
 	skb_set_queue_mapping(skb, 0);
 
-	rtl8180_tx(dev, skb);
+	rtl8180_tx(dev, NULL, skb);
 
 resched:
 	/*
@@ -1073,7 +1080,7 @@ static int __devinit rtl8180_probe(struct pci_dev *pdev,
 	if (!is_valid_ether_addr(mac_addr)) {
 		printk(KERN_WARNING "%s (rtl8180): Invalid hwaddr! Using"
 		       " randomly generated MAC addr\n", pci_name(pdev));
-		random_ether_addr(mac_addr);
+		eth_random_addr(mac_addr);
 	}
 	SET_IEEE80211_PERM_ADDR(dev, mac_addr);
 
@@ -1170,15 +1177,4 @@ static struct pci_driver rtl8180_driver = {
 #endif /* CONFIG_PM */
 };
 
-static int __init rtl8180_init(void)
-{
-	return pci_register_driver(&rtl8180_driver);
-}
-
-static void __exit rtl8180_exit(void)
-{
-	pci_unregister_driver(&rtl8180_driver);
-}
-
-module_init(rtl8180_init);
-module_exit(rtl8180_exit);
+module_pci_driver(rtl8180_driver);

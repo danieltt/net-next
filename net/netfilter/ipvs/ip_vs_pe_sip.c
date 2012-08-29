@@ -92,14 +92,13 @@ ip_vs_sip_fill_param(struct ip_vs_conn_param *p, struct sk_buff *skb)
 	if (get_callid(dptr, dataoff, datalen, &matchoff, &matchlen))
 		return -EINVAL;
 
-	p->pe_data = kmalloc(matchlen, GFP_ATOMIC);
-	if (!p->pe_data)
-		return -ENOMEM;
-
 	/* N.B: pe_data is only set on success,
 	 * this allows fallback to the default persistence logic on failure
 	 */
-	memcpy(p->pe_data, dptr + matchoff, matchlen);
+	p->pe_data = kmemdup(dptr + matchoff, matchlen, GFP_ATOMIC);
+	if (!p->pe_data)
+		return -ENOMEM;
+
 	p->pe_data_len = matchlen;
 
 	return 0;
@@ -109,7 +108,7 @@ static bool ip_vs_sip_ct_match(const struct ip_vs_conn_param *p,
 				  struct ip_vs_conn *ct)
 
 {
-	bool ret = 0;
+	bool ret = false;
 
 	if (ct->af == p->af &&
 	    ip_vs_addr_equal(p->af, p->caddr, &ct->caddr) &&
@@ -122,7 +121,7 @@ static bool ip_vs_sip_ct_match(const struct ip_vs_conn_param *p,
 	    ct->protocol == p->protocol &&
 	    ct->pe_data && ct->pe_data_len == p->pe_data_len &&
 	    !memcmp(ct->pe_data, p->pe_data, p->pe_data_len))
-		ret = 1;
+		ret = true;
 
 	IP_VS_DBG_BUF(9, "SIP template match %s %s->%s:%d %s\n",
 		      ip_vs_proto_name(p->protocol),

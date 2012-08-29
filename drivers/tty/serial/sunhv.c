@@ -23,14 +23,14 @@
 #include <asm/spitfire.h>
 #include <asm/prom.h>
 #include <asm/irq.h>
+#include <asm/setup.h>
 
 #if defined(CONFIG_MAGIC_SYSRQ)
 #define SUPPORT_SYSRQ
 #endif
 
 #include <linux/serial_core.h>
-
-#include "suncore.h"
+#include <linux/sunserialcore.h>
 
 #define CON_BREAK	((long)-1)
 #define CON_HUP		((long)-2)
@@ -519,7 +519,7 @@ static struct console sunhv_console = {
 	.data	=	&sunhv_reg,
 };
 
-static int __devinit hv_probe(struct platform_device *op, const struct of_device_id *match)
+static int __devinit hv_probe(struct platform_device *op)
 {
 	struct uart_port *port;
 	unsigned long minor;
@@ -629,7 +629,7 @@ static const struct of_device_id hv_match[] = {
 };
 MODULE_DEVICE_TABLE(of, hv_match);
 
-static struct of_platform_driver hv_driver = {
+static struct platform_driver hv_driver = {
 	.driver = {
 		.name = "hv",
 		.owner = THIS_MODULE,
@@ -644,12 +644,12 @@ static int __init sunhv_init(void)
 	if (tlb_type != hypervisor)
 		return -ENODEV;
 
-	return of_register_platform_driver(&hv_driver);
+	return platform_driver_register(&hv_driver);
 }
 
 static void __exit sunhv_exit(void)
 {
-	of_unregister_platform_driver(&hv_driver);
+	platform_driver_unregister(&hv_driver);
 }
 
 module_init(sunhv_init);

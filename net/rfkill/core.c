@@ -29,6 +29,7 @@
 #include <linux/rfkill.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
+#include <linux/device.h>
 #include <linux/miscdevice.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
@@ -149,6 +150,20 @@ static void rfkill_led_trigger_activate(struct led_classdev *led)
 	rfkill_led_trigger_event(rfkill);
 }
 
+const char *rfkill_get_led_trigger_name(struct rfkill *rfkill)
+{
+	return rfkill->led_trigger.name;
+}
+EXPORT_SYMBOL(rfkill_get_led_trigger_name);
+
+void rfkill_set_led_trigger_name(struct rfkill *rfkill, const char *name)
+{
+	BUG_ON(!rfkill);
+
+	rfkill->ledtrigname = name;
+}
+EXPORT_SYMBOL(rfkill_set_led_trigger_name);
+
 static int rfkill_led_trigger_register(struct rfkill *rfkill)
 {
 	rfkill->led_trigger.name = rfkill->ledtrigname
@@ -235,7 +250,7 @@ static bool __rfkill_set_hw_state(struct rfkill *rfkill,
 	else
 		rfkill->state &= ~RFKILL_BLOCK_HW;
 	*change = prev != blocked;
-	any = rfkill->state & RFKILL_BLOCK_ANY;
+	any = !!(rfkill->state & RFKILL_BLOCK_ANY);
 	spin_unlock_irqrestore(&rfkill->lock, flags);
 
 	rfkill_led_trigger_event(rfkill);
@@ -324,7 +339,7 @@ static void __rfkill_switch_all(const enum rfkill_type type, bool blocked)
 
 	rfkill_global_states[type].cur = blocked;
 	list_for_each_entry(rfkill, &rfkill_list, node) {
-		if (rfkill->type != type)
+		if (rfkill->type != type && type != RFKILL_TYPE_ALL)
 			continue;
 
 		rfkill_set_block(rfkill, blocked);
@@ -644,7 +659,7 @@ static ssize_t rfkill_soft_store(struct device *dev,
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
-	err = strict_strtoul(buf, 0, &state);
+	err = kstrtoul(buf, 0, &state);
 	if (err)
 		return err;
 
@@ -688,7 +703,7 @@ static ssize_t rfkill_state_store(struct device *dev,
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
-	err = strict_strtoul(buf, 0, &state);
+	err = kstrtoul(buf, 0, &state);
 	if (err)
 		return err;
 
@@ -1024,7 +1039,6 @@ static int rfkill_fop_open(struct inode *inode, struct file *file)
 	 * start getting events from elsewhere but hold mtx to get
 	 * startup events added first
 	 */
-	list_add(&data->list, &rfkill_fds);
 
 	list_for_each_entry(rfkill, &rfkill_list, node) {
 		ev = kzalloc(sizeof(*ev), GFP_KERNEL);
@@ -1033,6 +1047,7 @@ static int rfkill_fop_open(struct inode *inode, struct file *file)
 		rfkill_fill_event(&ev->ev, rfkill, RFKILL_OP_ADD);
 		list_add_tail(&ev->list, &data->events);
 	}
+	list_add(&data->list, &rfkill_fds);
 	mutex_unlock(&data->mtx);
 	mutex_unlock(&rfkill_global_mutex);
 

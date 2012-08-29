@@ -90,7 +90,7 @@ irqfd_shutdown(struct work_struct *work)
 	 * We know no new events will be scheduled at this point, so block
 	 * until all previously outstanding events have completed
 	 */
-	flush_work(&irqfd->inject);
+	flush_work_sync(&irqfd->inject);
 
 	/*
 	 * It is now safe to release the object's resources
@@ -198,7 +198,7 @@ static void irqfd_update(struct kvm *kvm, struct _irqfd *irqfd,
 }
 
 static int
-kvm_irqfd_assign(struct kvm *kvm, int fd, int gsi)
+kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
 {
 	struct kvm_irq_routing_table *irq_rt;
 	struct _irqfd *irqfd, *tmp;
@@ -212,12 +212,12 @@ kvm_irqfd_assign(struct kvm *kvm, int fd, int gsi)
 		return -ENOMEM;
 
 	irqfd->kvm = kvm;
-	irqfd->gsi = gsi;
+	irqfd->gsi = args->gsi;
 	INIT_LIST_HEAD(&irqfd->list);
 	INIT_WORK(&irqfd->inject, irqfd_inject);
 	INIT_WORK(&irqfd->shutdown, irqfd_shutdown);
 
-	file = eventfd_fget(fd);
+	file = eventfd_fget(args->fd);
 	if (IS_ERR(file)) {
 		ret = PTR_ERR(file);
 		goto fail;
@@ -298,23 +298,24 @@ kvm_eventfd_init(struct kvm *kvm)
  * shutdown any irqfd's that match fd+gsi
  */
 static int
-kvm_irqfd_deassign(struct kvm *kvm, int fd, int gsi)
+kvm_irqfd_deassign(struct kvm *kvm, struct kvm_irqfd *args)
 {
 	struct _irqfd *irqfd, *tmp;
 	struct eventfd_ctx *eventfd;
 
-	eventfd = eventfd_ctx_fdget(fd);
+	eventfd = eventfd_ctx_fdget(args->fd);
 	if (IS_ERR(eventfd))
 		return PTR_ERR(eventfd);
 
 	spin_lock_irq(&kvm->irqfds.lock);
 
 	list_for_each_entry_safe(irqfd, tmp, &kvm->irqfds.items, list) {
-		if (irqfd->eventfd == eventfd && irqfd->gsi == gsi) {
+		if (irqfd->eventfd == eventfd && irqfd->gsi == args->gsi) {
 			/*
 			 * This rcu_assign_pointer is needed for when
-			 * another thread calls kvm_irqfd_update before
-			 * we flush workqueue below.
+			 * another thread calls kvm_irq_routing_update before
+			 * we flush workqueue below (we synchronize with
+			 * kvm_irq_routing_update using irqfds.lock).
 			 * It is paired with synchronize_rcu done by caller
 			 * of that function.
 			 */
@@ -337,12 +338,15 @@ kvm_irqfd_deassign(struct kvm *kvm, int fd, int gsi)
 }
 
 int
-kvm_irqfd(struct kvm *kvm, int fd, int gsi, int flags)
+kvm_irqfd(struct kvm *kvm, struct kvm_irqfd *args)
 {
-	if (flags & KVM_IRQFD_FLAG_DEASSIGN)
-		return kvm_irqfd_deassign(kvm, fd, gsi);
+	if (args->flags & ~KVM_IRQFD_FLAG_DEASSIGN)
+		return -EINVAL;
 
-	return kvm_irqfd_assign(kvm, fd, gsi);
+	if (args->flags & KVM_IRQFD_FLAG_DEASSIGN)
+		return kvm_irqfd_deassign(kvm, args);
+
+	return kvm_irqfd_assign(kvm, args);
 }
 
 /*
@@ -577,7 +581,7 @@ kvm_assign_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
 
 	mutex_lock(&kvm->slots_lock);
 
-	/* Verify that there isnt a match already */
+	/* Verify that there isn't a match already */
 	if (ioeventfd_check_collision(kvm, p)) {
 		ret = -EEXIST;
 		goto unlock_fail;
@@ -585,7 +589,8 @@ kvm_assign_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
 
 	kvm_iodevice_init(&p->dev, &ioeventfd_ops);
 
-	ret = kvm_io_bus_register_dev(kvm, bus_idx, &p->dev);
+	ret = kvm_io_bus_register_dev(kvm, bus_idx, p->addr, p->length,
+				      &p->dev);
 	if (ret < 0)
 		goto unlock_fail;
 

@@ -36,6 +36,7 @@
 
 #include <linux/completion.h>
 #include <linux/uaccess.h>
+#include <linux/module.h>
 
 #define PICOLCD_NAME "PicoLCD (graphic)"
 
@@ -632,7 +633,7 @@ struct picolcd_fb_cleanup_item {
 	struct picolcd_fb_cleanup_item *next;
 };
 static struct picolcd_fb_cleanup_item *fb_pending;
-DEFINE_SPINLOCK(fb_pending_lock);
+static DEFINE_SPINLOCK(fb_pending_lock);
 
 static void picolcd_fb_do_cleanup(struct work_struct *data)
 {
@@ -657,7 +658,7 @@ static void picolcd_fb_do_cleanup(struct work_struct *data)
 	} while (item);
 }
 
-DECLARE_WORK(picolcd_fb_cleanup, picolcd_fb_do_cleanup);
+static DECLARE_WORK(picolcd_fb_cleanup, picolcd_fb_do_cleanup);
 
 static int picolcd_fb_open(struct fb_info *info, int u)
 {
@@ -944,6 +945,7 @@ static int picolcd_init_backlight(struct picolcd_data *data, struct hid_report *
 	}
 
 	memset(&props, 0, sizeof(props));
+	props.type = BACKLIGHT_RAW;
 	props.max_brightness = 0xff;
 	bdev = backlight_device_register(dev_name(dev), dev, data,
 			&picolcd_blops, &props);
@@ -1523,12 +1525,6 @@ static const struct file_operations picolcd_debug_reset_fops = {
 /*
  * The "eeprom" file
  */
-static int picolcd_debug_eeprom_open(struct inode *i, struct file *f)
-{
-	f->private_data = i->i_private;
-	return 0;
-}
-
 static ssize_t picolcd_debug_eeprom_read(struct file *f, char __user *u,
 		size_t s, loff_t *off)
 {
@@ -1584,11 +1580,11 @@ static ssize_t picolcd_debug_eeprom_write(struct file *f, const char __user *u,
 	memset(raw_data, 0, sizeof(raw_data));
 	raw_data[0] = *off & 0xff;
 	raw_data[1] = (*off >> 8) & 0xff;
-	raw_data[2] = s < 20 ? s : 20;
+	raw_data[2] = min((size_t)20, s);
 	if (*off + raw_data[2] > 0xff)
 		raw_data[2] = 0x100 - *off;
 
-	if (copy_from_user(raw_data+3, u, raw_data[2]))
+	if (copy_from_user(raw_data+3, u, min((u8)20, raw_data[2])))
 		return -EFAULT;
 	resp = picolcd_send_and_wait(data->hdev, REPORT_EE_WRITE, raw_data,
 			sizeof(raw_data));
@@ -1616,7 +1612,7 @@ static ssize_t picolcd_debug_eeprom_write(struct file *f, const char __user *u,
  */
 static const struct file_operations picolcd_debug_eeprom_fops = {
 	.owner    = THIS_MODULE,
-	.open     = picolcd_debug_eeprom_open,
+	.open     = simple_open,
 	.read     = picolcd_debug_eeprom_read,
 	.write    = picolcd_debug_eeprom_write,
 	.llseek   = generic_file_llseek,
@@ -1625,12 +1621,6 @@ static const struct file_operations picolcd_debug_eeprom_fops = {
 /*
  * The "flash" file
  */
-static int picolcd_debug_flash_open(struct inode *i, struct file *f)
-{
-	f->private_data = i->i_private;
-	return 0;
-}
-
 /* record a flash address to buf (bounds check to be done by caller) */
 static int _picolcd_flash_setaddr(struct picolcd_data *data, u8 *buf, long off)
 {
@@ -1805,17 +1795,17 @@ static ssize_t picolcd_debug_flash_write(struct file *f, const char __user *u,
 /*
  * Notes:
  * - concurrent writing is prevented by mutex and all writes must be
- *   n*64 bytes and 64-byte aligned, each write being preceeded by an
+ *   n*64 bytes and 64-byte aligned, each write being preceded by an
  *   ERASE which erases a 64byte block.
  *   If less than requested was written or an error is returned for an
  *   otherwise correct write request the next 64-byte block which should
  *   have been written is in undefined state (mostly: original, erased,
  *   (half-)written with write error)
- * - reading can happend without special restriction
+ * - reading can happen without special restriction
  */
 static const struct file_operations picolcd_debug_flash_fops = {
 	.owner    = THIS_MODULE,
-	.open     = picolcd_debug_flash_open,
+	.open     = simple_open,
 	.read     = picolcd_debug_flash_read,
 	.write    = picolcd_debug_flash_write,
 	.llseek   = generic_file_llseek,
@@ -1856,7 +1846,7 @@ static void picolcd_debug_out_report(struct picolcd_data *data,
 #define BUFF_SZ 256
 
 	/* Avoid unnecessary overhead if debugfs is disabled */
-	if (!hdev->debug_events)
+	if (list_empty(&hdev->debug_list))
 		return;
 
 	buff = kmalloc(BUFF_SZ, GFP_ATOMIC);
@@ -2408,7 +2398,7 @@ static int picolcd_raw_event(struct hid_device *hdev,
 #ifdef CONFIG_PM
 static int picolcd_suspend(struct hid_device *hdev, pm_message_t message)
 {
-	if (message.event & PM_EVENT_AUTO)
+	if (PMSG_IS_AUTO(message))
 		return 0;
 
 	picolcd_suspend_backlight(hid_get_drvdata(hdev));
@@ -2623,11 +2613,7 @@ static int picolcd_probe(struct hid_device *hdev,
 		goto err_cleanup_data;
 	}
 
-	/* We don't use hidinput but hid_hw_start() fails if nothing is
-	 * claimed. So spoof claimed input. */
-	hdev->claimed = HID_CLAIMED_INPUT;
 	error = hid_hw_start(hdev, 0);
-	hdev->claimed = 0;
 	if (error) {
 		hid_err(hdev, "hardware start failed\n");
 		goto err_cleanup_data;

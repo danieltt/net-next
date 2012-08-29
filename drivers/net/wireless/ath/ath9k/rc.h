@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2004 Sam Leffler, Errno Consulting
  * Copyright (c) 2004 Video54 Technologies, Inc.
- * Copyright (c) 2008-2009 Atheros Communications Inc.
+ * Copyright (c) 2008-2011 Atheros Communications Inc.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -25,8 +25,6 @@ struct ath_softc;
 
 #define ATH_RATE_MAX     30
 #define RATE_TABLE_SIZE  72
-#define MAX_TX_RATE_PHY  48
-
 
 #define RC_INVALID	0x0000
 #define RC_LEGACY	0x0001
@@ -162,10 +160,6 @@ struct ath_rate_table {
 		u32 user_ratekbps;
 		u8 ratecode;
 		u8 dot11rate;
-		u8 ctrl_rate;
-		u8 cw40index;
-		u8 sgi_index;
-		u8 ht_index;
 	} info[RATE_TABLE_SIZE];
 	u32 probe_interval;
 	u8 initial_ratemax;
@@ -219,12 +213,6 @@ struct ath_rate_priv {
 
 	struct dentry *debugfs_rcstats;
 	struct ath_rc_stats rcstats[RATE_TABLE_SIZE];
-};
-
-enum ath9k_internal_frame_type {
-	ATH9K_IFT_NOT_INTERNAL,
-	ATH9K_IFT_PAUSE,
-	ATH9K_IFT_UNPAUSE
 };
 
 #ifdef CONFIG_ATH9K_RATE_CONTROL

@@ -31,7 +31,6 @@
 #include <net/net_namespace.h>
 #include <net/protocol.h>
 #include <net/tcp.h>
-#include <asm/system.h>
 #include <linux/stat.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -42,6 +41,8 @@
 EXPORT_SYMBOL(register_ip_vs_app);
 EXPORT_SYMBOL(unregister_ip_vs_app);
 EXPORT_SYMBOL(register_ip_vs_app_inc);
+
+static DEFINE_MUTEX(__ip_vs_app_mutex);
 
 /*
  *	Get an ip_vs_app object
@@ -167,35 +168,50 @@ int
 register_ip_vs_app_inc(struct net *net, struct ip_vs_app *app, __u16 proto,
 		       __u16 port)
 {
-	struct netns_ipvs *ipvs = net_ipvs(net);
 	int result;
 
-	mutex_lock(&ipvs->app_mutex);
+	mutex_lock(&__ip_vs_app_mutex);
 
 	result = ip_vs_app_inc_new(net, app, proto, port);
 
-	mutex_unlock(&ipvs->app_mutex);
+	mutex_unlock(&__ip_vs_app_mutex);
 
 	return result;
 }
 
 
-/*
- *	ip_vs_app registration routine
- */
-int register_ip_vs_app(struct net *net, struct ip_vs_app *app)
+/* Register application for netns */
+struct ip_vs_app *register_ip_vs_app(struct net *net, struct ip_vs_app *app)
 {
 	struct netns_ipvs *ipvs = net_ipvs(net);
+	struct ip_vs_app *a;
+	int err = 0;
+
+	if (!ipvs)
+		return ERR_PTR(-ENOENT);
+
+	mutex_lock(&__ip_vs_app_mutex);
+
+	list_for_each_entry(a, &ipvs->app_list, a_list) {
+		if (!strcmp(app->name, a->name)) {
+			err = -EEXIST;
+			goto out_unlock;
+		}
+	}
+	a = kmemdup(app, sizeof(*app), GFP_KERNEL);
+	if (!a) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+	INIT_LIST_HEAD(&a->incs_list);
+	list_add(&a->a_list, &ipvs->app_list);
 	/* increase the module use count */
 	ip_vs_use_count_inc();
 
-	mutex_lock(&ipvs->app_mutex);
+out_unlock:
+	mutex_unlock(&__ip_vs_app_mutex);
 
-	list_add(&app->a_list, &ipvs->app_list);
-
-	mutex_unlock(&ipvs->app_mutex);
-
-	return 0;
+	return err ? ERR_PTR(err) : a;
 }
 
 
@@ -206,20 +222,28 @@ int register_ip_vs_app(struct net *net, struct ip_vs_app *app)
 void unregister_ip_vs_app(struct net *net, struct ip_vs_app *app)
 {
 	struct netns_ipvs *ipvs = net_ipvs(net);
-	struct ip_vs_app *inc, *nxt;
+	struct ip_vs_app *a, *anxt, *inc, *nxt;
 
-	mutex_lock(&ipvs->app_mutex);
+	if (!ipvs)
+		return;
 
-	list_for_each_entry_safe(inc, nxt, &app->incs_list, a_list) {
-		ip_vs_app_inc_release(net, inc);
+	mutex_lock(&__ip_vs_app_mutex);
+
+	list_for_each_entry_safe(a, anxt, &ipvs->app_list, a_list) {
+		if (app && strcmp(app->name, a->name))
+			continue;
+		list_for_each_entry_safe(inc, nxt, &a->incs_list, a_list) {
+			ip_vs_app_inc_release(net, inc);
+		}
+
+		list_del(&a->a_list);
+		kfree(a);
+
+		/* decrease the module use count */
+		ip_vs_use_count_dec();
 	}
 
-	list_del(&app->a_list);
-
-	mutex_unlock(&ipvs->app_mutex);
-
-	/* decrease the module use count */
-	ip_vs_use_count_dec();
+	mutex_unlock(&__ip_vs_app_mutex);
 }
 
 
@@ -314,7 +338,7 @@ vs_fix_ack_seq(const struct ip_vs_seq *vseq, struct tcphdr *th)
  *	Assumes already checked proto==IPPROTO_TCP and diff!=0.
  */
 static inline void vs_seq_update(struct ip_vs_conn *cp, struct ip_vs_seq *vseq,
-				 unsigned flag, __u32 seq, int diff)
+				 unsigned int flag, __u32 seq, int diff)
 {
 	/* spinlock is to keep updating cp->flags atomic */
 	spin_lock(&cp->lock);
@@ -501,7 +525,7 @@ static void *ip_vs_app_seq_start(struct seq_file *seq, loff_t *pos)
 	struct net *net = seq_file_net(seq);
 	struct netns_ipvs *ipvs = net_ipvs(net);
 
-	mutex_lock(&ipvs->app_mutex);
+	mutex_lock(&__ip_vs_app_mutex);
 
 	return *pos ? ip_vs_app_idx(ipvs, *pos - 1) : SEQ_START_TOKEN;
 }
@@ -535,9 +559,7 @@ static void *ip_vs_app_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 
 static void ip_vs_app_seq_stop(struct seq_file *seq, void *v)
 {
-	struct netns_ipvs *ipvs = net_ipvs(seq_file_net(seq));
-
-	mutex_unlock(&ipvs->app_mutex);
+	mutex_unlock(&__ip_vs_app_mutex);
 }
 
 static int ip_vs_app_seq_show(struct seq_file *seq, void *v)
@@ -574,40 +596,21 @@ static const struct file_operations ip_vs_app_fops = {
 	.open	 = ip_vs_app_open,
 	.read	 = seq_read,
 	.llseek  = seq_lseek,
-	.release = seq_release,
+	.release = seq_release_net,
 };
 #endif
 
-static int __net_init __ip_vs_app_init(struct net *net)
+int __net_init ip_vs_app_net_init(struct net *net)
 {
 	struct netns_ipvs *ipvs = net_ipvs(net);
 
 	INIT_LIST_HEAD(&ipvs->app_list);
-	__mutex_init(&ipvs->app_mutex, "ipvs->app_mutex", &ipvs->app_key);
 	proc_net_fops_create(net, "ip_vs_app", 0, &ip_vs_app_fops);
 	return 0;
 }
 
-static void __net_exit __ip_vs_app_cleanup(struct net *net)
+void __net_exit ip_vs_app_net_cleanup(struct net *net)
 {
+	unregister_ip_vs_app(net, NULL /* all */);
 	proc_net_remove(net, "ip_vs_app");
-}
-
-static struct pernet_operations ip_vs_app_ops = {
-	.init = __ip_vs_app_init,
-	.exit = __ip_vs_app_cleanup,
-};
-
-int __init ip_vs_app_init(void)
-{
-	int rv;
-
-	rv = register_pernet_subsys(&ip_vs_app_ops);
-	return rv;
-}
-
-
-void ip_vs_app_cleanup(void)
-{
-	unregister_pernet_subsys(&ip_vs_app_ops);
 }

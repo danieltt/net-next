@@ -20,16 +20,12 @@
 #include <linux/init.h>
 #include <linux/kmod.h>
 #include <linux/err.h>
+#include <linux/module.h>
 #include <net/net_namespace.h>
 #include <net/sock.h>
 #include <net/sch_generic.h>
 #include <net/act_api.h>
 #include <net/netlink.h>
-
-static void tcf_common_free_rcu(struct rcu_head *head)
-{
-	kfree(container_of(head, struct tcf_common, tcfc_rcu));
-}
 
 void tcf_hash_destroy(struct tcf_common *p, struct tcf_hashinfo *hinfo)
 {
@@ -47,7 +43,7 @@ void tcf_hash_destroy(struct tcf_common *p, struct tcf_hashinfo *hinfo)
 			 * gen_estimator est_timer() might access p->tcfc_lock
 			 * or bstats, wait a RCU grace period before freeing p
 			 */
-			call_rcu(&p->tcfc_rcu, tcf_common_free_rcu);
+			kfree_rcu(p, tcfc_rcu);
 			return;
 		}
 	}
@@ -131,7 +127,8 @@ static int tcf_del_walker(struct sk_buff *skb, struct tc_action *a,
 	nest = nla_nest_start(skb, a->order);
 	if (nest == NULL)
 		goto nla_put_failure;
-	NLA_PUT_STRING(skb, TCA_KIND, a->ops->kind);
+	if (nla_put_string(skb, TCA_KIND, a->ops->kind))
+		goto nla_put_failure;
 	for (i = 0; i < (hinfo->hmask + 1); i++) {
 		p = hinfo->htab[tcf_hash(i, hinfo->hmask)];
 
@@ -143,7 +140,8 @@ static int tcf_del_walker(struct sk_buff *skb, struct tc_action *a,
 			p = s_p;
 		}
 	}
-	NLA_PUT_U32(skb, TCA_FCNT, n_i);
+	if (nla_put_u32(skb, TCA_FCNT, n_i))
+		goto nla_put_failure;
 	nla_nest_end(skb, nest);
 
 	return n_i;
@@ -370,10 +368,10 @@ static struct tc_action_ops *tc_lookup_action_id(u32 type)
 }
 #endif
 
-int tcf_action_exec(struct sk_buff *skb, struct tc_action *act,
+int tcf_action_exec(struct sk_buff *skb, const struct tc_action *act,
 		    struct tcf_result *res)
 {
-	struct tc_action *a;
+	const struct tc_action *a;
 	int ret = -1;
 
 	if (skb->tc_verd & TC_NCLS) {
@@ -441,7 +439,8 @@ tcf_action_dump_1(struct sk_buff *skb, struct tc_action *a, int bind, int ref)
 	if (a->ops == NULL || a->ops->dump == NULL)
 		return err;
 
-	NLA_PUT_STRING(skb, TCA_KIND, a->ops->kind);
+	if (nla_put_string(skb, TCA_KIND, a->ops->kind))
+		goto nla_put_failure;
 	if (tcf_action_copy_stats(skb, a, 0))
 		goto nla_put_failure;
 	nest = nla_nest_start(skb, TCA_OPTIONS);
@@ -653,27 +652,27 @@ tca_get_fill(struct sk_buff *skb, struct tc_action *a, u32 pid, u32 seq,
 	unsigned char *b = skb_tail_pointer(skb);
 	struct nlattr *nest;
 
-	nlh = NLMSG_NEW(skb, pid, seq, event, sizeof(*t), flags);
-
-	t = NLMSG_DATA(nlh);
+	nlh = nlmsg_put(skb, pid, seq, event, sizeof(*t), flags);
+	if (!nlh)
+		goto out_nlmsg_trim;
+	t = nlmsg_data(nlh);
 	t->tca_family = AF_UNSPEC;
 	t->tca__pad1 = 0;
 	t->tca__pad2 = 0;
 
 	nest = nla_nest_start(skb, TCA_ACT_TAB);
 	if (nest == NULL)
-		goto nla_put_failure;
+		goto out_nlmsg_trim;
 
 	if (tcf_action_dump(skb, a, bind, ref) < 0)
-		goto nla_put_failure;
+		goto out_nlmsg_trim;
 
 	nla_nest_end(skb, nest);
 
 	nlh->nlmsg_len = skb_tail_pointer(skb) - b;
 	return skb->len;
 
-nla_put_failure:
-nlmsg_failure:
+out_nlmsg_trim:
 	nlmsg_trim(skb, b);
 	return -1;
 }
@@ -800,19 +799,21 @@ static int tca_action_flush(struct net *net, struct nlattr *nla,
 	if (a->ops == NULL)
 		goto err_out;
 
-	nlh = NLMSG_PUT(skb, pid, n->nlmsg_seq, RTM_DELACTION, sizeof(*t));
-	t = NLMSG_DATA(nlh);
+	nlh = nlmsg_put(skb, pid, n->nlmsg_seq, RTM_DELACTION, sizeof(*t), 0);
+	if (!nlh)
+		goto out_module_put;
+	t = nlmsg_data(nlh);
 	t->tca_family = AF_UNSPEC;
 	t->tca__pad1 = 0;
 	t->tca__pad2 = 0;
 
 	nest = nla_nest_start(skb, TCA_ACT_TAB);
 	if (nest == NULL)
-		goto nla_put_failure;
+		goto out_module_put;
 
 	err = a->ops->walk(skb, &dcb, RTM_DELACTION, a);
 	if (err < 0)
-		goto nla_put_failure;
+		goto out_module_put;
 	if (err == 0)
 		goto noflush_out;
 
@@ -829,8 +830,7 @@ static int tca_action_flush(struct net *net, struct nlattr *nla,
 
 	return err;
 
-nla_put_failure:
-nlmsg_failure:
+out_module_put:
 	module_put(a->ops->owner);
 err_out:
 noflush_out:
@@ -920,18 +920,20 @@ static int tcf_add_notify(struct net *net, struct tc_action *a,
 
 	b = skb_tail_pointer(skb);
 
-	nlh = NLMSG_NEW(skb, pid, seq, event, sizeof(*t), flags);
-	t = NLMSG_DATA(nlh);
+	nlh = nlmsg_put(skb, pid, seq, event, sizeof(*t), flags);
+	if (!nlh)
+		goto out_kfree_skb;
+	t = nlmsg_data(nlh);
 	t->tca_family = AF_UNSPEC;
 	t->tca__pad1 = 0;
 	t->tca__pad2 = 0;
 
 	nest = nla_nest_start(skb, TCA_ACT_TAB);
 	if (nest == NULL)
-		goto nla_put_failure;
+		goto out_kfree_skb;
 
 	if (tcf_action_dump(skb, a, 0, 0) < 0)
-		goto nla_put_failure;
+		goto out_kfree_skb;
 
 	nla_nest_end(skb, nest);
 
@@ -943,8 +945,7 @@ static int tcf_add_notify(struct net *net, struct tc_action *a,
 		err = 0;
 	return err;
 
-nla_put_failure:
-nlmsg_failure:
+out_kfree_skb:
 	kfree_skb(skb);
 	return -1;
 }
@@ -999,7 +1000,7 @@ static int tc_ctl_action(struct sk_buff *skb, struct nlmsghdr *n, void *arg)
 	switch (n->nlmsg_type) {
 	case RTM_NEWACTION:
 		/* we are going to assume all other flags
-		 * imply create only if it doesnt exist
+		 * imply create only if it doesn't exist
 		 * Note that CREATE | EXCL implies that
 		 * but since we want avoid ambiguity (eg when flags
 		 * is zero) then just set this
@@ -1063,7 +1064,7 @@ tc_dump_action(struct sk_buff *skb, struct netlink_callback *cb)
 	struct tc_action_ops *a_o;
 	struct tc_action a;
 	int ret = 0;
-	struct tcamsg *t = (struct tcamsg *) NLMSG_DATA(cb->nlh);
+	struct tcamsg *t = (struct tcamsg *) nlmsg_data(cb->nlh);
 	struct nlattr *kind = find_dump_kind(cb->nlh);
 
 	if (kind == NULL) {
@@ -1081,23 +1082,25 @@ tc_dump_action(struct sk_buff *skb, struct netlink_callback *cb)
 	if (a_o->walk == NULL) {
 		WARN(1, "tc_dump_action: %s !capable of dumping table\n",
 		     a_o->kind);
-		goto nla_put_failure;
+		goto out_module_put;
 	}
 
-	nlh = NLMSG_PUT(skb, NETLINK_CB(cb->skb).pid, cb->nlh->nlmsg_seq,
-			cb->nlh->nlmsg_type, sizeof(*t));
-	t = NLMSG_DATA(nlh);
+	nlh = nlmsg_put(skb, NETLINK_CB(cb->skb).pid, cb->nlh->nlmsg_seq,
+			cb->nlh->nlmsg_type, sizeof(*t), 0);
+	if (!nlh)
+		goto out_module_put;
+	t = nlmsg_data(nlh);
 	t->tca_family = AF_UNSPEC;
 	t->tca__pad1 = 0;
 	t->tca__pad2 = 0;
 
 	nest = nla_nest_start(skb, TCA_ACT_TAB);
 	if (nest == NULL)
-		goto nla_put_failure;
+		goto out_module_put;
 
 	ret = a_o->walk(skb, cb, RTM_GETACTION, &a);
 	if (ret < 0)
-		goto nla_put_failure;
+		goto out_module_put;
 
 	if (ret > 0) {
 		nla_nest_end(skb, nest);
@@ -1111,8 +1114,7 @@ tc_dump_action(struct sk_buff *skb, struct netlink_callback *cb)
 	module_put(a_o->owner);
 	return skb->len;
 
-nla_put_failure:
-nlmsg_failure:
+out_module_put:
 	module_put(a_o->owner);
 	nlmsg_trim(skb, b);
 	return skb->len;
@@ -1120,9 +1122,10 @@ nlmsg_failure:
 
 static int __init tc_action_init(void)
 {
-	rtnl_register(PF_UNSPEC, RTM_NEWACTION, tc_ctl_action, NULL);
-	rtnl_register(PF_UNSPEC, RTM_DELACTION, tc_ctl_action, NULL);
-	rtnl_register(PF_UNSPEC, RTM_GETACTION, tc_ctl_action, tc_dump_action);
+	rtnl_register(PF_UNSPEC, RTM_NEWACTION, tc_ctl_action, NULL, NULL);
+	rtnl_register(PF_UNSPEC, RTM_DELACTION, tc_ctl_action, NULL, NULL);
+	rtnl_register(PF_UNSPEC, RTM_GETACTION, tc_ctl_action, tc_dump_action,
+		      NULL);
 
 	return 0;
 }

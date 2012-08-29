@@ -4,13 +4,15 @@
  * Author: Matthew McClintock
  * Maintainer: Kumar Gala <galak@kernel.crashing.org>
  *
- * Copyright 2005, 2008, 2010 Freescale Semiconductor Inc.
+ * Copyright 2005, 2008, 2010-2011 Freescale Semiconductor Inc.
  *
  * This program is free software; you can redistribute  it and/or modify it
  * under  the terms of  the GNU General  Public License as published by the
  * Free Software Foundation;  either version 2 of the  License, or (at your
  * option) any later version.
  */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -21,7 +23,6 @@
 #include <linux/uaccess.h>
 
 #include <asm/reg_booke.h>
-#include <asm/system.h>
 #include <asm/time.h>
 #include <asm/div64.h>
 
@@ -36,7 +37,7 @@
 u32 booke_wdt_enabled;
 u32 booke_wdt_period = CONFIG_BOOKE_WDT_DEFAULT_TIMEOUT;
 
-#ifdef	CONFIG_FSL_BOOKE
+#ifdef	CONFIG_PPC_FSL_BOOK3E
 #define WDTP(x)		((((x)&0x3)<<30)|(((x)&0x3c)<<15))
 #define WDTP_MASK	(WDTP(0x3f))
 #else
@@ -189,7 +190,7 @@ static long booke_wdt_ioctl(struct file *file,
 	case WDIOC_SETTIMEOUT:
 		if (get_user(tmp, p))
 			return -EFAULT;
-#ifdef	CONFIG_FSL_BOOKE
+#ifdef	CONFIG_PPC_FSL_BOOK3E
 		/* period of 1 gives the largest possible timeout */
 		if (tmp > period_to_sec(1))
 			return -EINVAL;
@@ -198,9 +199,13 @@ static long booke_wdt_ioctl(struct file *file,
 		booke_wdt_period = tmp;
 #endif
 		booke_wdt_set();
-		return 0;
+		/* Fall */
 	case WDIOC_GETTIMEOUT:
+#ifdef	CONFIG_FSL_BOOKE
+		return put_user(period_to_sec(booke_wdt_period), p);
+#else
 		return put_user(booke_wdt_period, p);
+#endif
 	default:
 		return -ENOTTY;
 	}
@@ -221,9 +226,8 @@ static int booke_wdt_open(struct inode *inode, struct file *file)
 	if (booke_wdt_enabled == 0) {
 		booke_wdt_enabled = 1;
 		on_each_cpu(__booke_wdt_enable, NULL, 0);
-		printk(KERN_INFO
-		      "PowerPC Book-E Watchdog Timer Enabled (wdt_period=%d)\n",
-				booke_wdt_period);
+		pr_debug("watchdog enabled (timeout = %llu sec)\n",
+			 period_to_sec(booke_wdt_period));
 	}
 	spin_unlock(&booke_wdt_lock);
 
@@ -240,6 +244,7 @@ static int booke_wdt_release(struct inode *inode, struct file *file)
 	 */
 	on_each_cpu(__booke_wdt_disable, NULL, 0);
 	booke_wdt_enabled = 0;
+	pr_debug("watchdog disabled\n");
 #endif
 
 	clear_bit(0, &wdt_is_active);
@@ -271,21 +276,20 @@ static int __init booke_wdt_init(void)
 {
 	int ret = 0;
 
-	printk(KERN_INFO "PowerPC Book-E Watchdog Timer Loaded\n");
+	pr_info("powerpc book-e watchdog driver loaded\n");
 	ident.firmware_version = cur_cpu_spec->pvr_value;
 
 	ret = misc_register(&booke_wdt_miscdev);
 	if (ret) {
-		printk(KERN_CRIT "Cannot register miscdev on minor=%d: %d\n",
-				WATCHDOG_MINOR, ret);
+		pr_err("cannot register device (minor=%u, ret=%i)\n",
+		       WATCHDOG_MINOR, ret);
 		return ret;
 	}
 
 	spin_lock(&booke_wdt_lock);
 	if (booke_wdt_enabled == 1) {
-		printk(KERN_INFO
-		      "PowerPC Book-E Watchdog Timer Enabled (wdt_period=%d)\n",
-				booke_wdt_period);
+		pr_info("watchdog enabled (timeout = %llu sec)\n",
+			period_to_sec(booke_wdt_period));
 		on_each_cpu(__booke_wdt_enable, NULL, 0);
 	}
 	spin_unlock(&booke_wdt_lock);

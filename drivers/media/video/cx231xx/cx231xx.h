@@ -26,7 +26,6 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #include <linux/i2c.h>
-#include <linux/i2c-algo-bit.h>
 #include <linux/workqueue.h>
 #include <linux/mutex.h>
 
@@ -43,7 +42,7 @@
 #include "cx231xx-conf-reg.h"
 
 #define DRIVER_NAME                     "cx231xx"
-#define PWR_SLEEP_INTERVAL              5
+#define PWR_SLEEP_INTERVAL              10
 
 /* I2C addresses for control block in Cx231xx */
 #define     AFE_DEVICE_ADDRESS		0x60
@@ -64,6 +63,11 @@
 #define CX231XX_BOARD_HAUPPAUGE_EXETER  8
 #define CX231XX_BOARD_HAUPPAUGE_USBLIVE2 9
 #define CX231XX_BOARD_PV_PLAYTV_USB_HYBRID 10
+#define CX231XX_BOARD_PV_XCAPTURE_USB 11
+#define CX231XX_BOARD_KWORLD_UB430_USB_HYBRID 12
+#define CX231XX_BOARD_ICONBIT_U100 13
+#define CX231XX_BOARD_HAUPPAUGE_USB2_FM_PAL 14
+#define CX231XX_BOARD_HAUPPAUGE_USB2_FM_NTSC 15
 
 /* Limits minimum and default number of buffers */
 #define CX231XX_MIN_BUF                 4
@@ -109,7 +113,6 @@
 	V4L2_STD_PAL_BG |  V4L2_STD_PAL_DK    |  V4L2_STD_PAL_I    | \
 	V4L2_STD_PAL_M  |  V4L2_STD_PAL_N     |  V4L2_STD_PAL_Nc   | \
 	V4L2_STD_PAL_60 |  V4L2_STD_SECAM_L   |  V4L2_STD_SECAM_DK)
-#define CX231xx_VERSION_CODE KERNEL_VERSION(0, 0, 2)
 
 #define SLEEP_S5H1432    30
 #define CX23417_OSC_EN   8
@@ -353,7 +356,11 @@ struct cx231xx_board {
 
 	unsigned int max_range_640_480:1;
 	unsigned int has_dvb:1;
+	unsigned int has_417:1;
 	unsigned int valid:1;
+	unsigned int no_alt_vanc:1;
+	unsigned int external_av:1;
+	unsigned int dont_use_port_3:1;
 
 	unsigned char xclk, i2c_speed;
 
@@ -369,7 +376,6 @@ struct cx231xx_board {
 enum cx231xx_dev_state {
 	DEV_INITIALIZED = 0x01,
 	DEV_DISCONNECTED = 0x02,
-	DEV_MISCONFIGURED = 0x04,
 };
 
 enum AFE_MODE {
@@ -464,7 +470,7 @@ struct cx231xx_fh {
 #define I2C_STOP                0x0
 /* 1-- do not transmit STOP at end of transaction */
 #define I2C_NOSTOP              0x1
-/* 1--alllow slave to insert clock wait states */
+/* 1--allow slave to insert clock wait states */
 #define I2C_SYNC                0x1
 
 struct cx231xx_i2c {
@@ -474,7 +480,6 @@ struct cx231xx_i2c {
 
 	/* i2c i/o */
 	struct i2c_adapter i2c_adap;
-	struct i2c_algo_bit_data i2c_algo;
 	struct i2c_client i2c_client;
 	u32 i2c_rc;
 
@@ -613,6 +618,7 @@ struct cx231xx {
 
 	/* For I2C IR support */
 	struct IR_i2c_init_data    init_data;
+	struct i2c_client          *ir_i2c_client;
 
 	unsigned int stream_on:1;	/* Locks streams */
 	unsigned int vbi_stream_on:1;	/* Locks streams for VBI */

@@ -123,8 +123,8 @@ static int saa7164_vbi_buffers_alloc(struct saa7164_port *port)
 		((params->numberoflines * params->pitch) / PAGE_SIZE);
 	params->bitspersample = 8;
 	params->linethreshold = 0;
-	params->pagetablelistvirt = 0;
-	params->pagetablelistphys = 0;
+	params->pagetablelistvirt = NULL;
+	params->pagetablelistphys = NULL;
 	params->numpagetableentries = port->hwcfg.buffercount;
 
 	/* Allocate the PCI resources, buffers (hard) */
@@ -148,7 +148,7 @@ static int saa7164_vbi_buffers_alloc(struct saa7164_port *port)
 		}
 	}
 
-	/* Allocate some kenrel kernel buffers for copying
+	/* Allocate some kernel buffers for copying
 	 * to userpsace.
 	 */
 	len = params->numberoflines * params->pitch;
@@ -730,11 +730,6 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,
 	return 0;
 }
 
-static int vidioc_log_status(struct file *file, void *priv)
-{
-	return 0;
-}
-
 static int fill_queryctrl(struct saa7164_vbi_params *params,
 	struct v4l2_queryctrl *c)
 {
@@ -957,7 +952,7 @@ static int saa7164_vbi_start_streaming(struct saa7164_port *port)
 
 		/* Stop the hardware, regardless */
 		result = saa7164_vbi_stop_port(port);
-		if ((result != SAA_OK) && (result != SAA_ERR_ALREADY_STOPPED)) {
+		if (result != SAA_OK) {
 			printk(KERN_ERR "%s() pause/forced stop transition "
 				"failed, res = 0x%x\n", __func__, result);
 		}
@@ -976,7 +971,7 @@ static int saa7164_vbi_start_streaming(struct saa7164_port *port)
 		/* Stop the hardware, regardless */
 		result = saa7164_vbi_acquire_port(port);
 		result = saa7164_vbi_stop_port(port);
-		if ((result != SAA_OK) && (result != SAA_ERR_ALREADY_STOPPED)) {
+		if (result != SAA_OK) {
 			printk(KERN_ERR "%s() run/forced stop transition "
 				"failed, res = 0x%x\n", __func__, result);
 		}
@@ -1054,7 +1049,7 @@ static int fops_release(struct file *file)
 
 struct saa7164_user_buffer *saa7164_vbi_next_buf(struct saa7164_port *port)
 {
-	struct saa7164_user_buffer *ubuf = 0;
+	struct saa7164_user_buffer *ubuf = NULL;
 	struct saa7164_dev *dev = port->dev;
 	u32 crc;
 
@@ -1192,7 +1187,6 @@ static unsigned int fops_poll(struct file *file, poll_table *wait)
 {
 	struct saa7164_vbi_fh *fh = (struct saa7164_vbi_fh *)file->private_data;
 	struct saa7164_port *port = fh->port;
-	struct saa7164_user_buffer *ubuf;
 	unsigned int mask = 0;
 
 	port->last_poll_msecs_diff = port->last_poll_msecs;
@@ -1224,10 +1218,7 @@ static unsigned int fops_poll(struct file *file, poll_table *wait)
 	}
 
 	/* Pull the first buffer from the used list */
-	ubuf = list_first_entry(&port->list_buf_used.list,
-		struct saa7164_user_buffer, list);
-
-	if (ubuf)
+	if (!list_empty(&port->list_buf_used.list))
 		mask |= POLLIN | POLLRDNORM;
 
 	return mask;
@@ -1260,7 +1251,6 @@ static const struct v4l2_ioctl_ops vbi_ioctl_ops = {
 	.vidioc_g_ext_ctrls	 = vidioc_g_ext_ctrls,
 	.vidioc_s_ext_ctrls	 = vidioc_s_ext_ctrls,
 	.vidioc_try_ext_ctrls	 = vidioc_try_ext_ctrls,
-	.vidioc_log_status	 = vidioc_log_status,
 	.vidioc_queryctrl	 = vidioc_queryctrl,
 #if 0
 	.vidioc_g_chip_ident	 = saa7164_g_chip_ident,
@@ -1334,7 +1324,7 @@ int saa7164_vbi_register(struct saa7164_port *port)
 	port->v4l_device = saa7164_vbi_alloc(port,
 		dev->pci, &saa7164_vbi_template, "vbi");
 
-	if (port->v4l_device == NULL) {
+	if (!port->v4l_device) {
 		printk(KERN_INFO "%s: can't allocate vbi device\n",
 			dev->name);
 		result = -ENOMEM;

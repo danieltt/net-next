@@ -7,6 +7,7 @@
 
 #define	CPU_NAME		"COLDFIRE(m54xx)"
 #define	CPU_INSTR_PER_JIFFY	2
+#define	MCF_BUSCLK		(MCF_CLK / 2)
 
 #include <asm/m54xxacr.h>
 
@@ -15,7 +16,8 @@
 /*
  *      Interrupt Controller Registers
  */
-#define MCFICM_INTC0		0x0700		/* Base for Interrupt Ctrl 0 */
+#define MCFICM_INTC0		(MCF_MBAR + 0x700) 	/* Base for Interrupt Ctrl 0 */
+
 #define MCFINTC_IPRH		0x00		/* Interrupt pending 32-63 */
 #define MCFINTC_IPRL		0x04		/* Interrupt pending 1-31 */
 #define MCFINTC_IMRH		0x08		/* Interrupt mask 32-63 */
@@ -29,16 +31,20 @@
 /*
  *	UART module.
  */
-#define MCFUART_BASE1		0x8600		/* Base address of UART1 */
-#define MCFUART_BASE2		0x8700		/* Base address of UART2 */
-#define MCFUART_BASE3		0x8800		/* Base address of UART3 */
-#define MCFUART_BASE4		0x8900		/* Base address of UART4 */
+#define MCFUART_BASE0		(MCF_MBAR + 0x8600)	/* Base address UART0 */
+#define MCFUART_BASE1		(MCF_MBAR + 0x8700)	/* Base address UART1 */
+#define MCFUART_BASE2		(MCF_MBAR + 0x8800)	/* Base address UART2 */
+#define MCFUART_BASE3		(MCF_MBAR + 0x8900)	/* Base address UART3 */
 
 /*
  *	Define system peripheral IRQ usage.
  */
-#define MCF_IRQ_TIMER		(64 + 54)	/* Slice Timer 0 */
-#define MCF_IRQ_PROFILER	(64 + 53)	/* Slice Timer 1 */
+#define MCF_IRQ_TIMER		(MCFINT_VECBASE + 54)	/* Slice Timer 0 */
+#define MCF_IRQ_PROFILER	(MCFINT_VECBASE + 53)	/* Slice Timer 1 */
+#define MCF_IRQ_UART0		(MCFINT_VECBASE + 35)
+#define MCF_IRQ_UART1		(MCFINT_VECBASE + 34)
+#define MCF_IRQ_UART2		(MCFINT_VECBASE + 33)
+#define MCF_IRQ_UART3		(MCFINT_VECBASE + 32)
 
 /*
  *	Generic GPIO support
@@ -46,6 +52,16 @@
 #define MCFGPIO_PIN_MAX		0	/* I am too lazy to count */
 #define MCFGPIO_IRQ_MAX		-1
 #define MCFGPIO_IRQ_VECBASE	-1
+
+/*
+ *	EDGE Port support.
+ */
+#define	MCFEPORT_EPPAR		(MCF_MBAR + 0xf00)	/* Pin assignment */
+#define	MCFEPORT_EPDDR		(MCF_MBAR + 0xf04)	/* Data direction */
+#define	MCFEPORT_EPIER		(MCF_MBAR + 0xf05)	/* Interrupt enable */
+#define	MCFEPORT_EPDR		(MCF_MBAR + 0xf08)	/* Port data (w) */
+#define	MCFEPORT_EPPDR		(MCF_MBAR + 0xf09)	/* Port data (r) */
+#define	MCFEPORT_EPFR		(MCF_MBAR + 0xf0c)	/* Flags */
 
 /*
  *	Some PSC related definitions
@@ -64,5 +80,8 @@
 #define MCF_PAR_PSC_RTS_FSYNC	(0x20)
 #define MCF_PAR_PSC_RTS_RTS	(0x30)
 #define MCF_PAR_PSC_CANRX	(0x40)
+
+#define MCF_PAR_PCIBG		(CONFIG_MBAR + 0xa48)	/* PCI bus grant */
+#define MCF_PAR_PCIBR		(CONFIG_MBAR + 0xa4a)	/* PCI */
 
 #endif	/* m54xxsim_h */

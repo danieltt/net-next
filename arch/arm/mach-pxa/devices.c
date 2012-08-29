@@ -4,6 +4,7 @@
 #include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
 #include <linux/spi/pxa2xx_spi.h>
+#include <linux/i2c/pxa-i2c.h>
 
 #include <asm/pmu.h>
 #include <mach/udc.h>
@@ -11,12 +12,12 @@
 #include <mach/pxafb.h>
 #include <mach/mmc.h>
 #include <mach/irda.h>
+#include <mach/irqs.h>
 #include <mach/ohci.h>
 #include <plat/pxa27x_keypad.h>
 #include <mach/camera.h>
 #include <mach/audio.h>
 #include <mach/hardware.h>
-#include <plat/i2c.h>
 #include <plat/pxa3xx_nand.h>
 
 #include "devices.h"
@@ -90,7 +91,6 @@ void __init pxa_set_mci_info(struct pxamci_platform_data *info)
 
 static struct pxa2xx_udc_mach_info pxa_udc_info = {
 	.gpio_pullup = -1,
-	.gpio_vbus   = -1,
 };
 
 void __init pxa_set_udc_info(struct pxa2xx_udc_mach_info *info)
@@ -188,14 +188,10 @@ struct platform_device pxa_device_fb = {
 	.resource	= pxafb_resources,
 };
 
-void __init set_pxa_fb_info(struct pxafb_mach_info *info)
+void __init pxa_set_fb_info(struct device *parent, struct pxafb_mach_info *info)
 {
+	pxa_device_fb.dev.parent = parent;
 	pxa_register_device(&pxa_device_fb, info);
-}
-
-void __init set_pxa_fb_parent(struct device *parent_dev)
-{
-	pxa_device_fb.dev.parent = parent_dev;
 }
 
 static struct resource pxa_resource_ffuart[] = {
@@ -411,18 +407,15 @@ static struct resource pxa_rtc_resources[] = {
 	[1] = {
 		.start  = IRQ_RTC1Hz,
 		.end    = IRQ_RTC1Hz,
+		.name	= "rtc 1Hz",
 		.flags  = IORESOURCE_IRQ,
 	},
 	[2] = {
 		.start  = IRQ_RTCAlrm,
 		.end    = IRQ_RTCAlrm,
+		.name	= "rtc alarm",
 		.flags  = IORESOURCE_IRQ,
 	},
-};
-
-struct platform_device sa1100_device_rtc = {
-	.name		= "sa1100-rtc",
-	.id		= -1,
 };
 
 struct platform_device pxa_device_rtc = {
@@ -430,6 +423,27 @@ struct platform_device pxa_device_rtc = {
 	.id		= -1,
 	.num_resources  = ARRAY_SIZE(pxa_rtc_resources),
 	.resource       = pxa_rtc_resources,
+};
+
+static struct resource sa1100_rtc_resources[] = {
+	{
+		.start  = IRQ_RTC1Hz,
+		.end    = IRQ_RTC1Hz,
+		.name	= "rtc 1Hz",
+		.flags  = IORESOURCE_IRQ,
+	}, {
+		.start  = IRQ_RTCAlrm,
+		.end    = IRQ_RTCAlrm,
+		.name	= "rtc alarm",
+		.flags  = IORESOURCE_IRQ,
+	},
+};
+
+struct platform_device sa1100_device_rtc = {
+	.name		= "sa1100-rtc",
+	.id		= -1,
+	.num_resources	= ARRAY_SIZE(sa1100_rtc_resources),
+	.resource	= sa1100_rtc_resources,
 };
 
 static struct resource pxa_ac97_resources[] = {
@@ -1055,6 +1069,36 @@ struct platform_device pxa3xx_device_ssp4 = {
 	.num_resources	= ARRAY_SIZE(pxa3xx_resource_ssp4),
 };
 #endif /* CONFIG_PXA3xx || CONFIG_PXA95x */
+
+struct resource pxa_resource_gpio[] = {
+	{
+		.start	= 0x40e00000,
+		.end	= 0x40e0ffff,
+		.flags	= IORESOURCE_MEM,
+	}, {
+		.start	= IRQ_GPIO0,
+		.end	= IRQ_GPIO0,
+		.name	= "gpio0",
+		.flags	= IORESOURCE_IRQ,
+	}, {
+		.start	= IRQ_GPIO1,
+		.end	= IRQ_GPIO1,
+		.name	= "gpio1",
+		.flags	= IORESOURCE_IRQ,
+	}, {
+		.start	= IRQ_GPIO_2_x,
+		.end	= IRQ_GPIO_2_x,
+		.name	= "gpio_mux",
+		.flags	= IORESOURCE_IRQ,
+	},
+};
+
+struct platform_device pxa_device_gpio = {
+	.name		= "pxa-gpio",
+	.id		= -1,
+	.num_resources	= ARRAY_SIZE(pxa_resource_gpio),
+	.resource	= pxa_resource_gpio,
+};
 
 /* pxa2xx-spi platform-device ID equals respective SSP platform-device ID + 1.
  * See comment in arch/arm/mach-pxa/ssp.c::ssp_probe() */
