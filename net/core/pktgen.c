@@ -173,7 +173,7 @@
 #include <linux/uaccess.h>
 #include <asm/dma.h>
 #include <asm/div64.h>		/* do_div */
-#include "kmap_skb.h"
+#include <linux/highmem.h>
 
 #define VERSION	"2.75"
 #define IP_NAME_SZ 32
@@ -4240,7 +4240,7 @@ static int pktgen_rcv_counter(struct sk_buff *skb, struct net_device *dev,
 	void *vaddr;
 	struct pktgen_rx *data_cpu;
 	if (skb_is_nonlinear(skb)) {
-		vaddr = kmap_skb_frag(&skb_shinfo(skb)->frags[0]);
+		vaddr = kmap_atomic(skb_frag_page(&skb_shinfo(skb)->frags[0]));
 		pgh = (struct pktgen_hdr *)
 			(vaddr+skb_shinfo(skb)->frags[0].page_offset);
 	} else {
@@ -4257,7 +4257,7 @@ static int pktgen_rcv_counter(struct sk_buff *skb, struct net_device *dev,
 
 end:
 	if (skb_is_nonlinear(skb))
-		kunmap_skb_frag(vaddr);
+		kunmap_atomic(vaddr);
 	kfree_skb(skb);
 	return 0;
 }
@@ -4272,7 +4272,7 @@ static int pktgen_rcv_time(struct sk_buff *skb, struct net_device *dev,
 	struct pktgen_rx *data_cpu;
 	ktime_t now = ktime_get();
 	if (skb_is_nonlinear(skb)) {
-		vaddr = kmap_skb_frag(&skb_shinfo(skb)->frags[0]);
+		vaddr = kmap_atomic(skb_frag_page(&skb_shinfo(skb)->frags[0]));
 		pgh = (struct pktgen_hdr *)
 			(vaddr+skb_shinfo(skb)->frags[0].page_offset);
 	} else {
@@ -4293,7 +4293,7 @@ static int pktgen_rcv_time(struct sk_buff *skb, struct net_device *dev,
 	data_cpu->rx_bytes += skb->len + ETH_HLEN;
 end:
 	if (skb_is_nonlinear(skb))
-		kunmap_skb_frag(vaddr);
+		kunmap_atomic(vaddr);
 	kfree_skb(skb);
 	return 0;
 }
@@ -4308,7 +4308,7 @@ int pktgen_rcv_basic(struct sk_buff *skb, struct net_device *dev,
 	struct pktgen_rx *data_cpu;
 
 	if (skb_is_nonlinear(skb)) {
-		vaddr = kmap_skb_frag(&skb_shinfo(skb)->frags[0]);
+		vaddr = kmap_atomic(skb_frag_page(&skb_shinfo(skb)->frags[0]));
 		pgh = (struct pktgen_hdr *)
 			(vaddr+skb_shinfo(skb)->frags[0].page_offset);
 	} else {
@@ -4327,7 +4327,7 @@ int pktgen_rcv_basic(struct sk_buff *skb, struct net_device *dev,
 	data_cpu->rx_bytes += skb->len + ETH_HLEN;
 end:
 	if (skb_is_nonlinear(skb))
-		kunmap_skb_frag(vaddr);
+		kunmap_atomic(vaddr);
 	kfree_skb(skb);
 	return 0;
 }
@@ -4342,7 +4342,7 @@ int pktgen_rcv6_basic(struct sk_buff *skb, struct net_device *dev,
 	void *vaddr;
 	struct pktgen_rx *data_cpu;
 	if (skb_is_nonlinear(skb)) {
-		vaddr = kmap_skb_frag(&skb_shinfo(skb)->frags[0]);
+		vaddr = kmap_atomic(skb_frag_page(&skb_shinfo(skb)->frags[0]));
 		pgh = (struct pktgen_hdr *)
 			(vaddr+skb_shinfo(skb)->frags[0].page_offset);
 	} else {
@@ -4360,7 +4360,7 @@ int pktgen_rcv6_basic(struct sk_buff *skb, struct net_device *dev,
 	data_cpu->rx_bytes += skb->len + ETH_HLEN;
 end:
 	if (skb_is_nonlinear(skb))
-		kunmap_skb_frag(vaddr);
+		kunmap_atomic(vaddr);
 	kfree_skb(skb);
 	return 0;
 }
