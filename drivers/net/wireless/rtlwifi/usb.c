@@ -120,7 +120,7 @@ static int _usbctrl_vendorreq_sync_read(struct usb_device *udev, u8 request,
 
 	if (status < 0 && count++ < 4)
 		pr_err("reg 0x%x, usbctrl_vendorreq TimeOut! status:0x%x value=0x%x\n",
-		       value, status, le32_to_cpu(*(u32 *)pdata));
+		       value, status, *(u32 *)pdata);
 	return status;
 }
 
@@ -673,7 +673,7 @@ static int rtl_usb_start(struct ieee80211_hw *hw)
 		set_hal_start(rtlhal);
 
 		/* Start bulk IN */
-		_rtl_usb_receive(hw);
+		err = _rtl_usb_receive(hw);
 	}
 
 	return err;

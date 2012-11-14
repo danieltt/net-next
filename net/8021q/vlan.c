@@ -294,7 +294,7 @@ static void vlan_transfer_features(struct net_device *dev,
 	else
 		vlandev->hard_header_len = dev->hard_header_len + VLAN_HLEN;
 
-#if defined(CONFIG_FCOE) || defined(CONFIG_FCOE_MODULE)
+#if IS_ENABLED(CONFIG_FCOE)
 	vlandev->fcoe_ddp_xid = dev->fcoe_ddp_xid;
 #endif
 
@@ -463,7 +463,9 @@ static int vlan_device_event(struct notifier_block *unused, unsigned long event,
 
 	case NETDEV_PRE_TYPE_CHANGE:
 		/* Forbid underlaying device to change its type. */
-		return NOTIFY_BAD;
+		if (vlan_uses_dev(dev))
+			return NOTIFY_BAD;
+		break;
 
 	case NETDEV_NOTIFY_PEERS:
 	case NETDEV_BONDING_FAILOVER:

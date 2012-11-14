@@ -120,6 +120,10 @@
 #define HASH_SIZE  16
 #define HASH(addr) (((__force u32)addr^((__force u32)addr>>4))&0xF)
 
+static bool log_ecn_error = true;
+module_param(log_ecn_error, bool, 0644);
+MODULE_PARM_DESC(log_ecn_error, "Log packets received with corrupted ECN");
+
 static int ipip_net_id __read_mostly;
 struct ipip_net {
 	struct ip_tunnel __rcu *tunnels_r_l[HASH_SIZE];
@@ -134,6 +138,7 @@ struct ipip_net {
 static int ipip_tunnel_init(struct net_device *dev);
 static void ipip_tunnel_setup(struct net_device *dev);
 static void ipip_dev_free(struct net_device *dev);
+static struct rtnl_link_ops ipip_link_ops __read_mostly;
 
 /*
  * Locking : hash tables are protected by RCU and RTNL
@@ -301,6 +306,7 @@ static struct ip_tunnel *ipip_tunnel_locate(struct net *net,
 		goto failed_free;
 
 	strcpy(nt->parms.name, dev->name);
+	dev->rtnl_link_ops = &ipip_link_ops;
 
 	dev_hold(dev);
 	ipip_tunnel_link(ipn, nt);
@@ -365,8 +371,6 @@ static int ipip_err(struct sk_buff *skb, u32 info)
 	}
 
 	err = -ENOENT;
-
-	rcu_read_lock();
 	t = ipip_tunnel_lookup(dev_net(skb->dev), iph->daddr, iph->saddr);
 	if (t == NULL)
 		goto out;
@@ -398,34 +402,22 @@ static int ipip_err(struct sk_buff *skb, u32 info)
 		t->err_count = 1;
 	t->err_time = jiffies;
 out:
-	rcu_read_unlock();
+
 	return err;
-}
-
-static inline void ipip_ecn_decapsulate(const struct iphdr *outer_iph,
-					struct sk_buff *skb)
-{
-	struct iphdr *inner_iph = ip_hdr(skb);
-
-	if (INET_ECN_is_ce(outer_iph->tos))
-		IP_ECN_set_ce(inner_iph);
 }
 
 static int ipip_rcv(struct sk_buff *skb)
 {
 	struct ip_tunnel *tunnel;
 	const struct iphdr *iph = ip_hdr(skb);
+	int err;
 
-	rcu_read_lock();
 	tunnel = ipip_tunnel_lookup(dev_net(skb->dev), iph->saddr, iph->daddr);
 	if (tunnel != NULL) {
 		struct pcpu_tstats *tstats;
 
-		if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
-			rcu_read_unlock();
-			kfree_skb(skb);
-			return 0;
-		}
+		if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
+			goto drop;
 
 		secpath_reset(skb);
 
@@ -434,24 +426,35 @@ static int ipip_rcv(struct sk_buff *skb)
 		skb->protocol = htons(ETH_P_IP);
 		skb->pkt_type = PACKET_HOST;
 
+		__skb_tunnel_rx(skb, tunnel->dev);
+
+		err = IP_ECN_decapsulate(iph, skb);
+		if (unlikely(err)) {
+			if (log_ecn_error)
+				net_info_ratelimited("non-ECT from %pI4 with TOS=%#x\n",
+						     &iph->saddr, iph->tos);
+			if (err > 1) {
+				++tunnel->dev->stats.rx_frame_errors;
+				++tunnel->dev->stats.rx_errors;
+				goto drop;
+			}
+		}
+
 		tstats = this_cpu_ptr(tunnel->dev->tstats);
 		u64_stats_update_begin(&tstats->syncp);
 		tstats->rx_packets++;
 		tstats->rx_bytes += skb->len;
 		u64_stats_update_end(&tstats->syncp);
 
-		__skb_tunnel_rx(skb, tunnel->dev);
-
-		ipip_ecn_decapsulate(iph, skb);
-
 		netif_rx(skb);
-
-		rcu_read_unlock();
 		return 0;
 	}
-	rcu_read_unlock();
 
 	return -1;
+
+drop:
+	kfree_skb(skb);
+	return 0;
 }
 
 /*
@@ -476,6 +479,10 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
 	int    mtu;
 
 	if (skb->protocol != htons(ETH_P_IP))
+		goto tx_error;
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL &&
+	    skb_checksum_help(skb))
 		goto tx_error;
 
 	if (tos & 1)
@@ -772,6 +779,11 @@ static void ipip_dev_free(struct net_device *dev)
 	free_netdev(dev);
 }
 
+#define IPIP_FEATURES (NETIF_F_SG |		\
+		       NETIF_F_FRAGLIST |	\
+		       NETIF_F_HIGHDMA |	\
+		       NETIF_F_HW_CSUM)
+
 static void ipip_tunnel_setup(struct net_device *dev)
 {
 	dev->netdev_ops		= &ipip_netdev_ops;
@@ -786,6 +798,9 @@ static void ipip_tunnel_setup(struct net_device *dev)
 	dev->features		|= NETIF_F_NETNS_LOCAL;
 	dev->features		|= NETIF_F_LLTX;
 	dev->priv_flags		&= ~IFF_XMIT_DST_RELEASE;
+
+	dev->features		|= IPIP_FEATURES;
+	dev->hw_features	|= IPIP_FEATURES;
 }
 
 static int ipip_tunnel_init(struct net_device *dev)
@@ -827,6 +842,47 @@ static int __net_init ipip_fb_tunnel_init(struct net_device *dev)
 	rcu_assign_pointer(ipn->tunnels_wc[0], tunnel);
 	return 0;
 }
+
+static size_t ipip_get_size(const struct net_device *dev)
+{
+	return
+		/* IFLA_IPTUN_LINK */
+		nla_total_size(4) +
+		/* IFLA_IPTUN_LOCAL */
+		nla_total_size(4) +
+		/* IFLA_IPTUN_REMOTE */
+		nla_total_size(4) +
+		/* IFLA_IPTUN_TTL */
+		nla_total_size(1) +
+		/* IFLA_IPTUN_TOS */
+		nla_total_size(1) +
+		0;
+}
+
+static int ipip_fill_info(struct sk_buff *skb, const struct net_device *dev)
+{
+	struct ip_tunnel *tunnel = netdev_priv(dev);
+	struct ip_tunnel_parm *parm = &tunnel->parms;
+
+	if (nla_put_u32(skb, IFLA_IPTUN_LINK, parm->link) ||
+	    nla_put_be32(skb, IFLA_IPTUN_LOCAL, parm->iph.saddr) ||
+	    nla_put_be32(skb, IFLA_IPTUN_REMOTE, parm->iph.daddr) ||
+	    nla_put_u8(skb, IFLA_IPTUN_TTL, parm->iph.ttl) ||
+	    nla_put_u8(skb, IFLA_IPTUN_TOS, parm->iph.tos))
+		goto nla_put_failure;
+	return 0;
+
+nla_put_failure:
+	return -EMSGSIZE;
+}
+
+static struct rtnl_link_ops ipip_link_ops __read_mostly = {
+	.kind		= "ipip",
+	.maxtype	= IFLA_IPTUN_MAX,
+	.priv_size	= sizeof(struct ip_tunnel),
+	.get_size	= ipip_get_size,
+	.fill_info	= ipip_fill_info,
+};
 
 static struct xfrm_tunnel ipip_handler __read_mostly = {
 	.handler	=	ipip_rcv,
@@ -924,14 +980,26 @@ static int __init ipip_init(void)
 		return err;
 	err = xfrm4_tunnel_register(&ipip_handler, AF_INET);
 	if (err < 0) {
-		unregister_pernet_device(&ipip_net_ops);
 		pr_info("%s: can't register tunnel\n", __func__);
+		goto xfrm_tunnel_failed;
 	}
+	err = rtnl_link_register(&ipip_link_ops);
+	if (err < 0)
+		goto rtnl_link_failed;
+
+out:
 	return err;
+
+rtnl_link_failed:
+	xfrm4_tunnel_deregister(&ipip_handler, AF_INET);
+xfrm_tunnel_failed:
+	unregister_pernet_device(&ipip_net_ops);
+	goto out;
 }
 
 static void __exit ipip_fini(void)
 {
+	rtnl_link_unregister(&ipip_link_ops);
 	if (xfrm4_tunnel_deregister(&ipip_handler, AF_INET))
 		pr_info("%s: can't deregister tunnel\n", __func__);
 

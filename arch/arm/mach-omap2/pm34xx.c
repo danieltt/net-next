@@ -28,6 +28,8 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
+#include <linux/platform_data/gpio-omap.h>
+
 #include <trace/events/power.h>
 
 #include <asm/suspend.h>
@@ -272,21 +274,16 @@ void omap_sram_idle(void)
 	per_next_state = pwrdm_read_next_pwrst(per_pwrdm);
 	core_next_state = pwrdm_read_next_pwrst(core_pwrdm);
 
-	if (mpu_next_state < PWRDM_POWER_ON) {
-		pwrdm_pre_transition(mpu_pwrdm);
-		pwrdm_pre_transition(neon_pwrdm);
-	}
+	pwrdm_pre_transition(NULL);
 
 	/* PER */
 	if (per_next_state < PWRDM_POWER_ON) {
-		pwrdm_pre_transition(per_pwrdm);
 		per_going_off = (per_next_state == PWRDM_POWER_OFF) ? 1 : 0;
 		omap2_gpio_prepare_for_idle(per_going_off);
 	}
 
 	/* CORE */
 	if (core_next_state < PWRDM_POWER_ON) {
-		pwrdm_pre_transition(core_pwrdm);
 		if (core_next_state == PWRDM_POWER_OFF) {
 			omap3_core_save_context();
 			omap3_cm_save_context();
@@ -339,20 +336,14 @@ void omap_sram_idle(void)
 			omap2_prm_clear_mod_reg_bits(OMAP3430_AUTO_OFF_MASK,
 					       OMAP3430_GR_MOD,
 					       OMAP3_PRM_VOLTCTRL_OFFSET);
-		pwrdm_post_transition(core_pwrdm);
 	}
 	omap3_intc_resume_idle();
 
-	/* PER */
-	if (per_next_state < PWRDM_POWER_ON) {
-		omap2_gpio_resume_after_idle();
-		pwrdm_post_transition(per_pwrdm);
-	}
+	pwrdm_post_transition(NULL);
 
-	if (mpu_next_state < PWRDM_POWER_ON) {
-		pwrdm_post_transition(mpu_pwrdm);
-		pwrdm_post_transition(neon_pwrdm);
-	}
+	/* PER */
+	if (per_next_state < PWRDM_POWER_ON)
+		omap2_gpio_resume_after_idle();
 }
 
 static void omap3_pm_idle(void)
@@ -400,9 +391,8 @@ restore:
 	list_for_each_entry(pwrst, &pwrst_list, node) {
 		state = pwrdm_read_prev_pwrst(pwrst->pwrdm);
 		if (state > pwrst->next_state) {
-			pr_info("Powerdomain (%s) didn't enter "
-				"target state %d\n",
-			       pwrst->pwrdm->name, pwrst->next_state);
+			pr_info("Powerdomain (%s) didn't enter target state %d\n",
+				pwrst->pwrdm->name, pwrst->next_state);
 			ret = -1;
 		}
 		omap_set_pwrdm_state(pwrst->pwrdm, pwrst->saved_state);
@@ -662,14 +652,17 @@ static void __init pm_errata_configure(void)
 		/* Enable the l2 cache toggling in sleep logic */
 		enable_omap3630_toggle_l2_on_restore();
 		if (omap_rev() < OMAP3630_REV_ES1_2)
-			pm34xx_errata |= PM_SDRC_WAKEUP_ERRATUM_i583;
+			pm34xx_errata |= (PM_SDRC_WAKEUP_ERRATUM_i583 |
+					  PM_PER_MEMORIES_ERRATUM_i582);
+	} else if (cpu_is_omap34xx()) {
+		pm34xx_errata |= PM_PER_MEMORIES_ERRATUM_i582;
 	}
 }
 
 int __init omap3_pm_init(void)
 {
 	struct power_state *pwrst, *tmp;
-	struct clockdomain *neon_clkdm, *mpu_clkdm;
+	struct clockdomain *neon_clkdm, *mpu_clkdm, *per_clkdm, *wkup_clkdm;
 	int ret;
 
 	if (!omap3_has_io_chain_ctrl())
@@ -721,6 +714,8 @@ int __init omap3_pm_init(void)
 
 	neon_clkdm = clkdm_lookup("neon_clkdm");
 	mpu_clkdm = clkdm_lookup("mpu_clkdm");
+	per_clkdm = clkdm_lookup("per_clkdm");
+	wkup_clkdm = clkdm_lookup("wkup_clkdm");
 
 #ifdef CONFIG_SUSPEND
 	omap_pm_suspend = omap3_pm_suspend;
@@ -737,13 +732,33 @@ int __init omap3_pm_init(void)
 	if (IS_PM34XX_ERRATUM(PM_RTA_ERRATUM_i608))
 		omap3630_ctrl_disable_rta();
 
+	/*
+	 * The UART3/4 FIFO and the sidetone memory in McBSP2/3 are
+	 * not correctly reset when the PER powerdomain comes back
+	 * from OFF or OSWR when the CORE powerdomain is kept active.
+	 * See OMAP36xx Erratum i582 "PER Domain reset issue after
+	 * Domain-OFF/OSWR Wakeup".  This wakeup dependency is not a
+	 * complete workaround.  The kernel must also prevent the PER
+	 * powerdomain from going to OSWR/OFF while the CORE
+	 * powerdomain is not going to OSWR/OFF.  And if PER last
+	 * power state was off while CORE last power state was ON, the
+	 * UART3/4 and McBSP2/3 SIDETONE devices need to run a
+	 * self-test using their loopback tests; if that fails, those
+	 * devices are unusable until the PER/CORE can complete a transition
+	 * from ON to OSWR/OFF and then back to ON.
+	 *
+	 * XXX Technically this workaround is only needed if off-mode
+	 * or OSWR is enabled.
+	 */
+	if (IS_PM34XX_ERRATUM(PM_PER_MEMORIES_ERRATUM_i582))
+		clkdm_add_wkdep(per_clkdm, wkup_clkdm);
+
 	clkdm_add_wkdep(neon_clkdm, mpu_clkdm);
 	if (omap_type() != OMAP2_DEVICE_TYPE_GP) {
 		omap3_secure_ram_storage =
 			kmalloc(0x803F, GFP_KERNEL);
 		if (!omap3_secure_ram_storage)
-			pr_err("Memory allocation failed when "
-			       "allocating for secure sram context\n");
+			pr_err("Memory allocation failed when allocating for secure sram context\n");
 
 		local_irq_disable();
 		local_fiq_disable();

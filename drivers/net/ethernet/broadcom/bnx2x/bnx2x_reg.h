@@ -2107,6 +2107,7 @@
 #define NIG_REG_LLH1_ERROR_MASK 				 0x10090
 /* [RW 8] event id for llh1 */
 #define NIG_REG_LLH1_EVENT_ID					 0x10088
+#define NIG_REG_LLH1_FUNC_EN					 0x16104
 #define NIG_REG_LLH1_FUNC_MEM					 0x161c0
 #define NIG_REG_LLH1_FUNC_MEM_ENABLE				 0x16160
 #define NIG_REG_LLH1_FUNC_MEM_SIZE				 16
@@ -2302,6 +2303,15 @@
  * set to 0x345678021. This is a new register (with 2_) added in E3 B0 to
  * accommodate the 9 input clients to ETS arbiter. */
 #define NIG_REG_P0_TX_ARB_PRIORITY_CLIENT2_MSB			 0x18684
+/* [RW 1] MCP-to-host path enable. Set this bit to enable the routing of MCP
+ * packets to BRB LB interface to forward the packet to the host. All
+ * packets from MCP are forwarded to the network when this bit is cleared -
+ * regardless of the configured destination in tx_mng_destination register.
+ * When MCP-to-host paths for both ports 0 and 1 are disabled - the arbiter
+ * for BRB LB interface is bypassed and PBF LB traffic is always selected to
+ * send to BRB LB.
+ */
+#define NIG_REG_P0_TX_MNG_HOST_ENABLE				 0x182f4
 #define NIG_REG_P1_HWPFC_ENABLE					 0x181d0
 #define NIG_REG_P1_MAC_IN_EN					 0x185c0
 /* [RW 1] Output enable for TX MAC interface */
@@ -2418,6 +2428,12 @@
 #define NIG_REG_P1_TX_ARB_PRIORITY_CLIENT2_MSB			 0x186e4
 /* [R 1] TX FIFO for transmitting data to MAC is empty. */
 #define NIG_REG_P1_TX_MACFIFO_EMPTY				 0x18594
+/* [RW 1] MCP-to-host path enable. Set this bit to enable the routing of MCP
+ * packets to BRB LB interface to forward the packet to the host. All
+ * packets from MCP are forwarded to the network when this bit is cleared -
+ * regardless of the configured destination in tx_mng_destination register.
+ */
+#define NIG_REG_P1_TX_MNG_HOST_ENABLE				 0x182f8
 /* [R 1] FIFO empty status of the MCP TX FIFO used for storing MCP packets
    forwarded to the host. */
 #define NIG_REG_P1_TX_MNG_HOST_FIFO_EMPTY			 0x182b8
@@ -4949,6 +4965,10 @@
 #define UMAC_COMMAND_CONFIG_REG_SW_RESET			 (0x1<<13)
 #define UMAC_COMMAND_CONFIG_REG_TX_ENA				 (0x1<<0)
 #define UMAC_REG_COMMAND_CONFIG					 0x8
+/* [RW 16] This is the duration for which MAC must wait to go back to ACTIVE
+ * state from LPI state when it receives packet for transmission. The
+ * decrement unit is 1 micro-second. */
+#define UMAC_REG_EEE_WAKE_TIMER					 0x6c
 /* [RW 32] Register Bit 0 refers to Bit 16 of the MAC address; Bit 1 refers
  * to bit 17 of the MAC address etc. */
 #define UMAC_REG_MAC_ADDR0					 0xc
@@ -4958,6 +4978,8 @@
 /* [RW 14] Defines a 14-Bit maximum frame length used by the MAC receive
  * logic to check frames. */
 #define UMAC_REG_MAXFR						 0x14
+#define UMAC_REG_UMAC_EEE_CTRL					 0x64
+#define UMAC_UMAC_EEE_CTRL_REG_EEE_EN				 (0x1<<3)
 /* [RW 8] The event id for aggregated interrupt 0 */
 #define USDM_REG_AGG_INT_EVENT_0				 0xc4038
 #define USDM_REG_AGG_INT_EVENT_1				 0xc403c
@@ -6992,6 +7014,7 @@ Theotherbitsarereservedandshouldbezero*/
 /* BCM84833 only */
 #define MDIO_84833_TOP_CFG_FW_REV			0x400f
 #define MDIO_84833_TOP_CFG_FW_EEE		0x10b1
+#define MDIO_84833_TOP_CFG_FW_NO_EEE		0x1f81
 #define MDIO_84833_TOP_CFG_XGPHY_STRAP1			0x401a
 #define MDIO_84833_SUPER_ISOLATE		0x8000
 /* These are mailbox register set used by 84833. */
@@ -7160,10 +7183,11 @@ Theotherbitsarereservedandshouldbezero*/
 #define MDIO_REG_GPHY_ID_54618SE		0x5cd5
 #define MDIO_REG_GPHY_CL45_ADDR_REG			0xd
 #define MDIO_REG_GPHY_CL45_DATA_REG			0xe
-#define MDIO_REG_GPHY_EEE_ADV			0x3c
-#define MDIO_REG_GPHY_EEE_1G		(0x1 << 2)
-#define MDIO_REG_GPHY_EEE_100		(0x1 << 1)
 #define MDIO_REG_GPHY_EEE_RESOLVED		0x803e
+#define MDIO_REG_GPHY_EXP_ACCESS_GATE			0x15
+#define MDIO_REG_GPHY_EXP_ACCESS			0x17
+#define MDIO_REG_GPHY_EXP_ACCESS_TOP		0xd00
+#define MDIO_REG_GPHY_EXP_TOP_2K_BUF		0x40
 #define MDIO_REG_GPHY_AUX_STATUS			0x19
 #define MDIO_REG_INTR_STATUS				0x1a
 #define MDIO_REG_INTR_MASK				0x1b

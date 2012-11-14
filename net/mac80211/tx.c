@@ -354,7 +354,7 @@ static void purge_old_ps_buffers(struct ieee80211_local *local)
 			total += skb_queue_len(&sta->ps_tx_buf[ac]);
 			if (skb) {
 				purged++;
-				dev_kfree_skb(skb);
+				ieee80211_free_txskb(&local->hw, skb);
 				break;
 			}
 		}
@@ -466,7 +466,7 @@ ieee80211_tx_h_unicast_ps_buf(struct ieee80211_tx_data *tx)
 			ps_dbg(tx->sdata,
 			       "STA %pM TX buffer for AC %d full - dropping oldest frame\n",
 			       sta->sta.addr, ac);
-			dev_kfree_skb(old);
+			ieee80211_free_txskb(&local->hw, old);
 		} else
 			tx->local->total_ps_buffered++;
 
@@ -580,7 +580,7 @@ ieee80211_tx_h_select_key(struct ieee80211_tx_data *tx)
 				tx->key = NULL;
 			else
 				skip_hw = (tx->key->conf.flags &
-					   IEEE80211_KEY_FLAG_SW_MGMT) &&
+					   IEEE80211_KEY_FLAG_SW_MGMT_TX) &&
 					ieee80211_is_mgmt(hdr->frame_control);
 			break;
 		case WLAN_CIPHER_SUITE_AES_CMAC:
@@ -1103,7 +1103,7 @@ static bool ieee80211_tx_prep_agg(struct ieee80211_tx_data *tx,
 		spin_unlock(&tx->sta->lock);
 
 		if (purge_skb)
-			dev_kfree_skb(purge_skb);
+			ieee80211_free_txskb(&tx->local->hw, purge_skb);
 	}
 
 	/* reset session timer */
@@ -1214,7 +1214,7 @@ static bool ieee80211_tx_frags(struct ieee80211_local *local,
 #ifdef CONFIG_MAC80211_VERBOSE_DEBUG
 		if (WARN_ON_ONCE(q >= local->hw.queues)) {
 			__skb_unlink(skb, skbs);
-			dev_kfree_skb(skb);
+			ieee80211_free_txskb(&local->hw, skb);
 			continue;
 		}
 #endif
@@ -1356,7 +1356,7 @@ static int invoke_tx_handlers(struct ieee80211_tx_data *tx)
 	if (unlikely(res == TX_DROP)) {
 		I802_DEBUG_INC(tx->local->tx_handlers_drop);
 		if (tx->skb)
-			dev_kfree_skb(tx->skb);
+			ieee80211_free_txskb(&tx->local->hw, tx->skb);
 		else
 			__skb_queue_purge(&tx->skbs);
 		return -1;
@@ -1393,7 +1393,7 @@ static bool ieee80211_tx(struct ieee80211_sub_if_data *sdata,
 	res_prepare = ieee80211_tx_prepare(sdata, &tx, skb);
 
 	if (unlikely(res_prepare == TX_DROP)) {
-		dev_kfree_skb(skb);
+		ieee80211_free_txskb(&local->hw, skb);
 		goto out;
 	} else if (unlikely(res_prepare == TX_QUEUED)) {
 		goto out;
@@ -1465,7 +1465,7 @@ void ieee80211_xmit(struct ieee80211_sub_if_data *sdata, struct sk_buff *skb)
 	headroom = max_t(int, 0, headroom);
 
 	if (ieee80211_skb_resize(sdata, skb, headroom, may_encrypt)) {
-		dev_kfree_skb(skb);
+		ieee80211_free_txskb(&local->hw, skb);
 		rcu_read_unlock();
 		return;
 	}
@@ -1807,37 +1807,31 @@ netdev_tx_t ieee80211_subif_start_xmit(struct sk_buff *skb,
 			meshhdrlen = ieee80211_new_mesh_header(&mesh_hdr,
 					sdata, NULL, NULL);
 		} else {
-			int is_mesh_mcast = 1;
-			const u8 *mesh_da;
+			/* DS -> MBSS (802.11-2012 13.11.3.3).
+			 * For unicast with unknown forwarding information,
+			 * destination might be in the MBSS or if that fails
+			 * forwarded to another mesh gate. In either case
+			 * resolution will be handled in ieee80211_xmit(), so
+			 * leave the original DA. This also works for mcast */
+			const u8 *mesh_da = skb->data;
 
-			if (is_multicast_ether_addr(skb->data))
-				/* DA TA mSA AE:SA */
-				mesh_da = skb->data;
-			else {
-				static const u8 bcast[ETH_ALEN] =
-					{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
-				if (mppath) {
-					/* RA TA mDA mSA AE:DA SA */
-					mesh_da = mppath->mpp;
-					is_mesh_mcast = 0;
-				} else if (mpath) {
-					mesh_da = mpath->dst;
-					is_mesh_mcast = 0;
-				} else {
-					/* DA TA mSA AE:SA */
-					mesh_da = bcast;
-				}
-			}
+			if (mppath)
+				mesh_da = mppath->mpp;
+			else if (mpath)
+				mesh_da = mpath->dst;
+			rcu_read_unlock();
+
 			hdrlen = ieee80211_fill_mesh_addresses(&hdr, &fc,
 					mesh_da, sdata->vif.addr);
-			rcu_read_unlock();
-			if (is_mesh_mcast)
+			if (is_multicast_ether_addr(mesh_da))
+				/* DA TA mSA AE:SA */
 				meshhdrlen =
 					ieee80211_new_mesh_header(&mesh_hdr,
 							sdata,
 							skb->data + ETH_ALEN,
 							NULL);
 			else
+				/* RA TA mDA mSA AE:DA SA */
 				meshhdrlen =
 					ieee80211_new_mesh_header(&mesh_hdr,
 							sdata,
@@ -2056,8 +2050,10 @@ netdev_tx_t ieee80211_subif_start_xmit(struct sk_buff *skb,
 		head_need += IEEE80211_ENCRYPT_HEADROOM;
 		head_need += local->tx_headroom;
 		head_need = max_t(int, 0, head_need);
-		if (ieee80211_skb_resize(sdata, skb, head_need, true))
-			goto fail;
+		if (ieee80211_skb_resize(sdata, skb, head_need, true)) {
+			ieee80211_free_txskb(&local->hw, skb);
+			return NETDEV_TX_OK;
+		}
 	}
 
 	if (encaps_data) {
@@ -2190,7 +2186,7 @@ void ieee80211_tx_pending(unsigned long data)
 			struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 
 			if (WARN_ON(!info->control.vif)) {
-				kfree_skb(skb);
+				ieee80211_free_txskb(&local->hw, skb);
 				continue;
 			}
 

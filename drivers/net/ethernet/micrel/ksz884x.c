@@ -5407,8 +5407,8 @@ static int netdev_close(struct net_device *dev)
 		/* Delay for receive task to stop scheduling itself. */
 		msleep(2000 / HZ);
 
-		tasklet_disable(&hw_priv->rx_tasklet);
-		tasklet_disable(&hw_priv->tx_tasklet);
+		tasklet_kill(&hw_priv->rx_tasklet);
+		tasklet_kill(&hw_priv->tx_tasklet);
 		free_irq(dev->irq, hw_priv->dev);
 
 		transmit_cleanup(hw_priv, 0);
@@ -7251,18 +7251,7 @@ static struct pci_driver pci_device_driver = {
 	.remove		= pcidev_exit
 };
 
-static int __init ksz884x_init_module(void)
-{
-	return pci_register_driver(&pci_device_driver);
-}
-
-static void __exit ksz884x_cleanup_module(void)
-{
-	pci_unregister_driver(&pci_device_driver);
-}
-
-module_init(ksz884x_init_module);
-module_exit(ksz884x_cleanup_module);
+module_pci_driver(pci_device_driver);
 
 MODULE_DESCRIPTION("KSZ8841/2 PCI network driver");
 MODULE_AUTHOR("Tristram Ha <Tristram.Ha@micrel.com>");

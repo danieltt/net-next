@@ -50,6 +50,7 @@
 #define  TG3PCI_DEVICE_TIGON3_5785_G	 0x1699 /* GPHY */
 #define  TG3PCI_DEVICE_TIGON3_5785_F	 0x16a0 /* 10/100 only */
 #define  TG3PCI_DEVICE_TIGON3_5717	 0x1655
+#define  TG3PCI_DEVICE_TIGON3_5717_C	 0x1665
 #define  TG3PCI_DEVICE_TIGON3_5718	 0x1656
 #define  TG3PCI_DEVICE_TIGON3_57781	 0x16b1
 #define  TG3PCI_DEVICE_TIGON3_57785	 0x16b5
@@ -149,6 +150,7 @@
 #define  CHIPREV_ID_57780_A0		 0x57780000
 #define  CHIPREV_ID_57780_A1		 0x57780001
 #define  CHIPREV_ID_5717_A0		 0x05717000
+#define  CHIPREV_ID_5717_C0		 0x05717200
 #define  CHIPREV_ID_57765_A0		 0x57785000
 #define  CHIPREV_ID_5719_A0		 0x05719000
 #define  CHIPREV_ID_5720_A0		 0x05720000
@@ -2860,7 +2862,8 @@ struct tg3_rx_prodring_set {
 	dma_addr_t			rx_jmb_mapping;
 };
 
-#define TG3_IRQ_MAX_VECS_RSS		5
+#define TG3_RSS_MAX_NUM_QS		4
+#define TG3_IRQ_MAX_VECS_RSS		(TG3_RSS_MAX_NUM_QS + 1)
 #define TG3_IRQ_MAX_VECS		TG3_IRQ_MAX_VECS_RSS
 
 struct tg3_napi {
@@ -3037,6 +3040,9 @@ struct tg3 {
 	void				(*write32_tx_mbox) (struct tg3 *, u32,
 							    u32);
 	u32				dma_limit;
+	u32				txq_req;
+	u32				txq_cnt;
+	u32				txq_max;
 
 	/* begin "rx thread" cacheline section */
 	struct tg3_napi			napi[TG3_IRQ_MAX_VECS];
@@ -3051,6 +3057,9 @@ struct tg3 {
 	u32				rx_std_max_post;
 	u32				rx_offset;
 	u32				rx_pkt_map_sz;
+	u32				rxq_req;
+	u32				rxq_cnt;
+	u32				rxq_max;
 	bool				rx_refill;
 
 

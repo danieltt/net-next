@@ -52,8 +52,6 @@ struct netns_ipv4 {
 	struct xt_table		*iptable_security;
 #endif
 	struct xt_table		*nat_table;
-	struct hlist_head	*nat_bysource;
-	unsigned int		nat_htable_size;
 #endif
 
 	int sysctl_icmp_echo_ignore_all;
@@ -66,7 +64,6 @@ struct netns_ipv4 {
 	kgid_t sysctl_ping_group_range[2];
 	long sysctl_tcp_mem[3];
 
-	atomic_t rt_genid;
 	atomic_t dev_addr_genid;
 
 #ifdef CONFIG_IP_MROUTE

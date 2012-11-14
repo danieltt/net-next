@@ -26,6 +26,8 @@
 #include <linux/ethtool.h>
 #include <linux/mii.h>
 #include <linux/usb.h>
+#include <linux/bitrev.h>
+#include <linux/crc16.h>
 #include <linux/crc32.h>
 #include <linux/usb/usbnet.h>
 #include <linux/slab.h>
@@ -52,6 +54,8 @@
 #define USB_PRODUCT_ID_LAN7500		(0x7500)
 #define USB_PRODUCT_ID_LAN7505		(0x7505)
 #define RXW_PADDING			2
+#define SUPPORTED_WAKE			(WAKE_UCAST | WAKE_BCAST | \
+					 WAKE_MCAST | WAKE_ARP | WAKE_MAGIC)
 
 #define check_warn(ret, fmt, args...) \
 	({ if (ret < 0) netdev_warn(dev->net, fmt, ##args); })
@@ -65,6 +69,7 @@
 struct smsc75xx_priv {
 	struct usbnet *dev;
 	u32 rfe_ctl;
+	u32 wolopts;
 	u32 multicast_hash_table[DP_SEL_VHF_HASH_LEN];
 	struct mutex dataport_mutex;
 	spinlock_t rfe_ctl_lock;
@@ -80,59 +85,102 @@ static bool turbo_mode = true;
 module_param(turbo_mode, bool, 0644);
 MODULE_PARM_DESC(turbo_mode, "Enable multiple frames per Rx transaction");
 
-static int __must_check smsc75xx_read_reg(struct usbnet *dev, u32 index,
-					  u32 *data)
+static int __must_check __smsc75xx_read_reg(struct usbnet *dev, u32 index,
+					    u32 *data, int in_pm)
 {
-	u32 *buf = kmalloc(4, GFP_KERNEL);
+	u32 buf;
 	int ret;
+	int (*fn)(struct usbnet *, u8, u8, u16, u16, void *, u16);
 
 	BUG_ON(!dev);
 
-	if (!buf)
-		return -ENOMEM;
+	if (!in_pm)
+		fn = usbnet_read_cmd;
+	else
+		fn = usbnet_read_cmd_nopm;
 
-	ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
-		USB_VENDOR_REQUEST_READ_REGISTER,
-		USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-		00, index, buf, 4, USB_CTRL_GET_TIMEOUT);
-
+	ret = fn(dev, USB_VENDOR_REQUEST_READ_REGISTER, USB_DIR_IN
+		 | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+		 0, index, &buf, 4);
 	if (unlikely(ret < 0))
 		netdev_warn(dev->net,
 			"Failed to read reg index 0x%08x: %d", index, ret);
 
-	le32_to_cpus(buf);
-	*data = *buf;
-	kfree(buf);
+	le32_to_cpus(&buf);
+	*data = buf;
 
 	return ret;
+}
+
+static int __must_check __smsc75xx_write_reg(struct usbnet *dev, u32 index,
+					     u32 data, int in_pm)
+{
+	u32 buf;
+	int ret;
+	int (*fn)(struct usbnet *, u8, u8, u16, u16, const void *, u16);
+
+	BUG_ON(!dev);
+
+	if (!in_pm)
+		fn = usbnet_write_cmd;
+	else
+		fn = usbnet_write_cmd_nopm;
+
+	buf = data;
+	cpu_to_le32s(&buf);
+
+	ret = fn(dev, USB_VENDOR_REQUEST_WRITE_REGISTER, USB_DIR_OUT
+		 | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+		 0, index, &buf, 4);
+	if (unlikely(ret < 0))
+		netdev_warn(dev->net,
+			"Failed to write reg index 0x%08x: %d", index, ret);
+
+	return ret;
+}
+
+static int __must_check smsc75xx_read_reg_nopm(struct usbnet *dev, u32 index,
+					       u32 *data)
+{
+	return __smsc75xx_read_reg(dev, index, data, 1);
+}
+
+static int __must_check smsc75xx_write_reg_nopm(struct usbnet *dev, u32 index,
+						u32 data)
+{
+	return __smsc75xx_write_reg(dev, index, data, 1);
+}
+
+static int __must_check smsc75xx_read_reg(struct usbnet *dev, u32 index,
+					  u32 *data)
+{
+	return __smsc75xx_read_reg(dev, index, data, 0);
 }
 
 static int __must_check smsc75xx_write_reg(struct usbnet *dev, u32 index,
 					   u32 data)
 {
-	u32 *buf = kmalloc(4, GFP_KERNEL);
-	int ret;
+	return __smsc75xx_write_reg(dev, index, data, 0);
+}
 
-	BUG_ON(!dev);
+static int smsc75xx_set_feature(struct usbnet *dev, u32 feature)
+{
+	if (WARN_ON_ONCE(!dev))
+		return -EINVAL;
 
-	if (!buf)
-		return -ENOMEM;
+	return usbnet_write_cmd_nopm(dev, USB_REQ_SET_FEATURE,
+				     USB_DIR_OUT | USB_RECIP_DEVICE,
+				     feature, 0, NULL, 0);
+}
 
-	*buf = data;
-	cpu_to_le32s(buf);
+static int smsc75xx_clear_feature(struct usbnet *dev, u32 feature)
+{
+	if (WARN_ON_ONCE(!dev))
+		return -EINVAL;
 
-	ret = usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
-		USB_VENDOR_REQUEST_WRITE_REGISTER,
-		USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-		00, index, buf, 4, USB_CTRL_SET_TIMEOUT);
-
-	if (unlikely(ret < 0))
-		netdev_warn(dev->net,
-			"Failed to write reg index 0x%08x: %d", index, ret);
-
-	kfree(buf);
-
-	return ret;
+	return usbnet_write_cmd_nopm(dev, USB_REQ_CLEAR_FEATURE,
+				     USB_DIR_OUT | USB_RECIP_DEVICE,
+				     feature, 0, NULL, 0);
 }
 
 /* Loop until the read is completed with timeout
@@ -578,6 +626,26 @@ static int smsc75xx_ethtool_set_eeprom(struct net_device *netdev,
 	return smsc75xx_write_eeprom(dev, ee->offset, ee->len, data);
 }
 
+static void smsc75xx_ethtool_get_wol(struct net_device *net,
+				     struct ethtool_wolinfo *wolinfo)
+{
+	struct usbnet *dev = netdev_priv(net);
+	struct smsc75xx_priv *pdata = (struct smsc75xx_priv *)(dev->data[0]);
+
+	wolinfo->supported = SUPPORTED_WAKE;
+	wolinfo->wolopts = pdata->wolopts;
+}
+
+static int smsc75xx_ethtool_set_wol(struct net_device *net,
+				    struct ethtool_wolinfo *wolinfo)
+{
+	struct usbnet *dev = netdev_priv(net);
+	struct smsc75xx_priv *pdata = (struct smsc75xx_priv *)(dev->data[0]);
+
+	pdata->wolopts = wolinfo->wolopts & SUPPORTED_WAKE;
+	return 0;
+}
+
 static const struct ethtool_ops smsc75xx_ethtool_ops = {
 	.get_link	= usbnet_get_link,
 	.nway_reset	= usbnet_nway_reset,
@@ -589,6 +657,8 @@ static const struct ethtool_ops smsc75xx_ethtool_ops = {
 	.get_eeprom_len	= smsc75xx_ethtool_get_eeprom_len,
 	.get_eeprom	= smsc75xx_ethtool_get_eeprom,
 	.set_eeprom	= smsc75xx_ethtool_set_eeprom,
+	.get_wol	= smsc75xx_ethtool_get_wol,
+	.set_wol	= smsc75xx_ethtool_set_wol,
 };
 
 static int smsc75xx_ioctl(struct net_device *netdev, struct ifreq *rq, int cmd)
@@ -756,6 +826,29 @@ static int smsc75xx_set_features(struct net_device *netdev,
 	return 0;
 }
 
+static int smsc75xx_wait_ready(struct usbnet *dev, int in_pm)
+{
+	int timeout = 0;
+
+	do {
+		u32 buf;
+		int ret;
+
+		ret = __smsc75xx_read_reg(dev, PMT_CTL, &buf, in_pm);
+
+		check_warn_return(ret, "Failed to read PMT_CTL: %d", ret);
+
+		if (buf & PMT_CTL_DEV_RDY)
+			return 0;
+
+		msleep(10);
+		timeout++;
+	} while (timeout < 100);
+
+	netdev_warn(dev->net, "timeout waiting for device ready");
+	return -EIO;
+}
+
 static int smsc75xx_reset(struct usbnet *dev)
 {
 	struct smsc75xx_priv *pdata = (struct smsc75xx_priv *)(dev->data[0]);
@@ -763,6 +856,9 @@ static int smsc75xx_reset(struct usbnet *dev)
 	int ret = 0, timeout;
 
 	netif_dbg(dev, ifup, dev->net, "entering smsc75xx_reset");
+
+	ret = smsc75xx_wait_ready(dev, 0);
+	check_warn_return(ret, "device not ready in smsc75xx_reset");
 
 	ret = smsc75xx_read_reg(dev, HW_CFG, &buf);
 	check_warn_return(ret, "Failed to read HW_CFG: %d", ret);
@@ -1083,6 +1179,255 @@ static void smsc75xx_unbind(struct usbnet *dev, struct usb_interface *intf)
 	}
 }
 
+static u16 smsc_crc(const u8 *buffer, size_t len)
+{
+	return bitrev16(crc16(0xFFFF, buffer, len));
+}
+
+static int smsc75xx_write_wuff(struct usbnet *dev, int filter, u32 wuf_cfg,
+			       u32 wuf_mask1)
+{
+	int cfg_base = WUF_CFGX + filter * 4;
+	int mask_base = WUF_MASKX + filter * 16;
+	int ret;
+
+	ret = smsc75xx_write_reg(dev, cfg_base, wuf_cfg);
+	check_warn_return(ret, "Error writing WUF_CFGX");
+
+	ret = smsc75xx_write_reg(dev, mask_base, wuf_mask1);
+	check_warn_return(ret, "Error writing WUF_MASKX");
+
+	ret = smsc75xx_write_reg(dev, mask_base + 4, 0);
+	check_warn_return(ret, "Error writing WUF_MASKX");
+
+	ret = smsc75xx_write_reg(dev, mask_base + 8, 0);
+	check_warn_return(ret, "Error writing WUF_MASKX");
+
+	ret = smsc75xx_write_reg(dev, mask_base + 12, 0);
+	check_warn_return(ret, "Error writing WUF_MASKX");
+
+	return 0;
+}
+
+static int smsc75xx_suspend(struct usb_interface *intf, pm_message_t message)
+{
+	struct usbnet *dev = usb_get_intfdata(intf);
+	struct smsc75xx_priv *pdata = (struct smsc75xx_priv *)(dev->data[0]);
+	int ret;
+	u32 val;
+
+	ret = usbnet_suspend(intf, message);
+	check_warn_return(ret, "usbnet_suspend error");
+
+	/* if no wol options set, enter lowest power SUSPEND2 mode */
+	if (!(pdata->wolopts & SUPPORTED_WAKE)) {
+		netdev_info(dev->net, "entering SUSPEND2 mode");
+
+		/* disable energy detect (link up) & wake up events */
+		ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+		check_warn_return(ret, "Error reading WUCSR");
+
+		val &= ~(WUCSR_MPEN | WUCSR_WUEN);
+
+		ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+		check_warn_return(ret, "Error writing WUCSR");
+
+		ret = smsc75xx_read_reg_nopm(dev, PMT_CTL, &val);
+		check_warn_return(ret, "Error reading PMT_CTL");
+
+		val &= ~(PMT_CTL_ED_EN | PMT_CTL_WOL_EN);
+
+		ret = smsc75xx_write_reg_nopm(dev, PMT_CTL, val);
+		check_warn_return(ret, "Error writing PMT_CTL");
+
+		/* enter suspend2 mode */
+		ret = smsc75xx_read_reg_nopm(dev, PMT_CTL, &val);
+		check_warn_return(ret, "Error reading PMT_CTL");
+
+		val &= ~(PMT_CTL_SUS_MODE | PMT_CTL_WUPS | PMT_CTL_PHY_RST);
+		val |= PMT_CTL_SUS_MODE_2;
+
+		ret = smsc75xx_write_reg_nopm(dev, PMT_CTL, val);
+		check_warn_return(ret, "Error writing PMT_CTL");
+
+		return 0;
+	}
+
+	if (pdata->wolopts & (WAKE_MCAST | WAKE_ARP)) {
+		int i, filter = 0;
+
+		/* disable all filters */
+		for (i = 0; i < WUF_NUM; i++) {
+			ret = smsc75xx_write_reg_nopm(dev, WUF_CFGX + i * 4, 0);
+			check_warn_return(ret, "Error writing WUF_CFGX");
+		}
+
+		if (pdata->wolopts & WAKE_MCAST) {
+			const u8 mcast[] = {0x01, 0x00, 0x5E};
+			netdev_info(dev->net, "enabling multicast detection");
+
+			val = WUF_CFGX_EN | WUF_CFGX_ATYPE_MULTICAST
+				| smsc_crc(mcast, 3);
+			ret = smsc75xx_write_wuff(dev, filter++, val, 0x0007);
+			check_warn_return(ret, "Error writing wakeup filter");
+		}
+
+		if (pdata->wolopts & WAKE_ARP) {
+			const u8 arp[] = {0x08, 0x06};
+			netdev_info(dev->net, "enabling ARP detection");
+
+			val = WUF_CFGX_EN | WUF_CFGX_ATYPE_ALL | (0x0C << 16)
+				| smsc_crc(arp, 2);
+			ret = smsc75xx_write_wuff(dev, filter++, val, 0x0003);
+			check_warn_return(ret, "Error writing wakeup filter");
+		}
+
+		/* clear any pending pattern match packet status */
+		ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+		check_warn_return(ret, "Error reading WUCSR");
+
+		val |= WUCSR_WUFR;
+
+		ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+		check_warn_return(ret, "Error writing WUCSR");
+
+		netdev_info(dev->net, "enabling packet match detection");
+		ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+		check_warn_return(ret, "Error reading WUCSR");
+
+		val |= WUCSR_WUEN;
+
+		ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+		check_warn_return(ret, "Error writing WUCSR");
+	} else {
+		netdev_info(dev->net, "disabling packet match detection");
+		ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+		check_warn_return(ret, "Error reading WUCSR");
+
+		val &= ~WUCSR_WUEN;
+
+		ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+		check_warn_return(ret, "Error writing WUCSR");
+	}
+
+	/* disable magic, bcast & unicast wakeup sources */
+	ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+	check_warn_return(ret, "Error reading WUCSR");
+
+	val &= ~(WUCSR_MPEN | WUCSR_BCST_EN | WUCSR_PFDA_EN);
+
+	ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+	check_warn_return(ret, "Error writing WUCSR");
+
+	if (pdata->wolopts & WAKE_MAGIC) {
+		netdev_info(dev->net, "enabling magic packet wakeup");
+		ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+		check_warn_return(ret, "Error reading WUCSR");
+
+		/* clear any pending magic packet status */
+		val |= WUCSR_MPR | WUCSR_MPEN;
+
+		ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+		check_warn_return(ret, "Error writing WUCSR");
+	}
+
+	if (pdata->wolopts & WAKE_BCAST) {
+		netdev_info(dev->net, "enabling broadcast detection");
+		ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+		check_warn_return(ret, "Error reading WUCSR");
+
+		val |= WUCSR_BCAST_FR | WUCSR_BCST_EN;
+
+		ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+		check_warn_return(ret, "Error writing WUCSR");
+	}
+
+	if (pdata->wolopts & WAKE_UCAST) {
+		netdev_info(dev->net, "enabling unicast detection");
+		ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+		check_warn_return(ret, "Error reading WUCSR");
+
+		val |= WUCSR_WUFR | WUCSR_PFDA_EN;
+
+		ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+		check_warn_return(ret, "Error writing WUCSR");
+	}
+
+	/* enable receiver to enable frame reception */
+	ret = smsc75xx_read_reg_nopm(dev, MAC_RX, &val);
+	check_warn_return(ret, "Failed to read MAC_RX: %d", ret);
+
+	val |= MAC_RX_RXEN;
+
+	ret = smsc75xx_write_reg_nopm(dev, MAC_RX, val);
+	check_warn_return(ret, "Failed to write MAC_RX: %d", ret);
+
+	/* some wol options are enabled, so enter SUSPEND0 */
+	netdev_info(dev->net, "entering SUSPEND0 mode");
+
+	ret = smsc75xx_read_reg_nopm(dev, PMT_CTL, &val);
+	check_warn_return(ret, "Error reading PMT_CTL");
+
+	val &= (~(PMT_CTL_SUS_MODE | PMT_CTL_PHY_RST));
+	val |= PMT_CTL_SUS_MODE_0 | PMT_CTL_WOL_EN | PMT_CTL_WUPS;
+
+	ret = smsc75xx_write_reg_nopm(dev, PMT_CTL, val);
+	check_warn_return(ret, "Error writing PMT_CTL");
+
+	smsc75xx_set_feature(dev, USB_DEVICE_REMOTE_WAKEUP);
+
+	return 0;
+}
+
+static int smsc75xx_resume(struct usb_interface *intf)
+{
+	struct usbnet *dev = usb_get_intfdata(intf);
+	struct smsc75xx_priv *pdata = (struct smsc75xx_priv *)(dev->data[0]);
+	int ret;
+	u32 val;
+
+	if (pdata->wolopts) {
+		netdev_info(dev->net, "resuming from SUSPEND0");
+
+		smsc75xx_clear_feature(dev, USB_DEVICE_REMOTE_WAKEUP);
+
+		/* Disable wakeup sources */
+		ret = smsc75xx_read_reg_nopm(dev, WUCSR, &val);
+		check_warn_return(ret, "Error reading WUCSR");
+
+		val &= ~(WUCSR_WUEN | WUCSR_MPEN | WUCSR_PFDA_EN
+			| WUCSR_BCST_EN);
+
+		ret = smsc75xx_write_reg_nopm(dev, WUCSR, val);
+		check_warn_return(ret, "Error writing WUCSR");
+
+		/* clear wake-up status */
+		ret = smsc75xx_read_reg_nopm(dev, PMT_CTL, &val);
+		check_warn_return(ret, "Error reading PMT_CTL");
+
+		val &= ~PMT_CTL_WOL_EN;
+		val |= PMT_CTL_WUPS;
+
+		ret = smsc75xx_write_reg_nopm(dev, PMT_CTL, val);
+		check_warn_return(ret, "Error writing PMT_CTL");
+	} else {
+		netdev_info(dev->net, "resuming from SUSPEND2");
+
+		ret = smsc75xx_read_reg_nopm(dev, PMT_CTL, &val);
+		check_warn_return(ret, "Error reading PMT_CTL");
+
+		val |= PMT_CTL_PHY_PWRUP;
+
+		ret = smsc75xx_write_reg_nopm(dev, PMT_CTL, val);
+		check_warn_return(ret, "Error writing PMT_CTL");
+	}
+
+	ret = smsc75xx_wait_ready(dev, 1);
+	check_warn_return(ret, "device not ready in smsc75xx_resume");
+
+	return usbnet_resume(intf);
+}
+
 static void smsc75xx_rx_csum_offload(struct usbnet *dev, struct sk_buff *skb,
 				     u32 rx_cmd_a, u32 rx_cmd_b)
 {
@@ -1251,8 +1596,9 @@ static struct usb_driver smsc75xx_driver = {
 	.name		= SMSC_CHIPNAME,
 	.id_table	= products,
 	.probe		= usbnet_probe,
-	.suspend	= usbnet_suspend,
-	.resume		= usbnet_resume,
+	.suspend	= smsc75xx_suspend,
+	.resume		= smsc75xx_resume,
+	.reset_resume	= smsc75xx_resume,
 	.disconnect	= usbnet_disconnect,
 	.disable_hub_initiated_lpm = 1,
 };

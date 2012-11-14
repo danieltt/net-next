@@ -245,6 +245,7 @@ struct ieee80211_sta_vht_cap {
  *	rates" IE, i.e. CCK rates first, then OFDM.
  * @n_bitrates: Number of bitrates in @bitrates
  * @ht_cap: HT capabilities in this band
+ * @vht_cap: VHT capabilities in this band
  */
 struct ieee80211_supported_band {
 	struct ieee80211_channel *channels;
@@ -1217,6 +1218,7 @@ struct cfg80211_deauth_request {
 	const u8 *ie;
 	size_t ie_len;
 	u16 reason_code;
+	bool local_state_change;
 };
 
 /**
@@ -1579,9 +1581,7 @@ struct cfg80211_gtk_rekey_data {
  * @set_cqm_txe_config: Configure connection quality monitor TX error
  *	thresholds.
  * @sched_scan_start: Tell the driver to start a scheduled scan.
- * @sched_scan_stop: Tell the driver to stop an ongoing scheduled
- *	scan.  The driver_initiated flag specifies whether the driver
- *	itself has informed that the scan has stopped.
+ * @sched_scan_stop: Tell the driver to stop an ongoing scheduled scan.
  *
  * @mgmt_frame_register: Notify driver that a management frame type was
  *	registered. Note that this callback may not sleep, and cannot run
@@ -1629,7 +1629,7 @@ struct cfg80211_ops {
 	void	(*set_wakeup)(struct wiphy *wiphy, bool enabled);
 
 	struct wireless_dev * (*add_virtual_intf)(struct wiphy *wiphy,
-						  char *name,
+						  const char *name,
 						  enum nl80211_iftype type,
 						  u32 *flags,
 						  struct vif_params *params);
@@ -2458,7 +2458,7 @@ struct wireless_dev {
 
 	int beacon_interval;
 
-	u32 ap_unexpected_nlpid;
+	u32 ap_unexpected_nlportid;
 
 #ifdef CONFIG_CFG80211_WEXT
 	/* wext data */
@@ -2650,6 +2650,15 @@ unsigned int ieee80211_get_hdrlen_from_skb(const struct sk_buff *skb);
  * @fc: frame control field in little-endian format
  */
 unsigned int __attribute_const__ ieee80211_hdrlen(__le16 fc);
+
+/**
+ * ieee80211_get_mesh_hdrlen - get mesh extension header length
+ * @meshhdr: the mesh extension header, only the flags field
+ *	(first byte) will be accessed
+ * Returns the length of the extension header, which is always at
+ * least 6 bytes and at most 18 if address 5 and 6 are present.
+ */
+unsigned int ieee80211_get_mesh_hdrlen(struct ieee80211s_hdr *meshhdr);
 
 /**
  * DOC: Data path helpers
@@ -3360,6 +3369,25 @@ void cfg80211_new_sta(struct net_device *dev, const u8 *mac_addr,
  * @gfp: allocation flags
  */
 void cfg80211_del_sta(struct net_device *dev, const u8 *mac_addr, gfp_t gfp);
+
+/**
+ * cfg80211_conn_failed - connection request failed notification
+ *
+ * @dev: the netdev
+ * @mac_addr: the station's address
+ * @reason: the reason for connection failure
+ * @gfp: allocation flags
+ *
+ * Whenever a station tries to connect to an AP and if the station
+ * could not connect to the AP as the AP has rejected the connection
+ * for some reasons, this function is called.
+ *
+ * The reason for connection failure can be any of the value from
+ * nl80211_connect_failed_reason enum
+ */
+void cfg80211_conn_failed(struct net_device *dev, const u8 *mac_addr,
+			  enum nl80211_connect_failed_reason reason,
+			  gfp_t gfp);
 
 /**
  * cfg80211_rx_mgmt - notification of received, unprocessed management frame

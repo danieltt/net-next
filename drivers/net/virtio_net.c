@@ -212,8 +212,7 @@ static struct sk_buff *page_to_skb(struct virtnet_info *vi,
 	 * the case of a broken device.
 	 */
 	if (unlikely(len > MAX_SKB_FRAGS * PAGE_SIZE)) {
-		if (net_ratelimit())
-			pr_debug("%s: too much data\n", skb->dev->name);
+		net_dbg_ratelimited("%s: too much data\n", skb->dev->name);
 		dev_kfree_skb(skb);
 		return NULL;
 	}
@@ -333,9 +332,8 @@ static void receive_buf(struct net_device *dev, void *buf, unsigned int len)
 			skb_shinfo(skb)->gso_type = SKB_GSO_TCPV6;
 			break;
 		default:
-			if (net_ratelimit())
-				printk(KERN_WARNING "%s: bad gso type %u.\n",
-				       dev->name, hdr->hdr.gso_type);
+			net_warn_ratelimited("%s: bad gso type %u.\n",
+					     dev->name, hdr->hdr.gso_type);
 			goto frame_err;
 		}
 
@@ -344,9 +342,7 @@ static void receive_buf(struct net_device *dev, void *buf, unsigned int len)
 
 		skb_shinfo(skb)->gso_size = hdr->hdr.gso_size;
 		if (skb_shinfo(skb)->gso_size == 0) {
-			if (net_ratelimit())
-				printk(KERN_WARNING "%s: zero gso size.\n",
-				       dev->name);
+			net_warn_ratelimited("%s: zero gso size.\n", dev->name);
 			goto frame_err;
 		}
 
@@ -521,7 +517,7 @@ static void refill_work(struct work_struct *work)
 	/* In theory, this can happen: if we don't get any buffers in
 	 * we will *never* try to fill again. */
 	if (still_empty)
-		queue_delayed_work(system_nrt_wq, &vi->refill, HZ/2);
+		schedule_delayed_work(&vi->refill, HZ/2);
 }
 
 static int virtnet_poll(struct napi_struct *napi, int budget)
@@ -540,7 +536,7 @@ again:
 
 	if (vi->num < vi->max / 2) {
 		if (!try_fill_recv(vi, GFP_ATOMIC))
-			queue_delayed_work(system_nrt_wq, &vi->refill, 0);
+			schedule_delayed_work(&vi->refill, 0);
 	}
 
 	/* Out of packets? */
@@ -745,7 +741,7 @@ static int virtnet_open(struct net_device *dev)
 
 	/* Make sure we have some buffers: if oom use wq. */
 	if (!try_fill_recv(vi, GFP_KERNEL))
-		queue_delayed_work(system_nrt_wq, &vi->refill, 0);
+		schedule_delayed_work(&vi->refill, 0);
 
 	virtnet_napi_enable(vi);
 	return 0;
@@ -1020,7 +1016,7 @@ static void virtnet_config_changed(struct virtio_device *vdev)
 {
 	struct virtnet_info *vi = vdev->priv;
 
-	queue_work(system_nrt_wq, &vi->config_work);
+	schedule_work(&vi->config_work);
 }
 
 static int init_vqs(struct virtnet_info *vi)
@@ -1152,7 +1148,7 @@ static int virtnet_probe(struct virtio_device *vdev)
 	   otherwise get link status from config. */
 	if (virtio_has_feature(vi->vdev, VIRTIO_NET_F_STATUS)) {
 		netif_carrier_off(dev);
-		queue_work(system_nrt_wq, &vi->config_work);
+		schedule_work(&vi->config_work);
 	} else {
 		vi->status = VIRTIO_NET_S_LINK_UP;
 		netif_carrier_on(dev);
@@ -1264,7 +1260,7 @@ static int virtnet_restore(struct virtio_device *vdev)
 	netif_device_attach(vi->dev);
 
 	if (!try_fill_recv(vi, GFP_KERNEL))
-		queue_delayed_work(system_nrt_wq, &vi->refill, 0);
+		schedule_delayed_work(&vi->refill, 0);
 
 	mutex_lock(&vi->config_lock);
 	vi->config_enable = true;

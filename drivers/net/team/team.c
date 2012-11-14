@@ -966,7 +966,7 @@ static struct netpoll_info *team_netpoll_info(struct team *team)
 }
 #endif
 
-static void __team_port_change_check(struct team_port *port, bool linkup);
+static void __team_port_change_port_added(struct team_port *port, bool linkup);
 static int team_dev_type_check_change(struct net_device *dev,
 				      struct net_device *port_dev);
 
@@ -1079,7 +1079,7 @@ static int team_port_add(struct team *team, struct net_device *port_dev)
 	team_port_enable(team, port);
 	list_add_tail_rcu(&port->list, &team->port_list);
 	__team_compute_features(team);
-	__team_port_change_check(port, !!netif_carrier_ok(port_dev));
+	__team_port_change_port_added(port, !!netif_carrier_ok(port_dev));
 	__team_options_change_check(team);
 
 	netdev_info(dev, "Port device %s added\n", portname);
@@ -1114,6 +1114,8 @@ err_set_mtu:
 	return err;
 }
 
+static void __team_port_change_port_removed(struct team_port *port);
+
 static int team_port_del(struct team *team, struct net_device *port_dev)
 {
 	struct net_device *dev = team->dev;
@@ -1130,8 +1132,7 @@ static int team_port_del(struct team *team, struct net_device *port_dev)
 	__team_option_inst_mark_removed_port(team, port);
 	__team_options_change_check(team);
 	__team_option_inst_del_port(team, port);
-	port->removed = true;
-	__team_port_change_check(port, false);
+	__team_port_change_port_removed(port);
 	team_port_disable(team, port);
 	list_del_rcu(&port->list);
 	netdev_rx_handler_unregister(port_dev);
@@ -1314,6 +1315,7 @@ static const struct team_option team_options[] = {
 
 static struct lock_class_key team_netdev_xmit_lock_key;
 static struct lock_class_key team_netdev_addr_lock_key;
+static struct lock_class_key team_tx_busylock_key;
 
 static void team_set_lockdep_class_one(struct net_device *dev,
 				       struct netdev_queue *txq,
@@ -1326,6 +1328,7 @@ static void team_set_lockdep_class(struct net_device *dev)
 {
 	lockdep_set_class(&dev->addr_list_lock, &team_netdev_addr_lock_key);
 	netdev_for_each_tx_queue(dev, team_set_lockdep_class_one, NULL);
+	dev->qdisc_tx_busylock = &team_tx_busylock_key;
 }
 
 static int team_init(struct net_device *dev)
@@ -1886,16 +1889,16 @@ static int team_nl_cmd_noop(struct sk_buff *skb, struct genl_info *info)
 	if (!msg)
 		return -ENOMEM;
 
-	hdr = genlmsg_put(msg, info->snd_pid, info->snd_seq,
+	hdr = genlmsg_put(msg, info->snd_portid, info->snd_seq,
 			  &team_nl_family, 0, TEAM_CMD_NOOP);
-	if (IS_ERR(hdr)) {
-		err = PTR_ERR(hdr);
+	if (!hdr) {
+		err = -EMSGSIZE;
 		goto err_msg_put;
 	}
 
 	genlmsg_end(msg, hdr);
 
-	return genlmsg_unicast(genl_info_net(info), msg, info->snd_pid);
+	return genlmsg_unicast(genl_info_net(info), msg, info->snd_portid);
 
 err_msg_put:
 	nlmsg_free(msg);
@@ -1952,7 +1955,7 @@ static int team_nl_send_generic(struct genl_info *info, struct team *team,
 	if (err < 0)
 		goto err_fill;
 
-	err = genlmsg_unicast(genl_info_net(info), skb, info->snd_pid);
+	err = genlmsg_unicast(genl_info_net(info), skb, info->snd_portid);
 	return err;
 
 err_fill:
@@ -1961,11 +1964,11 @@ err_fill:
 }
 
 typedef int team_nl_send_func_t(struct sk_buff *skb,
-				struct team *team, u32 pid);
+				struct team *team, u32 portid);
 
-static int team_nl_send_unicast(struct sk_buff *skb, struct team *team, u32 pid)
+static int team_nl_send_unicast(struct sk_buff *skb, struct team *team, u32 portid)
 {
-	return genlmsg_unicast(dev_net(team->dev), skb, pid);
+	return genlmsg_unicast(dev_net(team->dev), skb, portid);
 }
 
 static int team_nl_fill_one_option_get(struct sk_buff *skb, struct team *team,
@@ -2050,13 +2053,13 @@ nest_cancel:
 }
 
 static int __send_and_alloc_skb(struct sk_buff **pskb,
-				struct team *team, u32 pid,
+				struct team *team, u32 portid,
 				team_nl_send_func_t *send_func)
 {
 	int err;
 
 	if (*pskb) {
-		err = send_func(*pskb, team, pid);
+		err = send_func(*pskb, team, portid);
 		if (err)
 			return err;
 	}
@@ -2066,7 +2069,7 @@ static int __send_and_alloc_skb(struct sk_buff **pskb,
 	return 0;
 }
 
-static int team_nl_send_options_get(struct team *team, u32 pid, u32 seq,
+static int team_nl_send_options_get(struct team *team, u32 portid, u32 seq,
 				    int flags, team_nl_send_func_t *send_func,
 				    struct list_head *sel_opt_inst_list)
 {
@@ -2083,14 +2086,14 @@ static int team_nl_send_options_get(struct team *team, u32 pid, u32 seq,
 				    struct team_option_inst, tmp_list);
 
 start_again:
-	err = __send_and_alloc_skb(&skb, team, pid, send_func);
+	err = __send_and_alloc_skb(&skb, team, portid, send_func);
 	if (err)
 		return err;
 
-	hdr = genlmsg_put(skb, pid, seq, &team_nl_family, flags | NLM_F_MULTI,
+	hdr = genlmsg_put(skb, portid, seq, &team_nl_family, flags | NLM_F_MULTI,
 			  TEAM_CMD_OPTIONS_GET);
-	if (IS_ERR(hdr))
-		return PTR_ERR(hdr);
+	if (!hdr)
+		return -EMSGSIZE;
 
 	if (nla_put_u32(skb, TEAM_ATTR_TEAM_IFINDEX, team->dev->ifindex))
 		goto nla_put_failure;
@@ -2120,15 +2123,15 @@ start_again:
 		goto start_again;
 
 send_done:
-	nlh = nlmsg_put(skb, pid, seq, NLMSG_DONE, 0, flags | NLM_F_MULTI);
+	nlh = nlmsg_put(skb, portid, seq, NLMSG_DONE, 0, flags | NLM_F_MULTI);
 	if (!nlh) {
-		err = __send_and_alloc_skb(&skb, team, pid, send_func);
+		err = __send_and_alloc_skb(&skb, team, portid, send_func);
 		if (err)
 			goto errout;
 		goto send_done;
 	}
 
-	return send_func(skb, team, pid);
+	return send_func(skb, team, portid);
 
 nla_put_failure:
 	err = -EMSGSIZE;
@@ -2151,7 +2154,7 @@ static int team_nl_cmd_options_get(struct sk_buff *skb, struct genl_info *info)
 
 	list_for_each_entry(opt_inst, &team->option_inst_list, list)
 		list_add_tail(&opt_inst->tmp_list, &sel_opt_inst_list);
-	err = team_nl_send_options_get(team, info->snd_pid, info->snd_seq,
+	err = team_nl_send_options_get(team, info->snd_portid, info->snd_seq,
 				       NLM_F_ACK, team_nl_send_unicast,
 				       &sel_opt_inst_list);
 
@@ -2305,7 +2308,7 @@ team_put:
 }
 
 static int team_nl_fill_port_list_get(struct sk_buff *skb,
-				      u32 pid, u32 seq, int flags,
+				      u32 portid, u32 seq, int flags,
 				      struct team *team,
 				      bool fillall)
 {
@@ -2313,10 +2316,10 @@ static int team_nl_fill_port_list_get(struct sk_buff *skb,
 	void *hdr;
 	struct team_port *port;
 
-	hdr = genlmsg_put(skb, pid, seq, &team_nl_family, flags,
+	hdr = genlmsg_put(skb, portid, seq, &team_nl_family, flags,
 			  TEAM_CMD_PORT_LIST_GET);
-	if (IS_ERR(hdr))
-		return PTR_ERR(hdr);
+	if (!hdr)
+		return -EMSGSIZE;
 
 	if (nla_put_u32(skb, TEAM_ATTR_TEAM_IFINDEX, team->dev->ifindex))
 		goto nla_put_failure;
@@ -2362,7 +2365,7 @@ static int team_nl_fill_port_list_get_all(struct sk_buff *skb,
 					  struct genl_info *info, int flags,
 					  struct team *team)
 {
-	return team_nl_fill_port_list_get(skb, info->snd_pid,
+	return team_nl_fill_port_list_get(skb, info->snd_portid,
 					  info->snd_seq, NLM_F_ACK,
 					  team, true);
 }
@@ -2415,7 +2418,7 @@ static struct genl_multicast_group team_change_event_mcgrp = {
 };
 
 static int team_nl_send_multicast(struct sk_buff *skb,
-				  struct team *team, u32 pid)
+				  struct team *team, u32 portid)
 {
 	return genlmsg_multicast_netns(dev_net(team->dev), skb, 0,
 				       team_change_event_mcgrp.id, GFP_KERNEL);
@@ -2499,12 +2502,10 @@ static void __team_options_change_check(struct team *team)
 }
 
 /* rtnl lock is held */
-static void __team_port_change_check(struct team_port *port, bool linkup)
+
+static void __team_port_change_send(struct team_port *port, bool linkup)
 {
 	int err;
-
-	if (!port->removed && port->state.linkup == linkup)
-		return;
 
 	port->changed = true;
 	port->state.linkup = linkup;
@@ -2528,6 +2529,23 @@ send_event:
 		netdev_warn(port->team->dev, "Failed to send port change of device %s via netlink (err %d)\n",
 			    port->dev->name, err);
 
+}
+
+static void __team_port_change_check(struct team_port *port, bool linkup)
+{
+	if (port->state.linkup != linkup)
+		__team_port_change_send(port, linkup);
+}
+
+static void __team_port_change_port_added(struct team_port *port, bool linkup)
+{
+	__team_port_change_send(port, linkup);
+}
+
+static void __team_port_change_port_removed(struct team_port *port)
+{
+	port->removed = true;
+	__team_port_change_send(port, false);
 }
 
 static void team_port_change_check(struct team_port *port, bool linkup)

@@ -70,6 +70,7 @@
 #include <linux/init.h>
 #include <linux/crypto.h>
 #include <linux/slab.h>
+#include <linux/file.h>
 
 #include <net/ip.h>
 #include <net/icmp.h>
@@ -109,7 +110,6 @@ static int sctp_do_bind(struct sock *, union sctp_addr *, int);
 static int sctp_autobind(struct sock *sk);
 static void sctp_sock_migrate(struct sock *, struct sock *,
 			      struct sctp_association *, sctp_socket_type_t);
-static char *sctp_hmac_alg = SCTP_COOKIE_HMAC_ALG;
 
 extern struct kmem_cache *sctp_bucket_cachep;
 extern long sysctl_sctp_mem[3];
@@ -973,7 +973,7 @@ SCTP_STATIC int sctp_setsockopt_bindx(struct sock* sk,
 	void *addr_buf;
 	struct sctp_af *af;
 
-	SCTP_DEBUG_PRINTK("sctp_setsocktopt_bindx: sk %p addrs %p"
+	SCTP_DEBUG_PRINTK("sctp_setsockopt_bindx: sk %p addrs %p"
 			  " addrs_size %d opt %d\n", sk, addrs, addrs_size, op);
 
 	if (unlikely(addrs_size <= 0))
@@ -3889,6 +3889,8 @@ SCTP_STATIC int sctp_init_sock(struct sock *sk)
 	sp->default_rcv_context = 0;
 	sp->max_burst = net->sctp.max_burst;
 
+	sp->sctp_hmac_alg = net->sctp.sctp_hmac_alg;
+
 	/* Initialize default setup parameters. These parameters
 	 * can be modified with the SCTP_INITMSG socket option or
 	 * overridden by the SCTP_INIT CMSG.
@@ -4292,6 +4294,7 @@ static int sctp_getsockopt_peeloff(struct sock *sk, int len, char __user *optval
 {
 	sctp_peeloff_arg_t peeloff;
 	struct socket *newsock;
+	struct file *newfile;
 	int retval = 0;
 
 	if (len < sizeof(sctp_peeloff_arg_t))
@@ -4305,22 +4308,35 @@ static int sctp_getsockopt_peeloff(struct sock *sk, int len, char __user *optval
 		goto out;
 
 	/* Map the socket to an unused fd that can be returned to the user.  */
-	retval = sock_map_fd(newsock, 0);
+	retval = get_unused_fd();
 	if (retval < 0) {
 		sock_release(newsock);
 		goto out;
+	}
+
+	newfile = sock_alloc_file(newsock, 0, NULL);
+	if (unlikely(IS_ERR(newfile))) {
+		put_unused_fd(retval);
+		sock_release(newsock);
+		return PTR_ERR(newfile);
 	}
 
 	SCTP_DEBUG_PRINTK("%s: sk: %p newsk: %p sd: %d\n",
 			  __func__, sk, newsock->sk, retval);
 
 	/* Return the fd mapped to the new socket.  */
-	peeloff.sd = retval;
-	if (put_user(len, optlen))
+	if (put_user(len, optlen)) {
+		fput(newfile);
+		put_unused_fd(retval);
 		return -EFAULT;
-	if (copy_to_user(optval, &peeloff, len))
-		retval = -EFAULT;
-
+	}
+	peeloff.sd = retval;
+	if (copy_to_user(optval, &peeloff, len)) {
+		fput(newfile);
+		put_unused_fd(retval);
+		return -EFAULT;
+	}
+	fd_install(retval, newfile);
 out:
 	return retval;
 }
@@ -5966,13 +5982,15 @@ SCTP_STATIC int sctp_listen_start(struct sock *sk, int backlog)
 	struct sctp_sock *sp = sctp_sk(sk);
 	struct sctp_endpoint *ep = sp->ep;
 	struct crypto_hash *tfm = NULL;
+	char alg[32];
 
 	/* Allocate HMAC for generating cookie. */
-	if (!sctp_sk(sk)->hmac && sctp_hmac_alg) {
-		tfm = crypto_alloc_hash(sctp_hmac_alg, 0, CRYPTO_ALG_ASYNC);
+	if (!sp->hmac && sp->sctp_hmac_alg) {
+		sprintf(alg, "hmac(%s)", sp->sctp_hmac_alg);
+		tfm = crypto_alloc_hash(alg, 0, CRYPTO_ALG_ASYNC);
 		if (IS_ERR(tfm)) {
 			net_info_ratelimited("failed to load transform for %s: %ld\n",
-					     sctp_hmac_alg, PTR_ERR(tfm));
+					     sp->sctp_hmac_alg, PTR_ERR(tfm));
 			return -ENOSYS;
 		}
 		sctp_sk(sk)->hmac = tfm;

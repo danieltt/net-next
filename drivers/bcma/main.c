@@ -158,9 +158,10 @@ static int bcma_register_cores(struct bcma_bus *bus)
 
 static void bcma_unregister_cores(struct bcma_bus *bus)
 {
-	struct bcma_device *core;
+	struct bcma_device *core, *tmp;
 
-	list_for_each_entry(core, &bus->cores, list) {
+	list_for_each_entry_safe(core, tmp, &bus->cores, list) {
+		list_del(&core->list);
 		if (core->dev_registered)
 			device_unregister(&core->dev);
 	}
@@ -227,7 +228,17 @@ int __devinit bcma_bus_register(struct bcma_bus *bus)
 
 void bcma_bus_unregister(struct bcma_bus *bus)
 {
+	struct bcma_device *cores[3];
+
+	cores[0] = bcma_find_core(bus, BCMA_CORE_MIPS_74K);
+	cores[1] = bcma_find_core(bus, BCMA_CORE_PCIE);
+	cores[2] = bcma_find_core(bus, BCMA_CORE_4706_MAC_GBIT_COMMON);
+
 	bcma_unregister_cores(bus);
+
+	kfree(cores[2]);
+	kfree(cores[1]);
+	kfree(cores[0]);
 }
 
 int __init bcma_bus_early_register(struct bcma_bus *bus,

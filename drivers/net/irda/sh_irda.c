@@ -33,11 +33,7 @@
 
 #define DRIVER_NAME "sh_irda"
 
-#if defined(CONFIG_ARCH_SH7367) || defined(CONFIG_ARCH_SH7377)
-#define __IRDARAM_LEN	0x13FF
-#else
 #define __IRDARAM_LEN	0x1039
-#endif
 
 #define IRTMR		0x1F00 /* Transfer mode */
 #define IRCFR		0x1F02 /* Configuration */
@@ -808,8 +804,8 @@ static int __devinit sh_irda_probe(struct platform_device *pdev)
 		goto err_mem_4;
 
 	platform_set_drvdata(pdev, ndev);
-
-	if (request_irq(irq, sh_irda_irq, IRQF_DISABLED, "sh_irda", self)) {
+	err = request_irq(irq, sh_irda_irq, IRQF_DISABLED, "sh_irda", self);
+	if (err) {
 		dev_warn(&pdev->dev, "Unable to attach sh_irda interrupt\n");
 		goto err_mem_4;
 	}

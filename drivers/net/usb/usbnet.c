@@ -359,10 +359,12 @@ static enum skb_state defer_bh(struct usbnet *dev, struct sk_buff *skb,
 void usbnet_defer_kevent (struct usbnet *dev, int work)
 {
 	set_bit (work, &dev->flags);
-	if (!schedule_work (&dev->kevent))
-		netdev_err(dev->net, "kevent %d may have been dropped\n", work);
-	else
+	if (!schedule_work (&dev->kevent)) {
+		if (net_ratelimit())
+			netdev_err(dev->net, "kevent %d may have been dropped\n", work);
+	} else {
 		netdev_dbg(dev->net, "kevent %d scheduled\n", work);
+	}
 }
 EXPORT_SYMBOL_GPL(usbnet_defer_kevent);
 
@@ -1158,6 +1160,7 @@ netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
 		usb_anchor_urb(urb, &dev->deferred);
 		/* no use to process more packets */
 		netif_stop_queue(net);
+		usb_put_urb(urb);
 		spin_unlock_irqrestore(&dev->txq.lock, flags);
 		netdev_dbg(dev->net, "Delaying transmission for resumption\n");
 		goto deferred;
@@ -1201,19 +1204,26 @@ deferred:
 }
 EXPORT_SYMBOL_GPL(usbnet_start_xmit);
 
-static void rx_alloc_submit(struct usbnet *dev, gfp_t flags)
+static int rx_alloc_submit(struct usbnet *dev, gfp_t flags)
 {
 	struct urb	*urb;
 	int		i;
+	int		ret = 0;
 
 	/* don't refill the queue all at once */
 	for (i = 0; i < 10 && dev->rxq.qlen < RX_QLEN(dev); i++) {
 		urb = usb_alloc_urb(0, flags);
 		if (urb != NULL) {
-			if (rx_submit(dev, urb, flags) == -ENOLINK)
-				return;
+			ret = rx_submit(dev, urb, flags);
+			if (ret)
+				goto err;
+		} else {
+			ret = -ENOMEM;
+			goto err;
 		}
 	}
+err:
+	return ret;
 }
 
 /*-------------------------------------------------------------------------*/
@@ -1257,7 +1267,8 @@ static void usbnet_bh (unsigned long param)
 		int	temp = dev->rxq.qlen;
 
 		if (temp < RX_QLEN(dev)) {
-			rx_alloc_submit(dev, GFP_ATOMIC);
+			if (rx_alloc_submit(dev, GFP_ATOMIC) == -ENOLINK)
+				return;
 			if (temp != dev->rxq.qlen)
 				netif_dbg(dev, link, dev->net,
 					  "rxqlen %d --> %d\n",
@@ -1301,6 +1312,8 @@ void usbnet_disconnect (struct usb_interface *intf)
 	unregister_netdev (net);
 
 	cancel_work_sync(&dev->kevent);
+
+	usb_scuttle_anchored_urbs(&dev->deferred);
 
 	if (dev->driver_info->unbind)
 		dev->driver_info->unbind (dev, intf);
@@ -1573,18 +1586,231 @@ int usbnet_resume (struct usb_interface *intf)
 				netif_device_present(dev->net) &&
 				!timer_pending(&dev->delay) &&
 				!test_bit(EVENT_RX_HALT, &dev->flags))
-					rx_alloc_submit(dev, GFP_KERNEL);
+					rx_alloc_submit(dev, GFP_NOIO);
 
 			if (!(dev->txq.qlen >= TX_QLEN(dev)))
 				netif_tx_wake_all_queues(dev->net);
 			tasklet_schedule (&dev->bh);
 		}
 	}
+
+	if (test_and_clear_bit(EVENT_DEVICE_REPORT_IDLE, &dev->flags))
+		usb_autopm_get_interface_no_resume(intf);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(usbnet_resume);
 
+/*
+ * Either a subdriver implements manage_power, then it is assumed to always
+ * be ready to be suspended or it reports the readiness to be suspended
+ * explicitly
+ */
+void usbnet_device_suggests_idle(struct usbnet *dev)
+{
+	if (!test_and_set_bit(EVENT_DEVICE_REPORT_IDLE, &dev->flags)) {
+		dev->intf->needs_remote_wakeup = 1;
+		usb_autopm_put_interface_async(dev->intf);
+	}
+}
+EXPORT_SYMBOL(usbnet_device_suggests_idle);
 
+/*-------------------------------------------------------------------------*/
+static int __usbnet_read_cmd(struct usbnet *dev, u8 cmd, u8 reqtype,
+			     u16 value, u16 index, void *data, u16 size)
+{
+	void *buf = NULL;
+	int err = -ENOMEM;
+
+	netdev_dbg(dev->net, "usbnet_read_cmd cmd=0x%02x reqtype=%02x"
+		   " value=0x%04x index=0x%04x size=%d\n",
+		   cmd, reqtype, value, index, size);
+
+	if (data) {
+		buf = kmalloc(size, GFP_KERNEL);
+		if (!buf)
+			goto out;
+	}
+
+	err = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+			      cmd, reqtype, value, index, buf, size,
+			      USB_CTRL_GET_TIMEOUT);
+	if (err > 0 && err <= size)
+		memcpy(data, buf, err);
+	kfree(buf);
+out:
+	return err;
+}
+
+static int __usbnet_write_cmd(struct usbnet *dev, u8 cmd, u8 reqtype,
+			      u16 value, u16 index, const void *data,
+			      u16 size)
+{
+	void *buf = NULL;
+	int err = -ENOMEM;
+
+	netdev_dbg(dev->net, "usbnet_write_cmd cmd=0x%02x reqtype=%02x"
+		   " value=0x%04x index=0x%04x size=%d\n",
+		   cmd, reqtype, value, index, size);
+
+	if (data) {
+		buf = kmemdup(data, size, GFP_KERNEL);
+		if (!buf)
+			goto out;
+	}
+
+	err = usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
+			      cmd, reqtype, value, index, buf, size,
+			      USB_CTRL_SET_TIMEOUT);
+	kfree(buf);
+
+out:
+	return err;
+}
+
+/*
+ * The function can't be called inside suspend/resume callback,
+ * otherwise deadlock will be caused.
+ */
+int usbnet_read_cmd(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, void *data, u16 size)
+{
+	int ret;
+
+	if (usb_autopm_get_interface(dev->intf) < 0)
+		return -ENODEV;
+	ret = __usbnet_read_cmd(dev, cmd, reqtype, value, index,
+				data, size);
+	usb_autopm_put_interface(dev->intf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usbnet_read_cmd);
+
+/*
+ * The function can't be called inside suspend/resume callback,
+ * otherwise deadlock will be caused.
+ */
+int usbnet_write_cmd(struct usbnet *dev, u8 cmd, u8 reqtype,
+		     u16 value, u16 index, const void *data, u16 size)
+{
+	int ret;
+
+	if (usb_autopm_get_interface(dev->intf) < 0)
+		return -ENODEV;
+	ret = __usbnet_write_cmd(dev, cmd, reqtype, value, index,
+				 data, size);
+	usb_autopm_put_interface(dev->intf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usbnet_write_cmd);
+
+/*
+ * The function can be called inside suspend/resume callback safely
+ * and should only be called by suspend/resume callback generally.
+ */
+int usbnet_read_cmd_nopm(struct usbnet *dev, u8 cmd, u8 reqtype,
+			  u16 value, u16 index, void *data, u16 size)
+{
+	return __usbnet_read_cmd(dev, cmd, reqtype, value, index,
+				 data, size);
+}
+EXPORT_SYMBOL_GPL(usbnet_read_cmd_nopm);
+
+/*
+ * The function can be called inside suspend/resume callback safely
+ * and should only be called by suspend/resume callback generally.
+ */
+int usbnet_write_cmd_nopm(struct usbnet *dev, u8 cmd, u8 reqtype,
+			  u16 value, u16 index, const void *data,
+			  u16 size)
+{
+	return __usbnet_write_cmd(dev, cmd, reqtype, value, index,
+				  data, size);
+}
+EXPORT_SYMBOL_GPL(usbnet_write_cmd_nopm);
+
+static void usbnet_async_cmd_cb(struct urb *urb)
+{
+	struct usb_ctrlrequest *req = (struct usb_ctrlrequest *)urb->context;
+	int status = urb->status;
+
+	if (status < 0)
+		dev_dbg(&urb->dev->dev, "%s failed with %d",
+			__func__, status);
+
+	kfree(req);
+	usb_free_urb(urb);
+}
+
+/*
+ * The caller must make sure that device can't be put into suspend
+ * state until the control URB completes.
+ */
+int usbnet_write_cmd_async(struct usbnet *dev, u8 cmd, u8 reqtype,
+			   u16 value, u16 index, const void *data, u16 size)
+{
+	struct usb_ctrlrequest *req = NULL;
+	struct urb *urb;
+	int err = -ENOMEM;
+	void *buf = NULL;
+
+	netdev_dbg(dev->net, "usbnet_write_cmd cmd=0x%02x reqtype=%02x"
+		   " value=0x%04x index=0x%04x size=%d\n",
+		   cmd, reqtype, value, index, size);
+
+	urb = usb_alloc_urb(0, GFP_ATOMIC);
+	if (!urb) {
+		netdev_err(dev->net, "Error allocating URB in"
+			   " %s!\n", __func__);
+		goto fail;
+	}
+
+	if (data) {
+		buf = kmemdup(data, size, GFP_ATOMIC);
+		if (!buf) {
+			netdev_err(dev->net, "Error allocating buffer"
+				   " in %s!\n", __func__);
+			goto fail_free;
+		}
+	}
+
+	req = kmalloc(sizeof(struct usb_ctrlrequest), GFP_ATOMIC);
+	if (!req) {
+		netdev_err(dev->net, "Failed to allocate memory for %s\n",
+			   __func__);
+		goto fail_free_buf;
+	}
+
+	req->bRequestType = reqtype;
+	req->bRequest = cmd;
+	req->wValue = cpu_to_le16(value);
+	req->wIndex = cpu_to_le16(index);
+	req->wLength = cpu_to_le16(size);
+
+	usb_fill_control_urb(urb, dev->udev,
+			     usb_sndctrlpipe(dev->udev, 0),
+			     (void *)req, buf, size,
+			     usbnet_async_cmd_cb, req);
+	urb->transfer_flags |= URB_FREE_BUFFER;
+
+	err = usb_submit_urb(urb, GFP_ATOMIC);
+	if (err < 0) {
+		netdev_err(dev->net, "Error submitting the control"
+			   " message: status=%d\n", err);
+		goto fail_free;
+	}
+	return 0;
+
+fail_free_buf:
+	kfree(buf);
+fail_free:
+	kfree(req);
+	usb_free_urb(urb);
+fail:
+	return err;
+
+}
+EXPORT_SYMBOL_GPL(usbnet_write_cmd_async);
 /*-------------------------------------------------------------------------*/
 
 static int __init usbnet_init(void)

@@ -93,6 +93,9 @@ struct net {
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 	struct netns_ct		ct;
 #endif
+#if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
+	struct netns_nf_frag	nf_frag;
+#endif
 	struct sock		*nfnl;
 	struct sock		*nfnl_stash;
 #endif
@@ -107,6 +110,7 @@ struct net {
 #endif
 	struct netns_ipvs	*ipvs;
 	struct sock		*diag_nlsk;
+	atomic_t		rt_genid;
 };
 
 /*
@@ -253,10 +257,12 @@ static inline struct net *read_pnet(struct net * const *pnet)
 #define __net_init
 #define __net_exit
 #define __net_initdata
+#define __net_initconst
 #else
 #define __net_init	__init
 #define __net_exit	__exit_refok
 #define __net_initdata	__initdata
+#define __net_initconst	__initconst
 #endif
 
 struct pernet_operations {
@@ -312,5 +318,14 @@ static inline void unregister_net_sysctl_table(struct ctl_table_header *header)
 }
 #endif
 
+static inline int rt_genid(struct net *net)
+{
+	return atomic_read(&net->rt_genid);
+}
+
+static inline void rt_genid_bump(struct net *net)
+{
+	atomic_inc(&net->rt_genid);
+}
 
 #endif /* __NET_NET_NAMESPACE_H */
