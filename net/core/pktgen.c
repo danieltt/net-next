@@ -462,6 +462,8 @@ struct pktgen_rx {
 
 	struct pktgen_stats latency;
 	ktime_t latency_last_tx;
+
+	struct net *net;
 };
 
 struct pktgen_rx_global {
@@ -3974,7 +3976,8 @@ static int pktgen_add_rx(const char *ifname)
 
 	pg_reset_rx();
 
-	idev = pktgen_dev_get_by_name(NULL, ifname);
+	idev = dev_get_by_name(&init_net, ifname);
+
 	if (!idev)
 		printk(KERN_INFO
 			"pktgen: device not present %s. Using all\n", ifname);
@@ -4300,7 +4303,7 @@ static int __net_init pg_net_init(struct net *net)
 	}
 
 	/*Create proc rx*/
-	pe = proc_create(PGRX, 0600, pg->proc_dir, &pktgen_rx_fops);
+	pe = proc_create(PGRX, 0600, pn->proc_dir, &pktgen_rx_fops);
 	if (pe == NULL) {
 		pr_err("pktgen: cannot create %s procfs entry.\n", PGRX);
 		ret = -EINVAL;
