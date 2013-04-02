@@ -74,6 +74,12 @@
 #define GEM_HRT					0x0084
 #define GEM_SA1B				0x0088
 #define GEM_SA1T				0x008C
+#define GEM_SA2B				0x0090
+#define GEM_SA2T				0x0094
+#define GEM_SA3B				0x0098
+#define GEM_SA3T				0x009C
+#define GEM_SA4B				0x00A0
+#define GEM_SA4T				0x00A4
 #define GEM_OTX					0x0100
 #define GEM_DCFG1				0x0280
 #define GEM_DCFG2				0x0284
@@ -165,8 +171,21 @@
 #define GEM_DBW128				2
 
 /* Bitfields in DMACFG. */
+#define GEM_FBLDO_OFFSET			0
+#define GEM_FBLDO_SIZE				5
+#define GEM_ENDIA_OFFSET			7
+#define GEM_ENDIA_SIZE				1
+#define GEM_RXBMS_OFFSET			8
+#define GEM_RXBMS_SIZE				2
+#define GEM_TXPBMS_OFFSET			10
+#define GEM_TXPBMS_SIZE				1
+#define GEM_TXCOEN_OFFSET			11
+#define GEM_TXCOEN_SIZE				1
 #define GEM_RXBS_OFFSET				16
 #define GEM_RXBS_SIZE				8
+#define GEM_DDRP_OFFSET				24
+#define GEM_DDRP_SIZE				1
+
 
 /* Bitfields in NSR */
 #define MACB_NSR_LINK_OFFSET			0

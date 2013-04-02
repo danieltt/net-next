@@ -1,4 +1,4 @@
-/* Copyright (C) 2007-2012 B.A.T.M.A.N. contributors:
+/* Copyright (C) 2007-2013 B.A.T.M.A.N. contributors:
  *
  * Marek Lindner, Simon Wunderlich
  *
@@ -20,8 +20,6 @@
 #ifndef _NET_BATMAN_ADV_PACKET_H_
 #define _NET_BATMAN_ADV_PACKET_H_
 
-#define BATADV_ETH_P_BATMAN  0x4305 /* unofficial/not registered Ethertype */
-
 enum batadv_packettype {
 	BATADV_IV_OGM		= 0x01,
 	BATADV_ICMP		= 0x02,
@@ -32,6 +30,7 @@ enum batadv_packettype {
 	BATADV_TT_QUERY		= 0x07,
 	BATADV_ROAM_ADV		= 0x08,
 	BATADV_UNICAST_4ADDR	= 0x09,
+	BATADV_CODED		= 0x0a,
 };
 
 /**
@@ -173,6 +172,18 @@ struct batadv_icmp_packet_rr {
 	uint8_t  rr[BATADV_RR_LEN][ETH_ALEN];
 };
 
+/* All packet headers in front of an ethernet header have to be completely
+ * divisible by 2 but not by 4 to make the payload after the ethernet
+ * header again 4 bytes boundary aligned.
+ *
+ * A packing of 2 is necessary to avoid extra padding at the end of the struct
+ * caused by a structure member which is larger than two bytes. Otherwise
+ * the structure would not fulfill the previously mentioned rule to avoid the
+ * misalignment of the payload after the ethernet header. It may also lead to
+ * leakage of information when the padding it not initialized before sending.
+ */
+#pragma pack(2)
+
 struct batadv_unicast_packet {
 	struct batadv_header header;
 	uint8_t  ttvn; /* destination translation table version number */
@@ -216,7 +227,9 @@ struct batadv_bcast_packet {
 	/* "4 bytes boundary + 2 bytes" long to make the payload after the
 	 * following ethernet header again 4 bytes boundary aligned
 	 */
-} __packed;
+};
+
+#pragma pack()
 
 struct batadv_vis_packet {
 	struct batadv_header header;
@@ -265,5 +278,37 @@ struct batadv_tt_change {
 	uint8_t flags;
 	uint8_t addr[ETH_ALEN];
 } __packed;
+
+/**
+ * struct batadv_coded_packet - network coded packet
+ * @header: common batman packet header and ttl of first included packet
+ * @reserved: Align following fields to 2-byte boundaries
+ * @first_source: original source of first included packet
+ * @first_orig_dest: original destinal of first included packet
+ * @first_crc: checksum of first included packet
+ * @first_ttvn: tt-version number of first included packet
+ * @second_ttl: ttl of second packet
+ * @second_dest: second receiver of this coded packet
+ * @second_source: original source of second included packet
+ * @second_orig_dest: original destination of second included packet
+ * @second_crc: checksum of second included packet
+ * @second_ttvn: tt version number of second included packet
+ * @coded_len: length of network coded part of the payload
+ */
+struct batadv_coded_packet {
+	struct batadv_header header;
+	uint8_t  first_ttvn;
+	/* uint8_t  first_dest[ETH_ALEN]; - saved in mac header destination */
+	uint8_t  first_source[ETH_ALEN];
+	uint8_t  first_orig_dest[ETH_ALEN];
+	__be32   first_crc;
+	uint8_t  second_ttl;
+	uint8_t  second_ttvn;
+	uint8_t  second_dest[ETH_ALEN];
+	uint8_t  second_source[ETH_ALEN];
+	uint8_t  second_orig_dest[ETH_ALEN];
+	__be32   second_crc;
+	__be16   coded_len;
+};
 
 #endif /* _NET_BATMAN_ADV_PACKET_H_ */

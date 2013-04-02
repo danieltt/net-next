@@ -1041,7 +1041,6 @@ xirc2ps_interrupt(int irq, void *dev_id)
 	    /* 1 extra so we can use insw */
 	    skb = netdev_alloc_skb(dev, pktlen + 3);
 	    if (!skb) {
-		pr_notice("low memory, packet dropped (size=%u)\n", pktlen);
 		dev->stats.rx_dropped++;
 	    } else { /* okay get the packet */
 		skb_reserve(skb, 2);
@@ -1412,7 +1411,8 @@ static void netdev_get_drvinfo(struct net_device *dev,
 			       struct ethtool_drvinfo *info)
 {
 	strlcpy(info->driver, "xirc2ps_cs", sizeof(info->driver));
-	sprintf(info->bus_info, "PCMCIA 0x%lx", dev->base_addr);
+	snprintf(info->bus_info, sizeof(info->bus_info), "PCMCIA 0x%lx",
+		 dev->base_addr);
 }
 
 static const struct ethtool_ops netdev_ethtool_ops = {

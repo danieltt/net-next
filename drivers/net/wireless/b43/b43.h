@@ -7,6 +7,7 @@
 #include <linux/hw_random.h>
 #include <linux/bcma/bcma.h>
 #include <linux/ssb/ssb.h>
+#include <linux/completion.h>
 #include <net/mac80211.h>
 
 #include "debugfs.h"
@@ -472,6 +473,12 @@ enum {
 #define B43_MACCMD_CCA			0x00000008	/* Clear channel assessment */
 #define B43_MACCMD_BGNOISE		0x00000010	/* Background noise */
 
+/* See BCMA_CLKCTLST_EXTRESREQ and BCMA_CLKCTLST_EXTRESST */
+#define B43_BCMA_CLKCTLST_80211_PLL_REQ	0x00000100
+#define B43_BCMA_CLKCTLST_PHY_PLL_REQ	0x00000200
+#define B43_BCMA_CLKCTLST_80211_PLL_ST	0x01000000
+#define B43_BCMA_CLKCTLST_PHY_PLL_ST	0x02000000
+
 /* BCMA 802.11 core specific IO Control (BCMA_IOCTL) flags */
 #define B43_BCMA_IOCTL_PHY_CLKEN	0x00000004	/* PHY Clock Enable */
 #define B43_BCMA_IOCTL_PHY_RESET	0x00000008	/* PHY Reset */
@@ -722,6 +729,10 @@ enum b43_firmware_file_type {
 struct b43_request_fw_context {
 	/* The device we are requesting the fw for. */
 	struct b43_wldev *dev;
+	/* a completion event structure needed if this call is asynchronous */
+	struct completion fw_load_complete;
+	/* a pointer to the firmware object */
+	const struct firmware *blob;
 	/* The type of firmware to request. */
 	enum b43_firmware_file_type req_type;
 	/* Error messages for each firmware type. */

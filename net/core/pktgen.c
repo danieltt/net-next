@@ -165,6 +165,7 @@
 #ifdef CONFIG_XFRM
 #include <net/xfrm.h>
 #endif
+#include <net/netns/generic.h>
 #include <asm/byteorder.h>
 #include <linux/rcupdate.h>
 #include <linux/bitops.h>
@@ -216,7 +217,6 @@
 #define PG_PROC_DIR "pktgen"
 #define PGCTRL	    "pgctrl"
 #define PGRX        "pgrx"
-static struct proc_dir_entry *pg_proc_dir;
 
 #define MAX_CFLOWS  65536
 
@@ -404,7 +404,15 @@ struct pktgen_hdr {
 	__s64 time;
 };
 
-static bool pktgen_exiting __read_mostly;
+
+static int pg_net_id __read_mostly;
+
+struct pktgen_net {
+	struct net		*net;
+	struct proc_dir_entry	*proc_dir;
+	struct list_head	pktgen_threads;
+	bool			pktgen_exiting;
+};
 
 struct pktgen_thread {
 	spinlock_t if_lock;		/* for list of devices */
@@ -421,6 +429,7 @@ struct pktgen_thread {
 
 	wait_queue_head_t queue;
 	struct completion start_done;
+	struct pktgen_net *net;
 };
 
 #define RX_COUNTER	1
@@ -474,9 +483,9 @@ static int pktgen_add_device(struct pktgen_thread *t, const char *ifname);
 static struct pktgen_dev *pktgen_find_dev(struct pktgen_thread *t,
 					  const char *ifname, bool exact);
 static int pktgen_device_event(struct notifier_block *, unsigned long, void *);
-static void pktgen_run_all_threads(void);
-static void pktgen_reset_all_threads(void);
-static void pktgen_stop_all_threads_ifs(void);
+static void pktgen_run_all_threads(struct pktgen_net *pn);
+static void pktgen_reset_all_threads(struct pktgen_net *pn);
+static void pktgen_stop_all_threads_ifs(struct pktgen_net *pn);
 
 static void pktgen_stop(struct pktgen_thread *t);
 static void pktgen_clear_counters(struct pktgen_dev *pkt_dev);
@@ -503,7 +512,6 @@ static int pg_clone_skb_d  __read_mostly;
 static int debug  __read_mostly;
 
 static DEFINE_MUTEX(pktgen_thread_lock);
-static LIST_HEAD(pktgen_threads);
 
 DEFINE_PER_CPU(struct pktgen_rx, pktgen_rx_data);
 static struct pktgen_rx_global *pg_rx_global;
@@ -536,6 +544,7 @@ static ssize_t pgctrl_write(struct file *file, const char __user *buf,
 {
 	int err = 0;
 	char data[128];
+	struct pktgen_net *pn = net_generic(current->nsproxy->net_ns, pg_net_id);
 
 	if (!capable(CAP_NET_ADMIN)) {
 		err = -EPERM;
@@ -552,13 +561,13 @@ static ssize_t pgctrl_write(struct file *file, const char __user *buf,
 	data[count - 1] = 0;	/* Make string */
 
 	if (!strcmp(data, "stop"))
-		pktgen_stop_all_threads_ifs();
+		pktgen_stop_all_threads_ifs(pn);
 
 	else if (!strcmp(data, "start"))
-		pktgen_run_all_threads();
+		pktgen_run_all_threads(pn);
 
 	else if (!strcmp(data, "reset"))
-		pktgen_reset_all_threads();
+		pktgen_reset_all_threads(pn);
 
 	else
 		pr_warning("Unknown command: %s\n", data);
@@ -1853,10 +1862,13 @@ static ssize_t pktgen_thread_write(struct file *file,
 			return -EFAULT;
 		i += len;
 		mutex_lock(&pktgen_thread_lock);
-		pktgen_add_device(t, f);
+		ret = pktgen_add_device(t, f);
 		mutex_unlock(&pktgen_thread_lock);
-		ret = count;
-		sprintf(pg_result, "OK: add_device=%s", f);
+		if (!ret) {
+			ret = count;
+			sprintf(pg_result, "OK: add_device=%s", f);
+		} else
+			sprintf(pg_result, "ERROR: can not add device %s", f);
 		goto out;
 	}
 
@@ -2151,13 +2163,14 @@ static const struct file_operations pktgen_rx_fops = {
 };
 
 /* Think find or remove for NN */
-static struct pktgen_dev *__pktgen_NN_threads(const char *ifname, int remove)
+static struct pktgen_dev *__pktgen_NN_threads(const struct pktgen_net *pn,
+					      const char *ifname, int remove)
 {
 	struct pktgen_thread *t;
 	struct pktgen_dev *pkt_dev = NULL;
 	bool exact = (remove == FIND);
 
-	list_for_each_entry(t, &pktgen_threads, th_list) {
+	list_for_each_entry(t, &pn->pktgen_threads, th_list) {
 		pkt_dev = pktgen_find_dev(t, ifname, exact);
 		if (pkt_dev) {
 			if (remove) {
@@ -2175,7 +2188,7 @@ static struct pktgen_dev *__pktgen_NN_threads(const char *ifname, int remove)
 /*
  * mark a device for removal
  */
-static void pktgen_mark_device(const char *ifname)
+static void pktgen_mark_device(const struct pktgen_net *pn, const char *ifname)
 {
 	struct pktgen_dev *pkt_dev = NULL;
 	const int max_tries = 10, msec_per_try = 125;
@@ -2186,7 +2199,7 @@ static void pktgen_mark_device(const char *ifname)
 
 	while (1) {
 
-		pkt_dev = __pktgen_NN_threads(ifname, REMOVE);
+		pkt_dev = __pktgen_NN_threads(pn, ifname, REMOVE);
 		if (pkt_dev == NULL)
 			break;	/* success */
 
@@ -2207,21 +2220,21 @@ static void pktgen_mark_device(const char *ifname)
 	mutex_unlock(&pktgen_thread_lock);
 }
 
-static void pktgen_change_name(struct net_device *dev)
+static void pktgen_change_name(const struct pktgen_net *pn, struct net_device *dev)
 {
 	struct pktgen_thread *t;
 
-	list_for_each_entry(t, &pktgen_threads, th_list) {
+	list_for_each_entry(t, &pn->pktgen_threads, th_list) {
 		struct pktgen_dev *pkt_dev;
 
 		list_for_each_entry(pkt_dev, &t->if_list, list) {
 			if (pkt_dev->odev != dev)
 				continue;
 
-			remove_proc_entry(pkt_dev->entry->name, pg_proc_dir);
+			remove_proc_entry(pkt_dev->entry->name, pn->proc_dir);
 
 			pkt_dev->entry = proc_create_data(dev->name, 0600,
-							  pg_proc_dir,
+							  pn->proc_dir,
 							  &pktgen_if_fops,
 							  pkt_dev);
 			if (!pkt_dev->entry)
@@ -2236,8 +2249,9 @@ static int pktgen_device_event(struct notifier_block *unused,
 			       unsigned long event, void *ptr)
 {
 	struct net_device *dev = ptr;
+	struct pktgen_net *pn = net_generic(dev_net(dev), pg_net_id);
 
-	if (!net_eq(dev_net(dev), &init_net) || pktgen_exiting)
+	if (pn->pktgen_exiting)
 		return NOTIFY_DONE;
 
 	/* It is OK that we do not hold the group lock right now,
@@ -2246,18 +2260,19 @@ static int pktgen_device_event(struct notifier_block *unused,
 
 	switch (event) {
 	case NETDEV_CHANGENAME:
-		pktgen_change_name(dev);
+		pktgen_change_name(pn, dev);
 		break;
 
 	case NETDEV_UNREGISTER:
-		pktgen_mark_device(dev->name);
+		pktgen_mark_device(pn, dev->name);
 		break;
 	}
 
 	return NOTIFY_DONE;
 }
 
-static struct net_device *pktgen_dev_get_by_name(struct pktgen_dev *pkt_dev,
+static struct net_device *pktgen_dev_get_by_name(const struct pktgen_net *pn,
+						 struct pktgen_dev *pkt_dev,
 						 const char *ifname)
 {
 	char b[IFNAMSIZ+5];
@@ -2271,13 +2286,14 @@ static struct net_device *pktgen_dev_get_by_name(struct pktgen_dev *pkt_dev,
 	}
 	b[i] = 0;
 
-	return dev_get_by_name(&init_net, b);
+	return dev_get_by_name(pn->net, b);
 }
 
 
 /* Associate pktgen_dev with a device. */
 
-static int pktgen_setup_dev(struct pktgen_dev *pkt_dev, const char *ifname)
+static int pktgen_setup_dev(const struct pktgen_net *pn,
+			    struct pktgen_dev *pkt_dev, const char *ifname)
 {
 	struct net_device *odev;
 	int err;
@@ -2288,7 +2304,7 @@ static int pktgen_setup_dev(struct pktgen_dev *pkt_dev, const char *ifname)
 		pkt_dev->odev = NULL;
 	}
 
-	odev = pktgen_dev_get_by_name(pkt_dev, ifname);
+	odev = pktgen_dev_get_by_name(pn, pkt_dev, ifname);
 	if (!odev) {
 		pr_err("no such netdevice: \"%s\"\n", ifname);
 		return -ENODEV;
@@ -2530,9 +2546,10 @@ static inline int f_pick(struct pktgen_dev *pkt_dev)
 static void get_ipsec_sa(struct pktgen_dev *pkt_dev, int flow)
 {
 	struct xfrm_state *x = pkt_dev->flows[flow].x;
+	struct pktgen_net *pn = net_generic(dev_net(pkt_dev->odev), pg_net_id);
 	if (!x) {
 		/*slow path: we dont already have xfrm_state*/
-		x = xfrm_stateonly_find(&init_net, DUMMY_MARK,
+		x = xfrm_stateonly_find(pn->net, DUMMY_MARK,
 					(xfrm_address_t *)&pkt_dev->cur_daddr,
 					(xfrm_address_t *)&pkt_dev->cur_saddr,
 					AF_INET,
@@ -3240,7 +3257,7 @@ static void pktgen_run(struct pktgen_thread *t)
 		t->control &= ~(T_STOP);
 }
 
-static void pktgen_stop_all_threads_ifs(void)
+static void pktgen_stop_all_threads_ifs(struct pktgen_net *pn)
 {
 	struct pktgen_thread *t;
 
@@ -3248,7 +3265,7 @@ static void pktgen_stop_all_threads_ifs(void)
 
 	mutex_lock(&pktgen_thread_lock);
 
-	list_for_each_entry(t, &pktgen_threads, th_list)
+	list_for_each_entry(t, &pn->pktgen_threads, th_list)
 		t->control |= T_STOP;
 
 	mutex_unlock(&pktgen_thread_lock);
@@ -3284,21 +3301,21 @@ signal:
 	return 0;
 }
 
-static int pktgen_wait_all_threads_run(void)
+static int pktgen_wait_all_threads_run(struct pktgen_net *pn)
 {
 	struct pktgen_thread *t;
 	int sig = 1;
 
 	mutex_lock(&pktgen_thread_lock);
 
-	list_for_each_entry(t, &pktgen_threads, th_list) {
+	list_for_each_entry(t, &pn->pktgen_threads, th_list) {
 		sig = pktgen_wait_thread_run(t);
 		if (sig == 0)
 			break;
 	}
 
 	if (sig == 0)
-		list_for_each_entry(t, &pktgen_threads, th_list)
+		list_for_each_entry(t, &pn->pktgen_threads, th_list)
 			t->control |= (T_STOP);
 
 	is_pktgen_sending = 0;
@@ -3306,7 +3323,7 @@ static int pktgen_wait_all_threads_run(void)
 	return sig;
 }
 
-static void pktgen_run_all_threads(void)
+static void pktgen_run_all_threads(struct pktgen_net *pn)
 {
 	struct pktgen_thread *t;
 
@@ -3315,7 +3332,7 @@ static void pktgen_run_all_threads(void)
 	is_pktgen_sending = 1;
 	mutex_lock(&pktgen_thread_lock);
 
-	list_for_each_entry(t, &pktgen_threads, th_list)
+	list_for_each_entry(t, &pn->pktgen_threads, th_list)
 		t->control |= (T_RUN);
 
 	mutex_unlock(&pktgen_thread_lock);
@@ -3323,10 +3340,10 @@ static void pktgen_run_all_threads(void)
 	/* Propagate thread->control  */
 	schedule_timeout_interruptible(msecs_to_jiffies(125));
 
-	pktgen_wait_all_threads_run();
+	pktgen_wait_all_threads_run(pn);
 }
 
-static void pktgen_reset_all_threads(void)
+static void pktgen_reset_all_threads(struct pktgen_net *pn)
 {
 	struct pktgen_thread *t;
 
@@ -3334,7 +3351,7 @@ static void pktgen_reset_all_threads(void)
 
 	mutex_lock(&pktgen_thread_lock);
 
-	list_for_each_entry(t, &pktgen_threads, th_list)
+	list_for_each_entry(t, &pn->pktgen_threads, th_list)
 		t->control |= (T_REMDEVALL);
 
 	mutex_unlock(&pktgen_thread_lock);
@@ -3342,7 +3359,7 @@ static void pktgen_reset_all_threads(void)
 	/* Propagate thread->control  */
 	schedule_timeout_interruptible(msecs_to_jiffies(125));
 
-	pktgen_wait_all_threads_run();
+	pktgen_wait_all_threads_run(pn);
 }
 
 static void show_results(struct pktgen_dev *pkt_dev, int nr_frags)
@@ -3484,9 +3501,7 @@ static void pktgen_rem_all_ifs(struct pktgen_thread *t)
 static void pktgen_rem_thread(struct pktgen_thread *t)
 {
 	/* Remove from the thread list */
-
-	remove_proc_entry(t->tsk->comm, pg_proc_dir);
-
+	remove_proc_entry(t->tsk->comm, t->net->proc_dir);
 }
 
 static void pktgen_resched(struct pktgen_dev *pkt_dev)
@@ -3632,7 +3647,7 @@ static int pktgen_thread_worker(void *arg)
 		pkt_dev = next_to_run(t);
 
 		if (unlikely(!pkt_dev && t->control == 0)) {
-			if (pktgen_exiting)
+			if (t->net->pktgen_exiting)
 				break;
 			wait_event_interruptible_timeout(t->queue,
 							 t->control != 0,
@@ -3754,7 +3769,7 @@ static int pktgen_add_device(struct pktgen_thread *t, const char *ifname)
 
 	/* We don't allow a device to be on several threads */
 
-	pkt_dev = __pktgen_NN_threads(ifname, FIND);
+	pkt_dev = __pktgen_NN_threads(t->net, ifname, FIND);
 	if (pkt_dev) {
 		pr_err("ERROR: interface already used\n");
 		return -EBUSY;
@@ -3789,13 +3804,13 @@ static int pktgen_add_device(struct pktgen_thread *t, const char *ifname)
 	pkt_dev->svlan_id = 0xffff;
 	pkt_dev->node = -1;
 
-	err = pktgen_setup_dev(pkt_dev, ifname);
+	err = pktgen_setup_dev(t->net, pkt_dev, ifname);
 	if (err)
 		goto out1;
 	if (pkt_dev->odev->priv_flags & IFF_TX_SKB_SHARING)
 		pkt_dev->clone_skb = pg_clone_skb_d;
 
-	pkt_dev->entry = proc_create_data(ifname, 0600, pg_proc_dir,
+	pkt_dev->entry = proc_create_data(ifname, 0600, t->net->proc_dir,
 					  &pktgen_if_fops, pkt_dev);
 	if (!pkt_dev->entry) {
 		pr_err("cannot create %s/%s procfs entry\n",
@@ -3820,7 +3835,7 @@ out1:
 	return err;
 }
 
-static int __init pktgen_create_thread(int cpu)
+static int __net_init pktgen_create_thread(int cpu, struct pktgen_net *pn)
 {
 	struct pktgen_thread *t;
 	struct proc_dir_entry *pe;
@@ -3838,7 +3853,7 @@ static int __init pktgen_create_thread(int cpu)
 
 	INIT_LIST_HEAD(&t->if_list);
 
-	list_add_tail(&t->th_list, &pktgen_threads);
+	list_add_tail(&t->th_list, &pn->pktgen_threads);
 	init_completion(&t->start_done);
 
 	p = kthread_create_on_node(pktgen_thread_worker,
@@ -3854,7 +3869,7 @@ static int __init pktgen_create_thread(int cpu)
 	kthread_bind(p, cpu);
 	t->tsk = p;
 
-	pe = proc_create_data(t->tsk->comm, 0600, pg_proc_dir,
+	pe = proc_create_data(t->tsk->comm, 0600, pn->proc_dir,
 			      &pktgen_thread_fops, t);
 	if (!pe) {
 		pr_err("cannot create %s/%s procfs entry\n",
@@ -3865,6 +3880,7 @@ static int __init pktgen_create_thread(int cpu)
 		return -EINVAL;
 	}
 
+	t->net = pn;
 	wake_up_process(p);
 	wait_for_completion(&t->start_done);
 
@@ -3890,6 +3906,7 @@ static void _rem_dev_from_if_list(struct pktgen_thread *t,
 static int pktgen_remove_device(struct pktgen_thread *t,
 				struct pktgen_dev *pkt_dev)
 {
+	struct pktgen_net *pn = t->net;
 
 	pr_debug("remove_device pkt_dev=%p\n", pkt_dev);
 
@@ -3910,7 +3927,7 @@ static int pktgen_remove_device(struct pktgen_thread *t,
 	_rem_dev_from_if_list(t, pkt_dev);
 
 	if (pkt_dev->entry)
-		remove_proc_entry(pkt_dev->entry->name, pg_proc_dir);
+		remove_proc_entry(pkt_dev->entry->name, pn->proc_dir);
 
 #ifdef CONFIG_XFRM
 	free_SAs(pkt_dev);
@@ -4261,74 +4278,73 @@ end:
 	return 0;
 }
 
-static int __init pg_init(void)
+static int __net_init pg_net_init(struct net *net)
 {
-	int cpu;
+	struct pktgen_net *pn = net_generic(net, pg_net_id);
 	struct proc_dir_entry *pe;
-	int ret = 0;
+	int cpu, ret = 0;
 
-	pr_info("%s", version);
-
-	pg_proc_dir = proc_mkdir(PG_PROC_DIR, init_net.proc_net);
-	if (!pg_proc_dir)
+	pn->net = net;
+	INIT_LIST_HEAD(&pn->pktgen_threads);
+	pn->pktgen_exiting = false;
+	pn->proc_dir = proc_mkdir(PG_PROC_DIR, pn->net->proc_net);
+	if (!pn->proc_dir) {
+		pr_warn("cannot create /proc/net/%s\n", PG_PROC_DIR);
 		return -ENODEV;
-
-	pe = proc_create(PGCTRL, 0600, pg_proc_dir, &pktgen_fops);
+	}
+	pe = proc_create(PGCTRL, 0600, pn->proc_dir, &pktgen_fops);
 	if (pe == NULL) {
-		pr_err("ERROR: cannot create %s procfs entry\n", PGCTRL);
+		pr_err("cannot create %s procfs entry\n", PGCTRL);
 		ret = -EINVAL;
-		goto remove_dir;
+		goto remove;
 	}
 
-	register_netdevice_notifier(&pktgen_notifier_block);
-
 	/*Create proc rx*/
-	pe = proc_create(PGRX, 0600, pg_proc_dir, &pktgen_rx_fops);
+	pe = proc_create(PGRX, 0600, pg->proc_dir, &pktgen_rx_fops);
 	if (pe == NULL) {
-		printk(KERN_ERR "pktgen: ERROR: cannot create %s "
-		       "procfs entry.\n", PGRX);
-		proc_net_remove(&init_net, PG_PROC_DIR);
-		return -EINVAL;
+		pr_err("pktgen: cannot create %s procfs entry.\n", PGRX);
+		ret = -EINVAL;
+		goto remove_rx;
 	}
 
 	for_each_online_cpu(cpu) {
 		int err;
 
-		err = pktgen_create_thread(cpu);
+		err = pktgen_create_thread(cpu, pn);
 		if (err)
-			pr_warning("WARNING: Cannot create thread for cpu %d (%d)\n",
+			pr_warn("Cannot create thread for cpu %d (%d)\n",
 				   cpu, err);
 	}
 
-	if (list_empty(&pktgen_threads)) {
-		pr_err("ERROR: Initialization failed for all threads\n");
-		pktgen_clean_rx();
-		remove_proc_entry(PGRX, pg_proc_dir);
+	if (list_empty(&pn->pktgen_threads)) {
+		pr_err("Initialization failed for all threads\n");
 		ret = -ENODEV;
-		goto unregister;
+		goto remove_entry;
 	}
 
 	return 0;
 
- unregister:
-	unregister_netdevice_notifier(&pktgen_notifier_block);
-	remove_proc_entry(PGCTRL, pg_proc_dir);
- remove_dir:
-	proc_net_remove(&init_net, PG_PROC_DIR);
+remove_rx:
+	remove_proc_entry(PGRX, pn->proc_dir);
+remove_entry:
+	remove_proc_entry(PGCTRL, pn->proc_dir);
+remove:
+	remove_proc_entry(PG_PROC_DIR, pn->net->proc_net);
 	return ret;
 }
 
-static void __exit pg_cleanup(void)
+static void __net_exit pg_net_exit(struct net *net)
 {
+	struct pktgen_net *pn = net_generic(net, pg_net_id);
 	struct pktgen_thread *t;
 	struct list_head *q, *n;
 	LIST_HEAD(list);
 
 	/* Stop all interfaces & threads */
-	pktgen_exiting = true;
+	pn->pktgen_exiting = true;
 
 	mutex_lock(&pktgen_thread_lock);
-	list_splice_init(&pktgen_threads, &list);
+	list_splice_init(&pn->pktgen_threads, &list);
 	mutex_unlock(&pktgen_thread_lock);
 
 	list_for_each_safe(q, n, &list) {
@@ -4338,15 +4354,39 @@ static void __exit pg_cleanup(void)
 		kfree(t);
 	}
 
-	/* Un-register us from receiving netdevice events */
-	unregister_netdevice_notifier(&pktgen_notifier_block);
+	remove_proc_entry(PGCTRL, pn->proc_dir);
+	remove_proc_entry(PG_PROC_DIR, pn->net->proc_net);
+	remove_proc_entry(PGRX, pn->proc_dir);
+}
 
+static struct pernet_operations pg_net_ops = {
+	.init = pg_net_init,
+	.exit = pg_net_exit,
+	.id   = &pg_net_id,
+	.size = sizeof(struct pktgen_net),
+};
+
+static int __init pg_init(void)
+{
+	int ret = 0;
+
+	pr_info("%s", version);
+	ret = register_pernet_subsys(&pg_net_ops);
+	if (ret)
+		return ret;
+	ret = register_netdevice_notifier(&pktgen_notifier_block);
+	if (ret)
+		unregister_pernet_subsys(&pg_net_ops);
+
+	return ret;
+}
+
+static void __exit pg_cleanup(void)
+{
 	pktgen_clean_rx();
-	remove_proc_entry(PGRX, pg_proc_dir);
 
-	/* Clean up proc file system */
-	remove_proc_entry(PGCTRL, pg_proc_dir);
-	proc_net_remove(&init_net, PG_PROC_DIR);
+	unregister_netdevice_notifier(&pktgen_notifier_block);
+	unregister_pernet_subsys(&pg_net_ops);
 }
 
 module_init(pg_init);

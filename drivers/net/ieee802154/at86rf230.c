@@ -233,8 +233,8 @@ struct at86rf230_local {
 #define STATE_SLEEP		0x0F
 #define STATE_BUSY_RX_AACK	0x11
 #define STATE_BUSY_TX_ARET	0x12
-#define STATE_BUSY_RX_AACK_ON	0x16
-#define STATE_BUSY_TX_ARET_ON	0x19
+#define STATE_RX_AACK_ON	0x16
+#define STATE_TX_ARET_ON	0x19
 #define STATE_RX_ON_NOCLK	0x1C
 #define STATE_RX_AACK_ON_NOCLK	0x1D
 #define STATE_BUSY_RX_AACK_NOCLK 0x1E
@@ -619,6 +619,52 @@ err:
 	return -EINVAL;
 }
 
+static int
+at86rf230_set_hw_addr_filt(struct ieee802154_dev *dev,
+			   struct ieee802154_hw_addr_filt *filt,
+			   unsigned long changed)
+{
+	struct at86rf230_local *lp = dev->priv;
+
+	if (changed & IEEE802515_AFILT_SADDR_CHANGED) {
+		dev_vdbg(&lp->spi->dev,
+			"at86rf230_set_hw_addr_filt called for saddr\n");
+		__at86rf230_write(lp, RG_SHORT_ADDR_0, filt->short_addr);
+		__at86rf230_write(lp, RG_SHORT_ADDR_1, filt->short_addr >> 8);
+	}
+
+	if (changed & IEEE802515_AFILT_PANID_CHANGED) {
+		dev_vdbg(&lp->spi->dev,
+			"at86rf230_set_hw_addr_filt called for pan id\n");
+		__at86rf230_write(lp, RG_PAN_ID_0, filt->pan_id);
+		__at86rf230_write(lp, RG_PAN_ID_1, filt->pan_id >> 8);
+	}
+
+	if (changed & IEEE802515_AFILT_IEEEADDR_CHANGED) {
+		dev_vdbg(&lp->spi->dev,
+			"at86rf230_set_hw_addr_filt called for IEEE addr\n");
+		at86rf230_write_subreg(lp, SR_IEEE_ADDR_0, filt->ieee_addr[7]);
+		at86rf230_write_subreg(lp, SR_IEEE_ADDR_1, filt->ieee_addr[6]);
+		at86rf230_write_subreg(lp, SR_IEEE_ADDR_2, filt->ieee_addr[5]);
+		at86rf230_write_subreg(lp, SR_IEEE_ADDR_3, filt->ieee_addr[4]);
+		at86rf230_write_subreg(lp, SR_IEEE_ADDR_4, filt->ieee_addr[3]);
+		at86rf230_write_subreg(lp, SR_IEEE_ADDR_5, filt->ieee_addr[2]);
+		at86rf230_write_subreg(lp, SR_IEEE_ADDR_6, filt->ieee_addr[1]);
+		at86rf230_write_subreg(lp, SR_IEEE_ADDR_7, filt->ieee_addr[0]);
+	}
+
+	if (changed & IEEE802515_AFILT_PANC_CHANGED) {
+		dev_vdbg(&lp->spi->dev,
+			"at86rf230_set_hw_addr_filt called for panc change\n");
+		if (filt->pan_coord)
+			at86rf230_write_subreg(lp, SR_AACK_I_AM_COORD, 1);
+		else
+			at86rf230_write_subreg(lp, SR_AACK_I_AM_COORD, 0);
+	}
+
+	return 0;
+}
+
 static struct ieee802154_ops at86rf230_ops = {
 	.owner = THIS_MODULE,
 	.xmit = at86rf230_xmit,
@@ -626,6 +672,7 @@ static struct ieee802154_ops at86rf230_ops = {
 	.set_channel = at86rf230_channel,
 	.start = at86rf230_start,
 	.stop = at86rf230_stop,
+	.set_hw_addr_filt = at86rf230_set_hw_addr_filt,
 };
 
 static void at86rf230_irqwork(struct work_struct *work)
@@ -751,16 +798,6 @@ static int at86rf230_hw_init(struct at86rf230_local *lp)
 	return 0;
 }
 
-static int at86rf230_suspend(struct spi_device *spi, pm_message_t message)
-{
-	return 0;
-}
-
-static int at86rf230_resume(struct spi_device *spi)
-{
-	return 0;
-}
-
 static int at86rf230_fill_data(struct spi_device *spi)
 {
 	struct at86rf230_local *lp = spi_get_drvdata(spi);
@@ -778,7 +815,7 @@ static int at86rf230_fill_data(struct spi_device *spi)
 	return 0;
 }
 
-static int __devinit at86rf230_probe(struct spi_device *spi)
+static int at86rf230_probe(struct spi_device *spi)
 {
 	struct ieee802154_dev *dev;
 	struct at86rf230_local *lp;
@@ -920,7 +957,7 @@ err_fill:
 	return rc;
 }
 
-static int __devexit at86rf230_remove(struct spi_device *spi)
+static int at86rf230_remove(struct spi_device *spi)
 {
 	struct at86rf230_local *lp = spi_get_drvdata(spi);
 
@@ -947,9 +984,7 @@ static struct spi_driver at86rf230_driver = {
 		.owner	= THIS_MODULE,
 	},
 	.probe      = at86rf230_probe,
-	.remove     = __devexit_p(at86rf230_remove),
-	.suspend    = at86rf230_suspend,
-	.resume     = at86rf230_resume,
+	.remove     = at86rf230_remove,
 };
 
 module_spi_driver(at86rf230_driver);

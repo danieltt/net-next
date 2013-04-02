@@ -6,8 +6,10 @@
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/pci.h>
+#include <linux/gpio.h>
 #include <linux/mod_devicetable.h>
 #include <linux/dma-mapping.h>
+#include <linux/platform_device.h>
 
 #include <linux/ssb/ssb_regs.h>
 
@@ -24,9 +26,9 @@ struct ssb_sprom_core_pwr_info {
 
 struct ssb_sprom {
 	u8 revision;
-	u8 il0mac[6];		/* MAC address for 802.11b/g */
-	u8 et0mac[6];		/* MAC address for Ethernet */
-	u8 et1mac[6];		/* MAC address for 802.11a */
+	u8 il0mac[6] __aligned(sizeof(u16));	/* MAC address for 802.11b/g */
+	u8 et0mac[6] __aligned(sizeof(u16));	/* MAC address for Ethernet */
+	u8 et1mac[6] __aligned(sizeof(u16));	/* MAC address for 802.11a */
 	u8 et0phyaddr;		/* MII address for enet0 */
 	u8 et1phyaddr;		/* MII address for enet1 */
 	u8 et0mdcport;		/* MDIO for enet0 */
@@ -432,7 +434,11 @@ struct ssb_bus {
 #ifdef CONFIG_SSB_EMBEDDED
 	/* Lock for GPIO register access. */
 	spinlock_t gpio_lock;
+	struct platform_device *watchdog;
 #endif /* EMBEDDED */
+#ifdef CONFIG_SSB_DRIVER_GPIO
+	struct gpio_chip gpio;
+#endif /* DRIVER_GPIO */
 
 	/* Internal-only stuff follows. Do not touch. */
 	struct list_head list;

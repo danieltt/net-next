@@ -14,17 +14,15 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #include <linux/debugfs.h>
-#include <linux/if_ether.h>
-#include <linux/if.h>
-#include <linux/ieee80211.h>
+#include <linux/netdevice.h>
 #include <linux/module.h>
 
-#include <defs.h>
 #include <brcmu_wifi.h>
 #include <brcmu_utils.h>
 #include "dhd.h"
 #include "dhd_bus.h"
 #include "dhd_dbg.h"
+#include "tracepoint.h"
 
 static struct dentry *root_folder;
 
@@ -46,10 +44,12 @@ void brcmf_debugfs_exit(void)
 
 int brcmf_debugfs_attach(struct brcmf_pub *drvr)
 {
+	struct device *dev = drvr->bus_if->dev;
+
 	if (!root_folder)
 		return -ENODEV;
 
-	drvr->dbgfs_dir = debugfs_create_dir(dev_name(drvr->dev), root_folder);
+	drvr->dbgfs_dir = debugfs_create_dir(dev_name(dev), root_folder);
 	return PTR_RET(drvr->dbgfs_dir);
 }
 
@@ -123,4 +123,45 @@ void brcmf_debugfs_create_sdio_count(struct brcmf_pub *drvr,
 	if (!IS_ERR_OR_NULL(dentry))
 		debugfs_create_file("counters", S_IRUGO, dentry,
 				    sdcnt, &brcmf_debugfs_sdio_counter_ops);
+}
+
+static
+ssize_t brcmf_debugfs_fws_stats_read(struct file *f, char __user *data,
+				     size_t count, loff_t *ppos)
+{
+	struct brcmf_fws_stats *fwstats = f->private_data;
+	char buf[100];
+	int res;
+
+	/* only allow read from start */
+	if (*ppos > 0)
+		return 0;
+
+	res = scnprintf(buf, sizeof(buf),
+			"header_pulls:     %u\n"
+			"header_only_pkt:  %u\n"
+			"tlv_parse_failed: %u\n"
+			"tlv_invalid_type: %u\n",
+			fwstats->header_pulls,
+			fwstats->header_only_pkt,
+			fwstats->tlv_parse_failed,
+			fwstats->tlv_invalid_type);
+
+	return simple_read_from_buffer(data, count, ppos, buf, res);
+}
+
+static const struct file_operations brcmf_debugfs_fws_stats_ops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = brcmf_debugfs_fws_stats_read
+};
+
+void brcmf_debugfs_create_fws_stats(struct brcmf_pub *drvr,
+				    struct brcmf_fws_stats *stats)
+{
+	struct dentry *dentry =  drvr->dbgfs_dir;
+
+	if (!IS_ERR_OR_NULL(dentry))
+		debugfs_create_file("fws_stats", S_IRUGO, dentry,
+				    stats, &brcmf_debugfs_fws_stats_ops);
 }

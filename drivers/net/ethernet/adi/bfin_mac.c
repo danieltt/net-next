@@ -188,10 +188,9 @@ static int desc_list_init(struct net_device *dev)
 
 		/* allocate a new skb for next time receive */
 		new_skb = netdev_alloc_skb(dev, PKT_BUF_SZ + NET_IP_ALIGN);
-		if (!new_skb) {
-			pr_notice("init: low on mem - packet dropped\n");
+		if (!new_skb)
 			goto init_error;
-		}
+
 		skb_reserve(new_skb, NET_IP_ALIGN);
 		/* Invidate the data cache of skb->data range when it is write back
 		 * cache. It will prevent overwritting the new data from DMA
@@ -425,8 +424,8 @@ static int mii_probe(struct net_device *dev, int phy_mode)
 		return -EINVAL;
 	}
 
-	phydev = phy_connect(dev, dev_name(&phydev->dev), &bfin_mac_adjust_link,
-			0, phy_mode);
+	phydev = phy_connect(dev, dev_name(&phydev->dev),
+			     &bfin_mac_adjust_link, phy_mode);
 
 	if (IS_ERR(phydev)) {
 		netdev_err(dev, "could not attach PHY\n");
@@ -498,10 +497,10 @@ bfin_mac_ethtool_setsettings(struct net_device *dev, struct ethtool_cmd *cmd)
 static void bfin_mac_ethtool_getdrvinfo(struct net_device *dev,
 					struct ethtool_drvinfo *info)
 {
-	strcpy(info->driver, KBUILD_MODNAME);
-	strcpy(info->version, DRV_VERSION);
-	strcpy(info->fw_version, "N/A");
-	strcpy(info->bus_info, dev_name(&dev->dev));
+	strlcpy(info->driver, KBUILD_MODNAME, sizeof(info->driver));
+	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
+	strlcpy(info->fw_version, "N/A", sizeof(info->fw_version));
+	strlcpy(info->bus_info, dev_name(&dev->dev), sizeof(info->bus_info));
 }
 
 static void bfin_mac_ethtool_getwol(struct net_device *dev,
@@ -647,7 +646,6 @@ static int bfin_mac_set_mac_address(struct net_device *dev, void *p)
 	if (netif_running(dev))
 		return -EBUSY;
 	memcpy(dev->dev_addr, addr->sa_data, dev->addr_len);
-	dev->addr_assign_type &= ~NET_ADDR_RANDOM;
 	setup_mac_addr(dev->dev_addr);
 	return 0;
 }
@@ -1237,7 +1235,6 @@ static void bfin_mac_rx(struct net_device *dev)
 
 	new_skb = netdev_alloc_skb(dev, PKT_BUF_SZ + NET_IP_ALIGN);
 	if (!new_skb) {
-		netdev_notice(dev, "rx: low on mem - packet dropped\n");
 		dev->stats.rx_dropped++;
 		goto out;
 	}
@@ -1603,7 +1600,7 @@ static const struct net_device_ops bfin_mac_netdev_ops = {
 #endif
 };
 
-static int __devinit bfin_mac_probe(struct platform_device *pdev)
+static int bfin_mac_probe(struct platform_device *pdev)
 {
 	struct net_device *ndev;
 	struct bfin_mac_local *lp;
@@ -1727,7 +1724,7 @@ out_err_probe_mac:
 	return rc;
 }
 
-static int __devexit bfin_mac_remove(struct platform_device *pdev)
+static int bfin_mac_remove(struct platform_device *pdev)
 {
 	struct net_device *ndev = platform_get_drvdata(pdev);
 	struct bfin_mac_local *lp = netdev_priv(ndev);
@@ -1786,7 +1783,7 @@ static int bfin_mac_resume(struct platform_device *pdev)
 #define bfin_mac_resume NULL
 #endif	/* CONFIG_PM */
 
-static int __devinit bfin_mii_bus_probe(struct platform_device *pdev)
+static int bfin_mii_bus_probe(struct platform_device *pdev)
 {
 	struct mii_bus *miibus;
 	struct bfin_mii_bus_platform_data *mii_bus_pd;
@@ -1864,7 +1861,7 @@ out_err_alloc:
 	return rc;
 }
 
-static int __devexit bfin_mii_bus_remove(struct platform_device *pdev)
+static int bfin_mii_bus_remove(struct platform_device *pdev)
 {
 	struct mii_bus *miibus = platform_get_drvdata(pdev);
 	struct bfin_mii_bus_platform_data *mii_bus_pd =
@@ -1881,7 +1878,7 @@ static int __devexit bfin_mii_bus_remove(struct platform_device *pdev)
 
 static struct platform_driver bfin_mii_bus_driver = {
 	.probe = bfin_mii_bus_probe,
-	.remove = __devexit_p(bfin_mii_bus_remove),
+	.remove = bfin_mii_bus_remove,
 	.driver = {
 		.name = "bfin_mii_bus",
 		.owner	= THIS_MODULE,
@@ -1890,7 +1887,7 @@ static struct platform_driver bfin_mii_bus_driver = {
 
 static struct platform_driver bfin_mac_driver = {
 	.probe = bfin_mac_probe,
-	.remove = __devexit_p(bfin_mac_remove),
+	.remove = bfin_mac_remove,
 	.resume = bfin_mac_resume,
 	.suspend = bfin_mac_suspend,
 	.driver = {

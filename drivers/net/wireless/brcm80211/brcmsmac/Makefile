@@ -40,7 +40,12 @@ BRCMSMAC_OFILES := \
 	phy/phytbl_n.o \
 	phy/phy_qmath.o \
 	dma.o \
-	brcms_trace_events.o
+	brcms_trace_events.o \
+	debug.o
+
+ifdef CONFIG_BCMA_DRIVER_GPIO
+BRCMSMAC_OFILES += led.o
+endif
 
 MODULEPFX := brcmsmac
 

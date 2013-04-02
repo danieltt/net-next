@@ -31,7 +31,7 @@ static void turnaround_delay(unsigned long last_jif, int mtt)
 	schedule_timeout_uninterruptible(ticks);
 }
 
-static void __devinit bfin_sir_init_ports(struct bfin_sir_port *sp, struct platform_device *pdev)
+static void bfin_sir_init_ports(struct bfin_sir_port *sp, struct platform_device *pdev)
 {
 	int i;
 	struct resource *res;
@@ -389,7 +389,8 @@ static int bfin_sir_startup(struct bfin_sir_port *port, struct net_device *dev)
 	set_dma_callback(port->rx_dma_channel, bfin_sir_dma_rx_int, dev);
 	set_dma_callback(port->tx_dma_channel, bfin_sir_dma_tx_int, dev);
 
-	port->rx_dma_buf.buf = (unsigned char *)dma_alloc_coherent(NULL, PAGE_SIZE, &dma_handle, GFP_DMA);
+	port->rx_dma_buf.buf = dma_alloc_coherent(NULL, PAGE_SIZE,
+						  &dma_handle, GFP_DMA);
 	port->rx_dma_buf.head = 0;
 	port->rx_dma_buf.tail = 0;
 	port->rx_dma_nrows = 0;
@@ -688,7 +689,7 @@ static const struct net_device_ops bfin_sir_ndo = {
 	.ndo_get_stats		= bfin_sir_stats,
 };
 
-static int __devinit bfin_sir_probe(struct platform_device *pdev)
+static int bfin_sir_probe(struct platform_device *pdev)
 {
 	struct net_device *dev;
 	struct bfin_sir_self *self;
@@ -775,7 +776,7 @@ err_mem_0:
 	return err;
 }
 
-static int __devexit bfin_sir_remove(struct platform_device *pdev)
+static int bfin_sir_remove(struct platform_device *pdev)
 {
 	struct bfin_sir_port *sir_port;
 	struct net_device *dev = NULL;
@@ -798,7 +799,7 @@ static int __devexit bfin_sir_remove(struct platform_device *pdev)
 
 static struct platform_driver bfin_ir_driver = {
 	.probe   = bfin_sir_probe,
-	.remove  = __devexit_p(bfin_sir_remove),
+	.remove  = bfin_sir_remove,
 	.suspend = bfin_sir_suspend,
 	.resume  = bfin_sir_resume,
 	.driver  = {

@@ -96,7 +96,7 @@ static int octeon_mdiobus_write(struct mii_bus *bus, int phy_id,
 	return 0;
 }
 
-static int __devinit octeon_mdiobus_probe(struct platform_device *pdev)
+static int octeon_mdiobus_probe(struct platform_device *pdev)
 {
 	struct octeon_mdiobus *bus;
 	struct resource *res_mem;
@@ -159,7 +159,7 @@ fail:
 	return err;
 }
 
-static int __devexit octeon_mdiobus_remove(struct platform_device *pdev)
+static int octeon_mdiobus_remove(struct platform_device *pdev)
 {
 	struct octeon_mdiobus *bus;
 	union cvmx_smix_en smi_en;
@@ -188,7 +188,7 @@ static struct platform_driver octeon_mdiobus_driver = {
 		.of_match_table = octeon_mdiobus_match,
 	},
 	.probe		= octeon_mdiobus_probe,
-	.remove		= __devexit_p(octeon_mdiobus_remove),
+	.remove		= octeon_mdiobus_remove,
 };
 
 void octeon_mdiobus_force_mod_depencency(void)
@@ -197,18 +197,7 @@ void octeon_mdiobus_force_mod_depencency(void)
 }
 EXPORT_SYMBOL(octeon_mdiobus_force_mod_depencency);
 
-static int __init octeon_mdiobus_mod_init(void)
-{
-	return platform_driver_register(&octeon_mdiobus_driver);
-}
-
-static void __exit octeon_mdiobus_mod_exit(void)
-{
-	platform_driver_unregister(&octeon_mdiobus_driver);
-}
-
-module_init(octeon_mdiobus_mod_init);
-module_exit(octeon_mdiobus_mod_exit);
+module_platform_driver(octeon_mdiobus_driver);
 
 MODULE_DESCRIPTION(DRV_DESCRIPTION);
 MODULE_VERSION(DRV_VERSION);

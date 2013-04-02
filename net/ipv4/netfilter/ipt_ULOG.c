@@ -37,7 +37,7 @@
 #include <linux/skbuff.h>
 #include <linux/kernel.h>
 #include <linux/timer.h>
-#include <linux/netlink.h>
+#include <net/netlink.h>
 #include <linux/netdevice.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
@@ -88,10 +88,8 @@ static void ulog_send(unsigned int nlgroupnum)
 {
 	ulog_buff_t *ub = &ulog_buffers[nlgroupnum];
 
-	if (timer_pending(&ub->timer)) {
-		pr_debug("ulog_send: timer was pending, deleting\n");
-		del_timer(&ub->timer);
-	}
+	pr_debug("ulog_send: timer is deleting\n");
+	del_timer(&ub->timer);
 
 	if (!ub->skb) {
 		pr_debug("ulog_send: nothing to send\n");
@@ -174,7 +172,7 @@ static void ipt_ulog_packet(unsigned int hooknum,
 	else
 		copy_len = loginfo->copy_range;
 
-	size = NLMSG_SPACE(sizeof(*pm) + copy_len);
+	size = nlmsg_total_size(sizeof(*pm) + copy_len);
 
 	ub = &ulog_buffers[groupnum];
 
@@ -426,10 +424,8 @@ static void __exit ulog_tg_exit(void)
 	/* remove pending timers and free allocated skb's */
 	for (i = 0; i < ULOG_MAXNLGROUPS; i++) {
 		ub = &ulog_buffers[i];
-		if (timer_pending(&ub->timer)) {
-			pr_debug("timer was pending, deleting\n");
-			del_timer(&ub->timer);
-		}
+		pr_debug("timer is deleting\n");
+		del_timer(&ub->timer);
 
 		if (ub->skb) {
 			kfree_skb(ub->skb);

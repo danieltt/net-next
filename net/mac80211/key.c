@@ -204,8 +204,11 @@ static void __ieee80211_set_default_key(struct ieee80211_sub_if_data *sdata,
 	if (idx >= 0 && idx < NUM_DEFAULT_KEYS)
 		key = key_mtx_dereference(sdata->local, sdata->keys[idx]);
 
-	if (uni)
+	if (uni) {
 		rcu_assign_pointer(sdata->default_unicast_key, key);
+		drv_set_default_unicast_key(sdata->local, sdata, idx);
+	}
+
 	if (multi)
 		rcu_assign_pointer(sdata->default_multicast_key, key);
 
@@ -339,7 +342,7 @@ struct ieee80211_key *ieee80211_key_alloc(u32 cipher, int idx, size_t key_len,
 		key->conf.iv_len = TKIP_IV_LEN;
 		key->conf.icv_len = TKIP_ICV_LEN;
 		if (seq) {
-			for (i = 0; i < NUM_RX_DATA_QUEUES; i++) {
+			for (i = 0; i < IEEE80211_NUM_TIDS; i++) {
 				key->u.tkip.rx[i].iv32 =
 					get_unaligned_le32(&seq[2]);
 				key->u.tkip.rx[i].iv16 =
@@ -352,7 +355,7 @@ struct ieee80211_key *ieee80211_key_alloc(u32 cipher, int idx, size_t key_len,
 		key->conf.iv_len = CCMP_HDR_LEN;
 		key->conf.icv_len = CCMP_MIC_LEN;
 		if (seq) {
-			for (i = 0; i < NUM_RX_DATA_QUEUES + 1; i++)
+			for (i = 0; i < IEEE80211_NUM_TIDS + 1; i++)
 				for (j = 0; j < CCMP_PN_LEN; j++)
 					key->u.ccmp.rx_pn[i][j] =
 						seq[CCMP_PN_LEN - j - 1];
@@ -372,8 +375,9 @@ struct ieee80211_key *ieee80211_key_alloc(u32 cipher, int idx, size_t key_len,
 		key->conf.iv_len = 0;
 		key->conf.icv_len = sizeof(struct ieee80211_mmie);
 		if (seq)
-			for (j = 0; j < 6; j++)
-				key->u.aes_cmac.rx_pn[j] = seq[6 - j - 1];
+			for (j = 0; j < CMAC_PN_LEN; j++)
+				key->u.aes_cmac.rx_pn[j] =
+					seq[CMAC_PN_LEN - j - 1];
 		/*
 		 * Initialize AES key state here as an optimization so that
 		 * it does not need to be initialized for every packet.
@@ -393,7 +397,8 @@ struct ieee80211_key *ieee80211_key_alloc(u32 cipher, int idx, size_t key_len,
 	return key;
 }
 
-static void __ieee80211_key_destroy(struct ieee80211_key *key)
+static void __ieee80211_key_destroy(struct ieee80211_key *key,
+				    bool delay_tailroom)
 {
 	if (!key)
 		return;
@@ -412,8 +417,18 @@ static void __ieee80211_key_destroy(struct ieee80211_key *key)
 	if (key->conf.cipher == WLAN_CIPHER_SUITE_AES_CMAC)
 		ieee80211_aes_cmac_key_free(key->u.aes_cmac.tfm);
 	if (key->local) {
+		struct ieee80211_sub_if_data *sdata = key->sdata;
+
 		ieee80211_debugfs_key_remove(key);
-		key->sdata->crypto_tx_tailroom_needed_cnt--;
+
+		if (delay_tailroom) {
+			/* see ieee80211_delayed_tailroom_dec */
+			sdata->crypto_tx_tailroom_pending_dec++;
+			schedule_delayed_work(&sdata->dec_tailroom_needed_wk,
+					      HZ/2);
+		} else {
+			sdata->crypto_tx_tailroom_needed_cnt--;
+		}
 	}
 
 	kfree(key);
@@ -436,32 +451,6 @@ int ieee80211_key_link(struct ieee80211_key *key,
 	key->sdata = sdata;
 	key->sta = sta;
 
-	if (sta) {
-		/*
-		 * some hardware cannot handle TKIP with QoS, so
-		 * we indicate whether QoS could be in use.
-		 */
-		if (test_sta_flag(sta, WLAN_STA_WME))
-			key->conf.flags |= IEEE80211_KEY_FLAG_WMM_STA;
-	} else {
-		if (sdata->vif.type == NL80211_IFTYPE_STATION) {
-			struct sta_info *ap;
-
-			/*
-			 * We're getting a sta pointer in, so must be under
-			 * appropriate locking for sta_info_get().
-			 */
-
-			/* same here, the AP could be using QoS */
-			ap = sta_info_get(key->sdata, key->sdata->u.mgd.bssid);
-			if (ap) {
-				if (test_sta_flag(ap, WLAN_STA_WME))
-					key->conf.flags |=
-						IEEE80211_KEY_FLAG_WMM_STA;
-			}
-		}
-	}
-
 	mutex_lock(&sdata->local->key_mtx);
 
 	if (sta && pairwise)
@@ -474,7 +463,7 @@ int ieee80211_key_link(struct ieee80211_key *key,
 	increment_tailroom_need_count(sdata);
 
 	__ieee80211_key_replace(sdata, sta, pairwise, old_key, key);
-	__ieee80211_key_destroy(old_key);
+	__ieee80211_key_destroy(old_key, true);
 
 	ieee80211_debugfs_key_add(key);
 
@@ -485,7 +474,7 @@ int ieee80211_key_link(struct ieee80211_key *key,
 	return ret;
 }
 
-void __ieee80211_key_free(struct ieee80211_key *key)
+void __ieee80211_key_free(struct ieee80211_key *key, bool delay_tailroom)
 {
 	if (!key)
 		return;
@@ -497,14 +486,14 @@ void __ieee80211_key_free(struct ieee80211_key *key)
 		__ieee80211_key_replace(key->sdata, key->sta,
 				key->conf.flags & IEEE80211_KEY_FLAG_PAIRWISE,
 				key, NULL);
-	__ieee80211_key_destroy(key);
+	__ieee80211_key_destroy(key, delay_tailroom);
 }
 
 void ieee80211_key_free(struct ieee80211_local *local,
 			struct ieee80211_key *key)
 {
 	mutex_lock(&local->key_mtx);
-	__ieee80211_key_free(key);
+	__ieee80211_key_free(key, true);
 	mutex_unlock(&local->key_mtx);
 }
 
@@ -562,36 +551,60 @@ void ieee80211_iter_keys(struct ieee80211_hw *hw,
 }
 EXPORT_SYMBOL(ieee80211_iter_keys);
 
-void ieee80211_disable_keys(struct ieee80211_sub_if_data *sdata)
-{
-	struct ieee80211_key *key;
-
-	ASSERT_RTNL();
-
-	mutex_lock(&sdata->local->key_mtx);
-
-	list_for_each_entry(key, &sdata->key_list, list)
-		ieee80211_key_disable_hw_accel(key);
-
-	mutex_unlock(&sdata->local->key_mtx);
-}
-
 void ieee80211_free_keys(struct ieee80211_sub_if_data *sdata)
 {
 	struct ieee80211_key *key, *tmp;
 
+	cancel_delayed_work_sync(&sdata->dec_tailroom_needed_wk);
+
 	mutex_lock(&sdata->local->key_mtx);
+
+	sdata->crypto_tx_tailroom_needed_cnt -=
+		sdata->crypto_tx_tailroom_pending_dec;
+	sdata->crypto_tx_tailroom_pending_dec = 0;
 
 	ieee80211_debugfs_key_remove_mgmt_default(sdata);
 
 	list_for_each_entry_safe(key, tmp, &sdata->key_list, list)
-		__ieee80211_key_free(key);
+		__ieee80211_key_free(key, false);
 
 	ieee80211_debugfs_key_update_default(sdata);
+
+	WARN_ON_ONCE(sdata->crypto_tx_tailroom_needed_cnt ||
+		     sdata->crypto_tx_tailroom_pending_dec);
 
 	mutex_unlock(&sdata->local->key_mtx);
 }
 
+void ieee80211_delayed_tailroom_dec(struct work_struct *wk)
+{
+	struct ieee80211_sub_if_data *sdata;
+
+	sdata = container_of(wk, struct ieee80211_sub_if_data,
+			     dec_tailroom_needed_wk.work);
+
+	/*
+	 * The reason for the delayed tailroom needed decrementing is to
+	 * make roaming faster: during roaming, all keys are first deleted
+	 * and then new keys are installed. The first new key causes the
+	 * crypto_tx_tailroom_needed_cnt to go from 0 to 1, which invokes
+	 * the cost of synchronize_net() (which can be slow). Avoid this
+	 * by deferring the crypto_tx_tailroom_needed_cnt decrementing on
+	 * key removal for a while, so if we roam the value is larger than
+	 * zero and no 0->1 transition happens.
+	 *
+	 * The cost is that if the AP switching was from an AP with keys
+	 * to one without, we still allocate tailroom while it would no
+	 * longer be needed. However, in the typical (fast) roaming case
+	 * within an ESS this usually won't happen.
+	 */
+
+	mutex_lock(&sdata->local->key_mtx);
+	sdata->crypto_tx_tailroom_needed_cnt -=
+		sdata->crypto_tx_tailroom_pending_dec;
+	sdata->crypto_tx_tailroom_pending_dec = 0;
+	mutex_unlock(&sdata->local->key_mtx);
+}
 
 void ieee80211_gtk_rekey_notify(struct ieee80211_vif *vif, const u8 *bssid,
 				const u8 *replay_ctr, gfp_t gfp)
@@ -654,16 +667,16 @@ void ieee80211_get_key_rx_seq(struct ieee80211_key_conf *keyconf,
 
 	switch (key->conf.cipher) {
 	case WLAN_CIPHER_SUITE_TKIP:
-		if (WARN_ON(tid < 0 || tid >= NUM_RX_DATA_QUEUES))
+		if (WARN_ON(tid < 0 || tid >= IEEE80211_NUM_TIDS))
 			return;
 		seq->tkip.iv32 = key->u.tkip.rx[tid].iv32;
 		seq->tkip.iv16 = key->u.tkip.rx[tid].iv16;
 		break;
 	case WLAN_CIPHER_SUITE_CCMP:
-		if (WARN_ON(tid < -1 || tid >= NUM_RX_DATA_QUEUES))
+		if (WARN_ON(tid < -1 || tid >= IEEE80211_NUM_TIDS))
 			return;
 		if (tid < 0)
-			pn = key->u.ccmp.rx_pn[NUM_RX_DATA_QUEUES];
+			pn = key->u.ccmp.rx_pn[IEEE80211_NUM_TIDS];
 		else
 			pn = key->u.ccmp.rx_pn[tid];
 		memcpy(seq->ccmp.pn, pn, CCMP_PN_LEN);

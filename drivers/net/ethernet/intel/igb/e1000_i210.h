@@ -1,7 +1,7 @@
 /*******************************************************************************
 
   Intel(R) Gigabit Ethernet Linux driver
-  Copyright(c) 2007-2012 Intel Corporation.
+  Copyright(c) 2007-2013 Intel Corporation.
 
   This program is free software; you can redistribute it and/or modify it
   under the terms and conditions of the GNU General Public License,
@@ -83,5 +83,11 @@ enum E1000_INVM_STRUCTURE_TYPE {
 #define ID_LED_DEFAULT_I210_SERDES	((ID_LED_DEF1_DEF2 << 8) | \
 					 (ID_LED_DEF1_DEF2 <<  4) | \
 					 (ID_LED_DEF1_DEF2))
+
+/* NVM offset defaults for i211 device */
+#define NVM_INIT_CTRL_2_DEFAULT_I211	0X7243
+#define NVM_INIT_CTRL_4_DEFAULT_I211	0x00C1
+#define NVM_LED_1_CFG_DEFAULT_I211	0x0184
+#define NVM_LED_0_2_CFG_DEFAULT_I211	0x200C
 
 #endif

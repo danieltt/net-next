@@ -46,6 +46,19 @@ struct llcp_sock_list {
 	rwlock_t          lock;
 };
 
+struct nfc_llcp_sdp_tlv {
+	u8 *tlv;
+	u8 tlv_len;
+
+	char *uri;
+	u8 tid;
+	u8 sap;
+
+	unsigned long time;
+
+	struct hlist_node node;
+};
+
 struct nfc_llcp_local {
 	struct list_head list;
 	struct nfc_dev *dev;
@@ -64,6 +77,9 @@ struct nfc_llcp_local {
 	u32 target_idx;
 	u8 rf_mode;
 	u8 comm_mode;
+	u8 lto;
+	u8 rw;
+	__be16 miux;
 	unsigned long local_wks;      /* Well known services */
 	unsigned long local_sdp;      /* Local services  */
 	unsigned long local_sap; /* Local SAPs, not available for discovery */
@@ -82,6 +98,12 @@ struct nfc_llcp_local {
 	u16 remote_lto;
 	u8  remote_opt;
 	u16 remote_wks;
+
+	struct mutex sdreq_lock;
+	struct hlist_head pending_sdreqs;
+	struct timer_list sdreq_timer;
+	struct work_struct sdreq_timeout_work;
+	u8 sdreq_next_tid;
 
 	/* sockets array */
 	struct llcp_sock_list sockets;
@@ -102,7 +124,12 @@ struct nfc_llcp_sock {
 	char *service_name;
 	size_t service_name_len;
 	u8 rw;
-	u16 miu;
+	u16 miux;
+
+
+	/* Remote link parameters */
+	u8 remote_rw;
+	u16 remote_miu;
 
 	/* Link variables */
 	u8 send_n;
@@ -118,11 +145,17 @@ struct nfc_llcp_sock {
 
 	struct sk_buff_head tx_queue;
 	struct sk_buff_head tx_pending_queue;
-	struct sk_buff_head tx_backlog_queue;
 
 	struct list_head accept_queue;
 	struct sock *parent;
 };
+
+struct nfc_llcp_ui_cb {
+	__u8 dsap;
+	__u8 ssap;
+};
+
+#define nfc_llcp_ui_skb_cb(__skb) ((struct nfc_llcp_ui_cb *)&((__skb)->cb[0]))
 
 #define nfc_llcp_sock(sk) ((struct nfc_llcp_sock *) (sk))
 #define nfc_llcp_dev(sk)  (nfc_llcp_sock((sk))->dev)
@@ -204,15 +237,26 @@ int nfc_llcp_parse_connection_tlv(struct nfc_llcp_sock *sock,
 /* Commands API */
 void nfc_llcp_recv(void *data, struct sk_buff *skb, int err);
 u8 *nfc_llcp_build_tlv(u8 type, u8 *value, u8 value_length, u8 *tlv_length);
+struct nfc_llcp_sdp_tlv *nfc_llcp_build_sdres_tlv(u8 tid, u8 sap);
+struct nfc_llcp_sdp_tlv *nfc_llcp_build_sdreq_tlv(u8 tid, char *uri,
+						  size_t uri_len);
+void nfc_llcp_free_sdp_tlv(struct nfc_llcp_sdp_tlv *sdp);
+void nfc_llcp_free_sdp_tlv_list(struct hlist_head *sdp_head);
 void nfc_llcp_recv(void *data, struct sk_buff *skb, int err);
 int nfc_llcp_disconnect(struct nfc_llcp_sock *sock);
 int nfc_llcp_send_symm(struct nfc_dev *dev);
 int nfc_llcp_send_connect(struct nfc_llcp_sock *sock);
 int nfc_llcp_send_cc(struct nfc_llcp_sock *sock);
+int nfc_llcp_send_snl_sdres(struct nfc_llcp_local *local,
+			    struct hlist_head *tlv_list, size_t tlvs_len);
+int nfc_llcp_send_snl_sdreq(struct nfc_llcp_local *local,
+			    struct hlist_head *tlv_list, size_t tlvs_len);
 int nfc_llcp_send_dm(struct nfc_llcp_local *local, u8 ssap, u8 dsap, u8 reason);
 int nfc_llcp_send_disconnect(struct nfc_llcp_sock *sock);
 int nfc_llcp_send_i_frame(struct nfc_llcp_sock *sock,
 			  struct msghdr *msg, size_t len);
+int nfc_llcp_send_ui_frame(struct nfc_llcp_sock *sock, u8 ssap, u8 dsap,
+			   struct msghdr *msg, size_t len);
 int nfc_llcp_send_rr(struct nfc_llcp_sock *sock);
 
 /* Socket API */
