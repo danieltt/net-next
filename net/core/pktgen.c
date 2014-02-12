@@ -2152,7 +2152,7 @@ out:
 
 static int pgrx_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, pgrx_show, PDE(inode)->data);
+	return single_open(file, pgrx_show, PDE_DATA(inode));
 }
 
 static const struct file_operations pktgen_rx_fops = {
