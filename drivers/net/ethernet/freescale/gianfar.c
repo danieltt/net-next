@@ -128,6 +128,7 @@ static void gfar_set_multi(struct net_device *dev);
 static void gfar_set_hash_for_addr(struct net_device *dev, u8 *addr);
 static void gfar_configure_serdes(struct net_device *dev);
 static int gfar_poll(struct napi_struct *napi, int budget);
+static int gfar_poll_sq(struct napi_struct *napi, int budget);
 #ifdef CONFIG_NET_POLL_CONTROLLER
 static void gfar_netpoll(struct net_device *dev);
 #endif
@@ -386,7 +387,7 @@ static void gfar_init_mac(struct net_device *ndev)
 		priv->uses_rxfcb = 1;
 	}
 
-	if (ndev->features & NETIF_F_HW_VLAN_RX) {
+	if (ndev->features & NETIF_F_HW_VLAN_CTAG_RX) {
 		rctrl |= RCTRL_VLEX | RCTRL_PRSDEP_INIT;
 		priv->uses_rxfcb = 1;
 	}
@@ -1000,7 +1001,7 @@ static int gfar_probe(struct platform_device *ofdev)
 	spin_lock_init(&priv->bflock);
 	INIT_WORK(&priv->reset_task, gfar_reset_task);
 
-	dev_set_drvdata(&ofdev->dev, priv);
+	platform_set_drvdata(ofdev, priv);
 	regs = priv->gfargrp[0].regs;
 
 	gfar_detect_errata(priv);
@@ -1038,9 +1039,13 @@ static int gfar_probe(struct platform_device *ofdev)
 	dev->ethtool_ops = &gfar_ethtool_ops;
 
 	/* Register for napi ...We are registering NAPI for each grp */
-	for (i = 0; i < priv->num_grps; i++)
-		netif_napi_add(dev, &priv->gfargrp[i].napi, gfar_poll,
+	if (priv->mode == SQ_SG_MODE)
+		netif_napi_add(dev, &priv->gfargrp[0].napi, gfar_poll_sq,
 			       GFAR_DEV_WEIGHT);
+	else
+		for (i = 0; i < priv->num_grps; i++)
+			netif_napi_add(dev, &priv->gfargrp[i].napi, gfar_poll,
+				       GFAR_DEV_WEIGHT);
 
 	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_CSUM) {
 		dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_SG |
@@ -1050,8 +1055,9 @@ static int gfar_probe(struct platform_device *ofdev)
 	}
 
 	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_VLAN) {
-		dev->hw_features |= NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_RX;
-		dev->features |= NETIF_F_HW_VLAN_RX;
+		dev->hw_features |= NETIF_F_HW_VLAN_CTAG_TX |
+				    NETIF_F_HW_VLAN_CTAG_RX;
+		dev->features |= NETIF_F_HW_VLAN_CTAG_RX;
 	}
 
 	if (priv->device_flags & FSL_GIANFAR_DEV_HAS_EXTENDED_HASH) {
@@ -1239,14 +1245,12 @@ register_fail:
 
 static int gfar_remove(struct platform_device *ofdev)
 {
-	struct gfar_private *priv = dev_get_drvdata(&ofdev->dev);
+	struct gfar_private *priv = platform_get_drvdata(ofdev);
 
 	if (priv->phy_node)
 		of_node_put(priv->phy_node);
 	if (priv->tbi_node)
 		of_node_put(priv->tbi_node);
-
-	dev_set_drvdata(&ofdev->dev, NULL);
 
 	unregister_netdev(priv->ndev);
 	unmap_group_regs(priv);
@@ -2348,7 +2352,7 @@ void gfar_vlan_mode(struct net_device *dev, netdev_features_t features)
 	local_irq_save(flags);
 	lock_rx_qs(priv);
 
-	if (features & NETIF_F_HW_VLAN_TX) {
+	if (features & NETIF_F_HW_VLAN_CTAG_TX) {
 		/* Enable VLAN tag insertion */
 		tempval = gfar_read(&regs->tctrl);
 		tempval |= TCTRL_VLINS;
@@ -2360,7 +2364,7 @@ void gfar_vlan_mode(struct net_device *dev, netdev_features_t features)
 		gfar_write(&regs->tctrl, tempval);
 	}
 
-	if (features & NETIF_F_HW_VLAN_RX) {
+	if (features & NETIF_F_HW_VLAN_CTAG_RX) {
 		/* Enable VLAN tag extraction */
 		tempval = gfar_read(&regs->rctrl);
 		tempval |= (RCTRL_VLEX | RCTRL_PRSDEP_INIT);
@@ -2724,13 +2728,13 @@ static void gfar_process_frame(struct net_device *dev, struct sk_buff *skb,
 	/* Tell the skb what kind of packet this is */
 	skb->protocol = eth_type_trans(skb, dev);
 
-	/* There's need to check for NETIF_F_HW_VLAN_RX here.
+	/* There's need to check for NETIF_F_HW_VLAN_CTAG_RX here.
 	 * Even if vlan rx accel is disabled, on some chips
 	 * RXFCB_VLN is pseudo randomly set.
 	 */
-	if (dev->features & NETIF_F_HW_VLAN_RX &&
+	if (dev->features & NETIF_F_HW_VLAN_CTAG_RX &&
 	    fcb->flags & RXFCB_VLN)
-		__vlan_hwaccel_put_tag(skb, fcb->vlctl);
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), fcb->vlctl);
 
 	/* Send the packet up the stack */
 	napi_gro_receive(napi, skb);
@@ -2822,6 +2826,48 @@ int gfar_clean_rx_ring(struct gfar_priv_rx_q *rx_queue, int rx_work_limit)
 	rx_queue->cur_rx = bdp;
 
 	return howmany;
+}
+
+static int gfar_poll_sq(struct napi_struct *napi, int budget)
+{
+	struct gfar_priv_grp *gfargrp =
+		container_of(napi, struct gfar_priv_grp, napi);
+	struct gfar __iomem *regs = gfargrp->regs;
+	struct gfar_priv_tx_q *tx_queue = gfargrp->priv->tx_queue[0];
+	struct gfar_priv_rx_q *rx_queue = gfargrp->priv->rx_queue[0];
+	int work_done = 0;
+
+	/* Clear IEVENT, so interrupts aren't called again
+	 * because of the packets that have already arrived
+	 */
+	gfar_write(&regs->ievent, IEVENT_RTX_MASK);
+
+	/* run Tx cleanup to completion */
+	if (tx_queue->tx_skbuff[tx_queue->skb_dirtytx])
+		gfar_clean_tx_ring(tx_queue);
+
+	work_done = gfar_clean_rx_ring(rx_queue, budget);
+
+	if (work_done < budget) {
+		napi_complete(napi);
+		/* Clear the halt bit in RSTAT */
+		gfar_write(&regs->rstat, gfargrp->rstat);
+
+		gfar_write(&regs->imask, IMASK_DEFAULT);
+
+		/* If we are coalescing interrupts, update the timer
+		 * Otherwise, clear it
+		 */
+		gfar_write(&regs->txic, 0);
+		if (likely(tx_queue->txcoalescing))
+			gfar_write(&regs->txic, tx_queue->txic);
+
+		gfar_write(&regs->rxic, 0);
+		if (unlikely(rx_queue->rxcoalescing))
+			gfar_write(&regs->rxic, rx_queue->rxic);
+	}
+
+	return work_done;
 }
 
 static int gfar_poll(struct napi_struct *napi, int budget)

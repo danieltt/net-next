@@ -29,7 +29,6 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_net.h>
-#include <linux/pinctrl/consumer.h>
 
 #include "macb.h"
 
@@ -299,42 +298,7 @@ static const struct of_device_id at91ether_dt_ids[] = {
 	{ .compatible = "cdns,emac" },
 	{ /* sentinel */ }
 };
-
 MODULE_DEVICE_TABLE(of, at91ether_dt_ids);
-
-static int at91ether_get_phy_mode_dt(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-
-	if (np)
-		return of_get_phy_mode(np);
-
-	return -ENODEV;
-}
-
-static int at91ether_get_hwaddr_dt(struct macb *bp)
-{
-	struct device_node *np = bp->pdev->dev.of_node;
-
-	if (np) {
-		const char *mac = of_get_mac_address(np);
-		if (mac) {
-			memcpy(bp->dev->dev_addr, mac, ETH_ALEN);
-			return 0;
-		}
-	}
-
-	return -ENODEV;
-}
-#else
-static int at91ether_get_phy_mode_dt(struct platform_device *pdev)
-{
-	return -ENODEV;
-}
-static int at91ether_get_hwaddr_dt(struct macb *bp)
-{
-	return -ENODEV;
-}
 #endif
 
 /* Detect MAC & PHY and perform ethernet interface initialization */
@@ -344,23 +308,14 @@ static int __init at91ether_probe(struct platform_device *pdev)
 	struct resource *regs;
 	struct net_device *dev;
 	struct phy_device *phydev;
-	struct pinctrl *pinctrl;
 	struct macb *lp;
 	int res;
 	u32 reg;
+	const char *mac;
 
 	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!regs)
 		return -ENOENT;
-
-	pinctrl = devm_pinctrl_get_select_default(&pdev->dev);
-	if (IS_ERR(pinctrl)) {
-		res = PTR_ERR(pinctrl);
-		if (res == -EPROBE_DEFER)
-			return res;
-
-		dev_warn(&pdev->dev, "No pinctrl provided\n");
-	}
 
 	dev = alloc_etherdev(sizeof(struct macb));
 	if (!dev)
@@ -399,11 +354,13 @@ static int __init at91ether_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, dev);
 	SET_NETDEV_DEV(dev, &pdev->dev);
 
-	res = at91ether_get_hwaddr_dt(lp);
-	if (res < 0)
+	mac = of_get_mac_address(pdev->dev.of_node);
+	if (mac)
+		memcpy(lp->dev->dev_addr, mac, ETH_ALEN);
+	else
 		macb_get_hwaddr(lp);
 
-	res = at91ether_get_phy_mode_dt(pdev);
+	res = of_get_phy_mode(pdev->dev.of_node);
 	if (res < 0) {
 		if (board_data && board_data->is_rmii)
 			lp->phy_interface = PHY_INTERFACE_MODE_RMII;
@@ -426,7 +383,8 @@ static int __init at91ether_probe(struct platform_device *pdev)
 	if (res)
 		goto err_disable_clock;
 
-	if (macb_mii_init(lp) != 0)
+	res = macb_mii_init(lp);
+	if (res)
 		goto err_out_unregister_netdev;
 
 	/* will be enabled in open() */
@@ -466,7 +424,6 @@ static int at91ether_remove(struct platform_device *pdev)
 	unregister_netdev(dev);
 	clk_disable(lp->pclk);
 	free_netdev(dev);
-	platform_set_drvdata(pdev, NULL);
 
 	return 0;
 }

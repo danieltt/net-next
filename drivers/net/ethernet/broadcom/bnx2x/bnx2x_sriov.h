@@ -197,7 +197,7 @@ struct bnx2x_virtf {
 
 	u8 state;
 #define VF_FREE		0	/* VF ready to be acquired holds no resc */
-#define VF_ACQUIRED	1	/* VF aquired, but not initalized */
+#define VF_ACQUIRED	1	/* VF acquired, but not initialized */
 #define VF_ENABLED	2	/* VF Enabled */
 #define VF_RESET	3	/* VF FLR'd, pending cleanup */
 
@@ -496,7 +496,7 @@ enum {
 		else if ((next) == VFOP_VERIFY_PEND)			\
 			BNX2X_ERR("expected pending\n");		\
 		else {							\
-			DP(BNX2X_MSG_IOV, "no ramrod. scheduling\n");	\
+			DP(BNX2X_MSG_IOV, "no ramrod. Scheduling\n");	\
 			atomic_set(&vf->op_in_progress, 1);		\
 			queue_delayed_work(bnx2x_wq, &bp->sp_task, 0);  \
 			return;						\
@@ -722,7 +722,6 @@ u32 bnx2x_crc_vf_bulletin(struct bnx2x *bp,
 			  struct pf_vf_bulletin_content *bulletin);
 int bnx2x_post_vf_bulletin(struct bnx2x *bp, int vf);
 
-
 enum sample_bulletin_result bnx2x_sample_bulletin(struct bnx2x *bp);
 
 /* VF side vfpf channel functions */
@@ -733,7 +732,7 @@ int bnx2x_vfpf_init(struct bnx2x *bp);
 void bnx2x_vfpf_close_vf(struct bnx2x *bp);
 int bnx2x_vfpf_setup_q(struct bnx2x *bp, int fp_idx);
 int bnx2x_vfpf_teardown_queue(struct bnx2x *bp, int qidx);
-int bnx2x_vfpf_set_mac(struct bnx2x *bp);
+int bnx2x_vfpf_config_mac(struct bnx2x *bp, u8 *addr, u8 vf_qid, bool set);
 int bnx2x_vfpf_set_mcast(struct net_device *dev);
 int bnx2x_vfpf_storm_rx_mode(struct bnx2x *bp);
 
@@ -752,6 +751,7 @@ static inline int bnx2x_vf_ustorm_prods_offset(struct bnx2x *bp,
 }
 
 enum sample_bulletin_result bnx2x_sample_bulletin(struct bnx2x *bp);
+void bnx2x_timer_sriov(struct bnx2x *bp);
 void __iomem *bnx2x_vf_doorbells(struct bnx2x *bp);
 int bnx2x_vf_pci_alloc(struct bnx2x *bp);
 int bnx2x_enable_sriov(struct bnx2x *bp);
@@ -762,6 +762,7 @@ static inline int bnx2x_vf_headroom(struct bnx2x *bp)
 }
 void bnx2x_pf_set_vfs_vlan(struct bnx2x *bp);
 int bnx2x_sriov_configure(struct pci_dev *dev, int num_vfs);
+void bnx2x_iov_channel_down(struct bnx2x *bp);
 int bnx2x_open_epilog(struct bnx2x *bp);
 
 #else /* CONFIG_BNX2X_SRIOV */
@@ -794,7 +795,8 @@ static inline int bnx2x_vfpf_init(struct bnx2x *bp) {return 0; }
 static inline void bnx2x_vfpf_close_vf(struct bnx2x *bp) {}
 static inline int bnx2x_vfpf_setup_q(struct bnx2x *bp, int fp_idx) {return 0; }
 static inline int bnx2x_vfpf_teardown_queue(struct bnx2x *bp, int qidx) {return 0; }
-static inline int bnx2x_vfpf_set_mac(struct bnx2x *bp) {return 0; }
+static inline int bnx2x_vfpf_config_mac(struct bnx2x *bp, u8 *addr,
+					u8 vf_qid, bool set) {return 0; }
 static inline int bnx2x_vfpf_set_mcast(struct net_device *dev) {return 0; }
 static inline int bnx2x_vfpf_storm_rx_mode(struct bnx2x *bp) {return 0; }
 static inline int bnx2x_iov_nic_init(struct bnx2x *bp) {return 0; }
@@ -808,6 +810,7 @@ static inline enum sample_bulletin_result bnx2x_sample_bulletin(struct bnx2x *bp
 {
 	return PFVF_BULLETIN_UNCHANGED;
 }
+static inline void bnx2x_timer_sriov(struct bnx2x *bp) {}
 
 static inline void __iomem *bnx2x_vf_doorbells(struct bnx2x *bp)
 {
@@ -817,6 +820,7 @@ static inline void __iomem *bnx2x_vf_doorbells(struct bnx2x *bp)
 static inline int bnx2x_vf_pci_alloc(struct bnx2x *bp) {return 0; }
 static inline void bnx2x_pf_set_vfs_vlan(struct bnx2x *bp) {}
 static inline int bnx2x_sriov_configure(struct pci_dev *dev, int num_vfs) {return 0; }
+static inline void bnx2x_iov_channel_down(struct bnx2x *bp) {}
 static inline int bnx2x_open_epilog(struct bnx2x *bp) {return 0; }
 
 #endif /* CONFIG_BNX2X_SRIOV */

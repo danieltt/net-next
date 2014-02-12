@@ -24,6 +24,7 @@
 #include "main.h"
 #include "wmm.h"
 #include "11n.h"
+#include "11ac.h"
 
 /*
  * This function prepares command to set/get RSSI information.
@@ -1133,6 +1134,55 @@ mwifiex_cmd_mef_cfg(struct mwifiex_private *priv,
 	return 0;
 }
 
+/* This function parse cal data from ASCII to hex */
+static u32 mwifiex_parse_cal_cfg(u8 *src, size_t len, u8 *dst)
+{
+	u8 *s = src, *d = dst;
+
+	while (s - src < len) {
+		if (*s && (isspace(*s) || *s == '\t')) {
+			s++;
+			continue;
+		}
+		if (isxdigit(*s)) {
+			*d++ = simple_strtol(s, NULL, 16);
+			s += 2;
+		} else {
+			s++;
+		}
+	}
+
+	return d - dst;
+}
+
+/* This function prepares command of set_cfg_data. */
+static int mwifiex_cmd_cfg_data(struct mwifiex_private *priv,
+				struct host_cmd_ds_command *cmd,
+				u16 cmd_action)
+{
+	struct host_cmd_ds_802_11_cfg_data *cfg_data = &cmd->params.cfg_data;
+	struct mwifiex_adapter *adapter = priv->adapter;
+	u32 len, cal_data_offset;
+	u8 *tmp_cmd = (u8 *)cmd;
+
+	cal_data_offset = S_DS_GEN + sizeof(*cfg_data);
+	if ((adapter->cal_data->data) && (adapter->cal_data->size > 0))
+		len = mwifiex_parse_cal_cfg((u8 *)adapter->cal_data->data,
+					    adapter->cal_data->size,
+					    (u8 *)(tmp_cmd + cal_data_offset));
+	else
+		return -1;
+
+	cfg_data->action = cpu_to_le16(cmd_action);
+	cfg_data->type = cpu_to_le16(CFG_DATA_TYPE_CAL);
+	cfg_data->data_len = cpu_to_le16(len);
+
+	cmd->command = cpu_to_le16(HostCmd_CMD_CFG_DATA);
+	cmd->size = cpu_to_le16(S_DS_GEN + sizeof(*cfg_data) + len);
+
+	return 0;
+}
+
 /*
  * This function prepares the commands before sending them to the firmware.
  *
@@ -1150,6 +1200,9 @@ int mwifiex_sta_prepare_cmd(struct mwifiex_private *priv, uint16_t cmd_no,
 	switch (cmd_no) {
 	case HostCmd_CMD_GET_HW_SPEC:
 		ret = mwifiex_cmd_get_hw_spec(priv, cmd_ptr);
+		break;
+	case HostCmd_CMD_CFG_DATA:
+		ret = mwifiex_cmd_cfg_data(priv, cmd_ptr, cmd_action);
 		break;
 	case HostCmd_CMD_MAC_CONTROL:
 		ret = mwifiex_cmd_mac_control(priv, cmd_ptr, cmd_action,
@@ -1257,6 +1310,9 @@ int mwifiex_sta_prepare_cmd(struct mwifiex_private *priv, uint16_t cmd_no,
 		cmd_ptr->size =
 		      cpu_to_le16(sizeof(struct host_cmd_ds_remain_on_chan) +
 				  S_DS_GEN);
+		break;
+	case HostCmd_CMD_11AC_CFG:
+		ret = mwifiex_cmd_11ac_cfg(priv, cmd_ptr, cmd_action, data_buf);
 		break;
 	case HostCmd_CMD_P2P_MODE_CFG:
 		cmd_ptr->command = cpu_to_le16(cmd_no);
@@ -1380,6 +1436,7 @@ int mwifiex_sta_prepare_cmd(struct mwifiex_private *priv, uint16_t cmd_no,
  */
 int mwifiex_sta_init_cmd(struct mwifiex_private *priv, u8 first_sta)
 {
+	struct mwifiex_adapter *adapter = priv->adapter;
 	int ret;
 	u16 enable = true;
 	struct mwifiex_ds_11n_amsdu_aggr_ctrl amsdu_aggr_ctrl;
@@ -1400,6 +1457,15 @@ int mwifiex_sta_init_cmd(struct mwifiex_private *priv, u8 first_sta)
 					    HostCmd_ACT_GEN_SET, 0, NULL);
 		if (ret)
 			return -1;
+
+		/* Download calibration data to firmware */
+		if (adapter->cal_data) {
+			ret = mwifiex_send_cmd_sync(priv, HostCmd_CMD_CFG_DATA,
+						HostCmd_ACT_GEN_SET, 0, NULL);
+			if (ret)
+				return -1;
+		}
+
 		/* Read MAC address from HW */
 		ret = mwifiex_send_cmd_sync(priv, HostCmd_CMD_GET_HW_SPEC,
 					    HostCmd_ACT_GEN_GET, 0, NULL);

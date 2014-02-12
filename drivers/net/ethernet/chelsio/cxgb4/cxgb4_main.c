@@ -229,44 +229,44 @@ static DEFINE_PCI_DEVICE_TABLE(cxgb4_pci_tbl) = {
 	CH_DEVICE(0x440a, 4),
 	CH_DEVICE(0x440d, 4),
 	CH_DEVICE(0x440e, 4),
-	CH_DEVICE(0x5001, 5),
-	CH_DEVICE(0x5002, 5),
-	CH_DEVICE(0x5003, 5),
-	CH_DEVICE(0x5004, 5),
-	CH_DEVICE(0x5005, 5),
-	CH_DEVICE(0x5006, 5),
-	CH_DEVICE(0x5007, 5),
-	CH_DEVICE(0x5008, 5),
-	CH_DEVICE(0x5009, 5),
-	CH_DEVICE(0x500A, 5),
-	CH_DEVICE(0x500B, 5),
-	CH_DEVICE(0x500C, 5),
-	CH_DEVICE(0x500D, 5),
-	CH_DEVICE(0x500E, 5),
-	CH_DEVICE(0x500F, 5),
-	CH_DEVICE(0x5010, 5),
-	CH_DEVICE(0x5011, 5),
-	CH_DEVICE(0x5012, 5),
-	CH_DEVICE(0x5013, 5),
-	CH_DEVICE(0x5401, 5),
-	CH_DEVICE(0x5402, 5),
-	CH_DEVICE(0x5403, 5),
-	CH_DEVICE(0x5404, 5),
-	CH_DEVICE(0x5405, 5),
-	CH_DEVICE(0x5406, 5),
-	CH_DEVICE(0x5407, 5),
-	CH_DEVICE(0x5408, 5),
-	CH_DEVICE(0x5409, 5),
-	CH_DEVICE(0x540A, 5),
-	CH_DEVICE(0x540B, 5),
-	CH_DEVICE(0x540C, 5),
-	CH_DEVICE(0x540D, 5),
-	CH_DEVICE(0x540E, 5),
-	CH_DEVICE(0x540F, 5),
-	CH_DEVICE(0x5410, 5),
-	CH_DEVICE(0x5411, 5),
-	CH_DEVICE(0x5412, 5),
-	CH_DEVICE(0x5413, 5),
+	CH_DEVICE(0x5001, 4),
+	CH_DEVICE(0x5002, 4),
+	CH_DEVICE(0x5003, 4),
+	CH_DEVICE(0x5004, 4),
+	CH_DEVICE(0x5005, 4),
+	CH_DEVICE(0x5006, 4),
+	CH_DEVICE(0x5007, 4),
+	CH_DEVICE(0x5008, 4),
+	CH_DEVICE(0x5009, 4),
+	CH_DEVICE(0x500A, 4),
+	CH_DEVICE(0x500B, 4),
+	CH_DEVICE(0x500C, 4),
+	CH_DEVICE(0x500D, 4),
+	CH_DEVICE(0x500E, 4),
+	CH_DEVICE(0x500F, 4),
+	CH_DEVICE(0x5010, 4),
+	CH_DEVICE(0x5011, 4),
+	CH_DEVICE(0x5012, 4),
+	CH_DEVICE(0x5013, 4),
+	CH_DEVICE(0x5401, 4),
+	CH_DEVICE(0x5402, 4),
+	CH_DEVICE(0x5403, 4),
+	CH_DEVICE(0x5404, 4),
+	CH_DEVICE(0x5405, 4),
+	CH_DEVICE(0x5406, 4),
+	CH_DEVICE(0x5407, 4),
+	CH_DEVICE(0x5408, 4),
+	CH_DEVICE(0x5409, 4),
+	CH_DEVICE(0x540A, 4),
+	CH_DEVICE(0x540B, 4),
+	CH_DEVICE(0x540C, 4),
+	CH_DEVICE(0x540D, 4),
+	CH_DEVICE(0x540E, 4),
+	CH_DEVICE(0x540F, 4),
+	CH_DEVICE(0x5410, 4),
+	CH_DEVICE(0x5411, 4),
+	CH_DEVICE(0x5412, 4),
+	CH_DEVICE(0x5413, 4),
 	{ 0, }
 };
 
@@ -559,7 +559,7 @@ static int link_start(struct net_device *dev)
 	 * that step explicitly.
 	 */
 	ret = t4_set_rxmode(pi->adapter, mb, pi->viid, dev->mtu, -1, -1, -1,
-			    !!(dev->features & NETIF_F_HW_VLAN_RX), true);
+			    !!(dev->features & NETIF_F_HW_VLAN_CTAG_RX), true);
 	if (ret == 0) {
 		ret = t4_change_mac(pi->adapter, mb, pi->viid,
 				    pi->xact_addr_filt, dev->dev_addr, true,
@@ -645,6 +645,21 @@ static int fwevtq_handler(struct sge_rspq *q, const __be64 *rsp,
 	u8 opcode = ((const struct rss_header *)rsp)->opcode;
 
 	rsp++;                                          /* skip RSS header */
+
+	/* FW can send EGR_UPDATEs encapsulated in a CPL_FW4_MSG.
+	 */
+	if (unlikely(opcode == CPL_FW4_MSG &&
+	   ((const struct cpl_fw4_msg *)rsp)->type == FW_TYPE_RSSCPL)) {
+		rsp++;
+		opcode = ((const struct rss_header *)rsp)->opcode;
+		rsp++;
+		if (opcode != CPL_SGE_EGR_UPDATE) {
+			dev_err(q->adap->pdev_dev, "unexpected FW4/CPL %#x on FW event queue\n"
+				, opcode);
+			goto out;
+		}
+	}
+
 	if (likely(opcode == CPL_SGE_EGR_UPDATE)) {
 		const struct cpl_sge_egr_update *p = (void *)rsp;
 		unsigned int qid = EGR_QID(ntohl(p->opcode_qid));
@@ -679,6 +694,7 @@ static int fwevtq_handler(struct sge_rspq *q, const __be64 *rsp,
 	} else
 		dev_err(q->adap->pdev_dev,
 			"unexpected CPL %#x on FW event queue\n", opcode);
+out:
 	return 0;
 }
 
@@ -695,6 +711,12 @@ static int uldrx_handler(struct sge_rspq *q, const __be64 *rsp,
 			 const struct pkt_gl *gl)
 {
 	struct sge_ofld_rxq *rxq = container_of(q, struct sge_ofld_rxq, rspq);
+
+	/* FW can send CPLs encapsulated in a CPL_FW4_MSG.
+	 */
+	if (((const struct rss_header *)rsp)->opcode == CPL_FW4_MSG &&
+	    ((const struct cpl_fw4_msg *)(rsp + 1))->type == FW_TYPE_RSSCPL)
+		rsp += 2;
 
 	if (ulds[q->uld].rx_handler(q->adap->uld_handle[q->uld], rsp, gl)) {
 		rxq->stats.nomem++;
@@ -2722,14 +2744,14 @@ static int cxgb_set_features(struct net_device *dev, netdev_features_t features)
 	netdev_features_t changed = dev->features ^ features;
 	int err;
 
-	if (!(changed & NETIF_F_HW_VLAN_RX))
+	if (!(changed & NETIF_F_HW_VLAN_CTAG_RX))
 		return 0;
 
 	err = t4_set_rxmode(pi->adapter, pi->adapter->fn, pi->viid, -1,
 			    -1, -1, -1,
-			    !!(features & NETIF_F_HW_VLAN_RX), true);
+			    !!(features & NETIF_F_HW_VLAN_CTAG_RX), true);
 	if (unlikely(err))
-		dev->features = features ^ NETIF_F_HW_VLAN_RX;
+		dev->features = features ^ NETIF_F_HW_VLAN_CTAG_RX;
 	return err;
 }
 
@@ -4820,8 +4842,17 @@ static int adap_init0(struct adapter *adap)
 	 * is excessively mismatched relative to the driver.)
 	 */
 	ret = t4_check_fw_version(adap);
+
+	/* The error code -EFAULT is returned by t4_check_fw_version() if
+	 * firmware on adapter < supported firmware. If firmware on adapter
+	 * is too old (not supported by driver) and we're the MASTER_PF set
+	 * adapter state to DEV_STATE_UNINIT to force firmware upgrade
+	 * and reinitialization.
+	 */
+	if ((adap->flags & MASTER_PF) && ret == -EFAULT)
+		state = DEV_STATE_UNINIT;
 	if ((adap->flags & MASTER_PF) && state != DEV_STATE_INIT) {
-		if (ret == -EINVAL || ret > 0) {
+		if (ret == -EINVAL || ret == -EFAULT || ret > 0) {
 			if (upgrade_fw(adap) >= 0) {
 				/*
 				 * Note that the chip was reset as part of the
@@ -4830,7 +4861,21 @@ static int adap_init0(struct adapter *adap)
 				 */
 				reset = 0;
 				ret = t4_check_fw_version(adap);
-			}
+			} else
+				if (ret == -EFAULT) {
+					/*
+					 * Firmware is old but still might
+					 * work if we force reinitialization
+					 * of the adapter. Ignoring FW upgrade
+					 * failure.
+					 */
+					dev_warn(adap->pdev_dev,
+						 "Ignoring firmware upgrade "
+						 "failure, and forcing driver "
+						 "to reinitialize the "
+						 "adapter.\n");
+					ret = 0;
+				}
 		}
 		if (ret < 0)
 			return ret;
@@ -4989,6 +5034,15 @@ static int adap_init0(struct adapter *adap)
 		adap->tids.aftid_base = val[0];
 		adap->tids.aftid_end = val[1];
 	}
+
+	/* If we're running on newer firmware, let it know that we're
+	 * prepared to deal with encapsulated CPL messages.  Older
+	 * firmware won't understand this and we'll just get
+	 * unencapsulated messages ...
+	 */
+	params[0] = FW_PARAM_PFVF(CPLFW4MSG_ENCAP);
+	val[0] = 1;
+	(void) t4_set_params(adap, adap->mbox, adap->fn, 0, 1, params, val);
 
 	/*
 	 * Get device capabilities so we can determine what resources we need
@@ -5173,7 +5227,7 @@ static pci_ers_result_t eeh_slot_reset(struct pci_dev *pdev)
 
 	if (t4_wait_dev_ready(adap) < 0)
 		return PCI_ERS_RESULT_DISCONNECT;
-	if (t4_fw_hello(adap, adap->fn, adap->fn, MASTER_MUST, NULL))
+	if (t4_fw_hello(adap, adap->fn, adap->fn, MASTER_MUST, NULL) < 0)
 		return PCI_ERS_RESULT_DISCONNECT;
 	adap->flags |= FW_OK;
 	if (adap_init1(adap, &c))
@@ -5628,7 +5682,7 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		netdev->hw_features = NETIF_F_SG | TSO_FLAGS |
 			NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			NETIF_F_RXCSUM | NETIF_F_RXHASH |
-			NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_RX;
+			NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
 		if (highdma)
 			netdev->hw_features |= NETIF_F_HIGHDMA;
 		netdev->features |= netdev->hw_features;

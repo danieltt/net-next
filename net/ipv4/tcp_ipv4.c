@@ -75,6 +75,7 @@
 #include <net/netdma.h>
 #include <net/secure_seq.h>
 #include <net/tcp_memcontrol.h>
+#include <net/busy_poll.h>
 
 #include <linux/inet.h>
 #include <linux/ipv6.h>
@@ -545,8 +546,7 @@ out:
 	sock_put(sk);
 }
 
-static void __tcp_v4_send_check(struct sk_buff *skb,
-				__be32 saddr, __be32 daddr)
+void __tcp_v4_send_check(struct sk_buff *skb, __be32 saddr, __be32 daddr)
 {
 	struct tcphdr *th = tcp_hdr(skb);
 
@@ -570,23 +570,6 @@ void tcp_v4_send_check(struct sock *sk, struct sk_buff *skb)
 	__tcp_v4_send_check(skb, inet->inet_saddr, inet->inet_daddr);
 }
 EXPORT_SYMBOL(tcp_v4_send_check);
-
-int tcp_v4_gso_send_check(struct sk_buff *skb)
-{
-	const struct iphdr *iph;
-	struct tcphdr *th;
-
-	if (!pskb_may_pull(skb, sizeof(*th)))
-		return -EINVAL;
-
-	iph = ip_hdr(skb);
-	th = tcp_hdr(skb);
-
-	th->check = 0;
-	skb->ip_summed = CHECKSUM_PARTIAL;
-	__tcp_v4_send_check(skb, iph->saddr, iph->daddr);
-	return 0;
-}
 
 /*
  *	This routine will send an RST to the other tcp.
@@ -1003,7 +986,7 @@ int tcp_md5_do_add(struct sock *sk, const union tcp_md5_addr *addr,
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_md5sig_info *md5sig;
 
-	key = tcp_md5_do_lookup(sk, (union tcp_md5_addr *)&addr, AF_INET);
+	key = tcp_md5_do_lookup(sk, addr, family);
 	if (key) {
 		/* Pre-existing entry - just update that one. */
 		memcpy(key->key, newkey, newkeylen);
@@ -1026,7 +1009,7 @@ int tcp_md5_do_add(struct sock *sk, const union tcp_md5_addr *addr,
 	key = sock_kmalloc(sk, sizeof(*key), gfp);
 	if (!key)
 		return -ENOMEM;
-	if (hlist_empty(&md5sig->head) && !tcp_alloc_md5sig_pool(sk)) {
+	if (!tcp_alloc_md5sig_pool()) {
 		sock_kfree_s(sk, key, sizeof(*key));
 		return -ENOMEM;
 	}
@@ -1044,20 +1027,14 @@ EXPORT_SYMBOL(tcp_md5_do_add);
 
 int tcp_md5_do_del(struct sock *sk, const union tcp_md5_addr *addr, int family)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_md5sig_key *key;
-	struct tcp_md5sig_info *md5sig;
 
-	key = tcp_md5_do_lookup(sk, (union tcp_md5_addr *)&addr, AF_INET);
+	key = tcp_md5_do_lookup(sk, addr, family);
 	if (!key)
 		return -ENOENT;
 	hlist_del_rcu(&key->node);
 	atomic_sub(sizeof(*key), &sk->sk_omem_alloc);
 	kfree_rcu(key, rcu);
-	md5sig = rcu_dereference_protected(tp->md5sig_info,
-					   sock_owned_by_user(sk));
-	if (hlist_empty(&md5sig->head))
-		tcp_free_md5sig_pool();
 	return 0;
 }
 EXPORT_SYMBOL(tcp_md5_do_del);
@@ -1071,8 +1048,6 @@ static void tcp_clear_md5_list(struct sock *sk)
 
 	md5sig = rcu_dereference_protected(tp->md5sig_info, 1);
 
-	if (!hlist_empty(&md5sig->head))
-		tcp_free_md5sig_pool();
 	hlist_for_each_entry_safe(key, n, &md5sig->head, node) {
 		hlist_del_rcu(&key->node);
 		atomic_sub(sizeof(*key), &sk->sk_omem_alloc);
@@ -1866,6 +1841,7 @@ discard:
 	return 0;
 
 csum_err:
+	TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_CSUMERRORS);
 	TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);
 	goto discard;
 }
@@ -1926,6 +1902,7 @@ bool tcp_prequeue(struct sock *sk, struct sk_buff *skb)
 	    skb_queue_len(&tp->ucopy.prequeue) == 0)
 		return false;
 
+	skb_dst_force(skb);
 	__skb_queue_tail(&tp->ucopy.prequeue, skb);
 	tp->ucopy.memory += skb->truesize;
 	if (tp->ucopy.memory > sk->sk_rcvbuf) {
@@ -1985,7 +1962,7 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	 * provided case of th->doff==0 is eliminated.
 	 * So, we defer the checks. */
 	if (!skb_csum_unnecessary(skb) && tcp_v4_checksum_init(skb))
-		goto bad_packet;
+		goto csum_error;
 
 	th = tcp_hdr(skb);
 	iph = ip_hdr(skb);
@@ -2017,6 +1994,7 @@ process:
 	if (sk_filter(sk, skb))
 		goto discard_and_relse;
 
+	sk_mark_napi_id(sk, skb);
 	skb->dev = NULL;
 
 	bh_lock_sock_nested(sk);
@@ -2051,6 +2029,8 @@ no_tcp_socket:
 		goto discard_it;
 
 	if (skb->len < (th->doff << 2) || tcp_checksum_complete(skb)) {
+csum_error:
+		TCP_INC_STATS_BH(net, TCP_MIB_CSUMERRORS);
 bad_packet:
 		TCP_INC_STATS_BH(net, TCP_MIB_INERRS);
 	} else {
@@ -2072,10 +2052,13 @@ do_time_wait:
 		goto discard_it;
 	}
 
-	if (skb->len < (th->doff << 2) || tcp_checksum_complete(skb)) {
-		TCP_INC_STATS_BH(net, TCP_MIB_INERRS);
+	if (skb->len < (th->doff << 2)) {
 		inet_twsk_put(inet_twsk(sk));
-		goto discard_it;
+		goto bad_packet;
+	}
+	if (tcp_checksum_complete(skb)) {
+		inet_twsk_put(inet_twsk(sk));
+		goto csum_error;
 	}
 	switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {
 	case TCP_TW_SYN: {
@@ -2576,7 +2559,7 @@ static void tcp_seq_stop(struct seq_file *seq, void *v)
 
 int tcp_seq_open(struct inode *inode, struct file *file)
 {
-	struct tcp_seq_afinfo *afinfo = PDE(inode)->data;
+	struct tcp_seq_afinfo *afinfo = PDE_DATA(inode);
 	struct tcp_iter_state *s;
 	int err;
 
@@ -2795,52 +2778,6 @@ void tcp4_proc_exit(void)
 	unregister_pernet_subsys(&tcp4_net_ops);
 }
 #endif /* CONFIG_PROC_FS */
-
-struct sk_buff **tcp4_gro_receive(struct sk_buff **head, struct sk_buff *skb)
-{
-	const struct iphdr *iph = skb_gro_network_header(skb);
-	__wsum wsum;
-	__sum16 sum;
-
-	switch (skb->ip_summed) {
-	case CHECKSUM_COMPLETE:
-		if (!tcp_v4_check(skb_gro_len(skb), iph->saddr, iph->daddr,
-				  skb->csum)) {
-			skb->ip_summed = CHECKSUM_UNNECESSARY;
-			break;
-		}
-flush:
-		NAPI_GRO_CB(skb)->flush = 1;
-		return NULL;
-
-	case CHECKSUM_NONE:
-		wsum = csum_tcpudp_nofold(iph->saddr, iph->daddr,
-					  skb_gro_len(skb), IPPROTO_TCP, 0);
-		sum = csum_fold(skb_checksum(skb,
-					     skb_gro_offset(skb),
-					     skb_gro_len(skb),
-					     wsum));
-		if (sum)
-			goto flush;
-
-		skb->ip_summed = CHECKSUM_UNNECESSARY;
-		break;
-	}
-
-	return tcp_gro_receive(head, skb);
-}
-
-int tcp4_gro_complete(struct sk_buff *skb)
-{
-	const struct iphdr *iph = ip_hdr(skb);
-	struct tcphdr *th = tcp_hdr(skb);
-
-	th->check = ~tcp_v4_check(skb->len - skb_transport_offset(skb),
-				  iph->saddr, iph->daddr, 0);
-	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
-
-	return tcp_gro_complete(skb);
-}
 
 struct proto tcp_prot = {
 	.name			= "TCP",

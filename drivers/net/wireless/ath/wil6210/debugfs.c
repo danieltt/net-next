@@ -145,7 +145,7 @@ static void wil_print_ring(struct seq_file *s, const char *prefix,
 				   le16_to_cpu(hdr.type), hdr.flags);
 			if (len <= MAX_MBOXITEM_SIZE) {
 				int n = 0;
-				unsigned char printbuf[16 * 3 + 2];
+				char printbuf[16 * 3 + 2];
 				unsigned char databuf[MAX_MBOXITEM_SIZE];
 				void __iomem *src = wmi_buffer(wil, d.addr) +
 					sizeof(struct wil6210_mbox_hdr);
@@ -216,7 +216,7 @@ DEFINE_SIMPLE_ATTRIBUTE(fops_iomem_x32, wil_debugfs_iomem_x32_get,
 			wil_debugfs_iomem_x32_set, "0x%08llx\n");
 
 static struct dentry *wil_debugfs_create_iomem_x32(const char *name,
-						   mode_t mode,
+						   umode_t mode,
 						   struct dentry *parent,
 						   void __iomem *value)
 {
@@ -359,7 +359,7 @@ static const struct file_operations fops_ioblob = {
 
 static
 struct dentry *wil_debugfs_create_ioblob(const char *name,
-					 mode_t mode,
+					 umode_t mode,
 					 struct dentry *parent,
 					 struct debugfs_blob_wrapper *blob)
 {
@@ -416,10 +416,16 @@ static int wil_txdesc_debugfs_show(struct seq_file *s, void *data)
 		seq_printf(s, "  SKB = %p\n", skb);
 
 		if (skb) {
-			unsigned char printbuf[16 * 3 + 2];
+			char printbuf[16 * 3 + 2];
 			int i = 0;
-			int len = skb_headlen(skb);
+			int len = le16_to_cpu(d->dma.length);
 			void *p = skb->data;
+
+			if (len != skb_headlen(skb)) {
+				seq_printf(s, "!!! len: desc = %d skb = %d\n",
+					   len, skb_headlen(skb));
+				len = min_t(int, len, skb_headlen(skb));
+			}
 
 			seq_printf(s, "    len = %d\n", len);
 

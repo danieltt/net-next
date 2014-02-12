@@ -3426,13 +3426,19 @@ static void bnx2x_calc_ieee_aneg_adv(struct bnx2x_phy *phy,
 
 	switch (phy->req_flow_ctrl) {
 	case BNX2X_FLOW_CTRL_AUTO:
-		if (params->req_fc_auto_adv == BNX2X_FLOW_CTRL_BOTH)
+		switch (params->req_fc_auto_adv) {
+		case BNX2X_FLOW_CTRL_BOTH:
 			*ieee_fc |= MDIO_COMBO_IEEE0_AUTO_NEG_ADV_PAUSE_BOTH;
-		else
+			break;
+		case BNX2X_FLOW_CTRL_RX:
+		case BNX2X_FLOW_CTRL_TX:
 			*ieee_fc |=
-			MDIO_COMBO_IEEE0_AUTO_NEG_ADV_PAUSE_ASYMMETRIC;
+				MDIO_COMBO_IEEE0_AUTO_NEG_ADV_PAUSE_ASYMMETRIC;
+			break;
+		default:
+			break;
+		}
 		break;
-
 	case BNX2X_FLOW_CTRL_TX:
 		*ieee_fc |= MDIO_COMBO_IEEE0_AUTO_NEG_ADV_PAUSE_ASYMMETRIC;
 		break;
@@ -13481,13 +13487,7 @@ static void bnx2x_check_kr2_wa(struct link_params *params,
 {
 	struct bnx2x *bp = params->bp;
 	u16 base_page, next_page, not_kr2_device, lane;
-	int sigdet = bnx2x_warpcore_get_sigdet(phy, params);
-
-	if (!sigdet) {
-		if (!(vars->link_attr_sync & LINK_ATTR_SYNC_KR2_ENABLE))
-			bnx2x_kr2_recovery(params, vars, phy);
-		return;
-	}
+	int sigdet;
 
 	/* Once KR2 was disabled, wait 5 seconds before checking KR2 recovery
 	 * Since some switches tend to reinit the AN process and clear the
@@ -13498,6 +13498,16 @@ static void bnx2x_check_kr2_wa(struct link_params *params,
 		vars->check_kr2_recovery_cnt--;
 		return;
 	}
+
+	sigdet = bnx2x_warpcore_get_sigdet(phy, params);
+	if (!sigdet) {
+		if (!(vars->link_attr_sync & LINK_ATTR_SYNC_KR2_ENABLE)) {
+			bnx2x_kr2_recovery(params, vars, phy);
+			DP(NETIF_MSG_LINK, "No sigdet\n");
+		}
+		return;
+	}
+
 	lane = bnx2x_get_warpcore_lane(phy, params);
 	CL22_WR_OVER_CL45(bp, phy, MDIO_REG_BANK_AER_BLOCK,
 			  MDIO_AER_BLOCK_AER_REG, lane);

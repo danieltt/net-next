@@ -52,10 +52,8 @@ static int ndesc_get_tx_status(void *data, struct stmmac_extra_stats *x,
 		ret = -1;
 	}
 
-	if (p->des01.etx.vlan_frame) {
-		CHIP_DBG(KERN_INFO "GMAC TX status: VLAN frame\n");
+	if (p->des01.etx.vlan_frame)
 		x->tx_vlan++;
-	}
 
 	if (unlikely(p->des01.tx.deferred))
 		x->tx_deferred++;
@@ -79,8 +77,8 @@ static int ndesc_get_rx_status(void *data, struct stmmac_extra_stats *x,
 	struct net_device_stats *stats = (struct net_device_stats *)data;
 
 	if (unlikely(p->des01.rx.last_descriptor == 0)) {
-		pr_warning("ndesc Error: Oversized Ethernet "
-			   "frame spanned multiple buffers\n");
+		pr_warn("%s: Oversized frame spanned multiple buffers\n",
+			__func__);
 		stats->rx_length_errors++;
 		return discard_frame;
 	}

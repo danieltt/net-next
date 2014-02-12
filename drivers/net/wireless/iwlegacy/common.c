@@ -1423,7 +1423,7 @@ il_setup_rx_scan_handlers(struct il_priv *il)
 }
 EXPORT_SYMBOL(il_setup_rx_scan_handlers);
 
-inline u16
+u16
 il_get_active_dwell_time(struct il_priv *il, enum ieee80211_band band,
 			 u8 n_probes)
 {
@@ -4660,6 +4660,7 @@ il_force_reset(struct il_priv *il, bool external)
 
 	return 0;
 }
+EXPORT_SYMBOL(il_force_reset);
 
 int
 il_mac_change_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
@@ -4701,8 +4702,7 @@ out:
 }
 EXPORT_SYMBOL(il_mac_change_interface);
 
-void
-il_mac_flush(struct ieee80211_hw *hw, bool drop)
+void il_mac_flush(struct ieee80211_hw *hw, u32 queues, bool drop)
 {
 	struct il_priv *il = hw->priv;
 	unsigned long timeout = jiffies + msecs_to_jiffies(500);
@@ -4972,7 +4972,7 @@ il_mac_config(struct ieee80211_hw *hw, u32 changed)
 	struct il_priv *il = hw->priv;
 	const struct il_channel_info *ch_info;
 	struct ieee80211_conf *conf = &hw->conf;
-	struct ieee80211_channel *channel = conf->channel;
+	struct ieee80211_channel *channel = conf->chandef.chan;
 	struct il_ht_config *ht_conf = &il->current_ht_config;
 	unsigned long flags = 0;
 	int ret = 0;
@@ -5306,6 +5306,17 @@ il_mac_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 
 	if (changes & BSS_CHANGED_BSSID) {
 		D_MAC80211("BSSID %pM\n", bss_conf->bssid);
+
+		/*
+		 * On passive channel we wait with blocked queues to see if
+		 * there is traffic on that channel. If no frame will be
+		 * received (what is very unlikely since scan detects AP on
+		 * that channel, but theoretically possible), mac80211 associate
+		 * procedure will time out and mac80211 will call us with NULL
+		 * bssid. We have to unblock queues on such condition.
+		 */
+		if (is_zero_ether_addr(bss_conf->bssid))
+			il_wake_queues_by_reason(il, IL_STOP_REASON_PASSIVE);
 
 		/*
 		 * If there is currently a HW scan going on in the background,

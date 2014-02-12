@@ -94,10 +94,10 @@ static inline void _tg3_flag_clear(enum TG3_FLAGS flag, unsigned long *bits)
 
 #define DRV_MODULE_NAME		"tg3"
 #define TG3_MAJ_NUM			3
-#define TG3_MIN_NUM			130
+#define TG3_MIN_NUM			132
 #define DRV_MODULE_VERSION	\
 	__stringify(TG3_MAJ_NUM) "." __stringify(TG3_MIN_NUM)
-#define DRV_MODULE_RELDATE	"February 14, 2013"
+#define DRV_MODULE_RELDATE	"May 21, 2013"
 
 #define RESET_KIND_SHUTDOWN	0
 #define RESET_KIND_INIT		1
@@ -744,6 +744,9 @@ static int tg3_ape_lock(struct tg3 *tp, int locknum)
 		status = tg3_ape_read32(tp, gnt + off);
 		if (status == bit)
 			break;
+		if (pci_channel_offline(tp->pdev))
+			break;
+
 		udelay(10);
 	}
 
@@ -964,9 +967,6 @@ static void tg3_ape_driver_state_change(struct tg3 *tp, int kind)
 		tg3_ape_write32(tp, TG3_APE_HOST_DRVR_STATE, apedata);
 
 		event = APE_EVENT_STATUS_STATE_UNLOAD;
-		break;
-	case RESET_KIND_SUSPEND:
-		event = APE_EVENT_STATUS_STATE_SUSPEND;
 		break;
 	default:
 		return;
@@ -1314,8 +1314,8 @@ static int tg3_phy_toggle_auxctl_smdsp(struct tg3 *tp, bool enable)
 
 	if (err)
 		return err;
-	if (enable)
 
+	if (enable)
 		val |= MII_TG3_AUXCTL_ACTL_SMDSP_ENA;
 	else
 		val &= ~MII_TG3_AUXCTL_ACTL_SMDSP_ENA;
@@ -1635,6 +1635,9 @@ static void tg3_wait_for_event_ack(struct tg3 *tp)
 	for (i = 0; i < delay_cnt; i++) {
 		if (!(tr32(GRC_RX_CPU_EVENT) & GRC_RX_CPU_DRIVER_EVENT))
 			break;
+		if (pci_channel_offline(tp->pdev))
+			break;
+
 		udelay(8);
 	}
 }
@@ -1739,10 +1742,6 @@ static void tg3_write_sig_pre_reset(struct tg3 *tp, int kind)
 			break;
 		}
 	}
-
-	if (kind == RESET_KIND_INIT ||
-	    kind == RESET_KIND_SUSPEND)
-		tg3_ape_driver_state_change(tp, kind);
 }
 
 /* tp->lock is held. */
@@ -1764,9 +1763,6 @@ static void tg3_write_sig_post_reset(struct tg3 *tp, int kind)
 			break;
 		}
 	}
-
-	if (kind == RESET_KIND_SHUTDOWN)
-		tg3_ape_driver_state_change(tp, kind);
 }
 
 /* tp->lock is held. */
@@ -1800,6 +1796,9 @@ static int tg3_poll_fw(struct tg3 *tp)
 	int i;
 	u32 val;
 
+	if (tg3_flag(tp, NO_FWARE_REPORTED))
+		return 0;
+
 	if (tg3_flag(tp, IS_SSB_CORE)) {
 		/* We don't use firmware. */
 		return 0;
@@ -1810,6 +1809,9 @@ static int tg3_poll_fw(struct tg3 *tp)
 		for (i = 0; i < 200; i++) {
 			if (tr32(VCPU_STATUS) & VCPU_STATUS_INIT_DONE)
 				return 0;
+			if (pci_channel_offline(tp->pdev))
+				return -ENODEV;
+
 			udelay(100);
 		}
 		return -ENODEV;
@@ -1820,6 +1822,15 @@ static int tg3_poll_fw(struct tg3 *tp)
 		tg3_read_mem(tp, NIC_SRAM_FIRMWARE_MBOX, &val);
 		if (val == ~NIC_SRAM_FIRMWARE_MBOX_MAGIC1)
 			break;
+		if (pci_channel_offline(tp->pdev)) {
+			if (!tg3_flag(tp, NO_FWARE_REPORTED)) {
+				tg3_flag_set(tp, NO_FWARE_REPORTED);
+				netdev_info(tp->dev, "No firmware running\n");
+			}
+
+			break;
+		}
+
 		udelay(10);
 	}
 
@@ -1874,6 +1885,20 @@ static void tg3_link_report(struct tg3 *tp)
 	tp->link_up = netif_carrier_ok(tp->dev);
 }
 
+static u32 tg3_decode_flowctrl_1000T(u32 adv)
+{
+	u32 flowctrl = 0;
+
+	if (adv & ADVERTISE_PAUSE_CAP) {
+		flowctrl |= FLOW_CTRL_RX;
+		if (!(adv & ADVERTISE_PAUSE_ASYM))
+			flowctrl |= FLOW_CTRL_TX;
+	} else if (adv & ADVERTISE_PAUSE_ASYM)
+		flowctrl |= FLOW_CTRL_TX;
+
+	return flowctrl;
+}
+
 static u16 tg3_advert_flowctrl_1000X(u8 flow_ctrl)
 {
 	u16 miireg;
@@ -1888,6 +1913,20 @@ static u16 tg3_advert_flowctrl_1000X(u8 flow_ctrl)
 		miireg = 0;
 
 	return miireg;
+}
+
+static u32 tg3_decode_flowctrl_1000X(u32 adv)
+{
+	u32 flowctrl = 0;
+
+	if (adv & ADVERTISE_1000XPAUSE) {
+		flowctrl |= FLOW_CTRL_RX;
+		if (!(adv & ADVERTISE_1000XPSE_ASYM))
+			flowctrl |= FLOW_CTRL_TX;
+	} else if (adv & ADVERTISE_1000XPSE_ASYM)
+		flowctrl |= FLOW_CTRL_TX;
+
+	return flowctrl;
 }
 
 static u8 tg3_resolve_flowctrl_1000X(u16 lcladv, u16 rmtadv)
@@ -2200,7 +2239,7 @@ static void tg3_phy_toggle_apd(struct tg3 *tp, bool enable)
 	tg3_writephy(tp, MII_TG3_MISC_SHDW, reg);
 }
 
-static void tg3_phy_toggle_automdix(struct tg3 *tp, int enable)
+static void tg3_phy_toggle_automdix(struct tg3 *tp, bool enable)
 {
 	u32 phy;
 
@@ -2292,7 +2331,47 @@ static void tg3_phy_apply_otp(struct tg3 *tp)
 	tg3_phy_toggle_auxctl_smdsp(tp, false);
 }
 
-static void tg3_phy_eee_adjust(struct tg3 *tp, u32 current_link_up)
+static void tg3_eee_pull_config(struct tg3 *tp, struct ethtool_eee *eee)
+{
+	u32 val;
+	struct ethtool_eee *dest = &tp->eee;
+
+	if (!(tp->phy_flags & TG3_PHYFLG_EEE_CAP))
+		return;
+
+	if (eee)
+		dest = eee;
+
+	if (tg3_phy_cl45_read(tp, MDIO_MMD_AN, TG3_CL45_D7_EEERES_STAT, &val))
+		return;
+
+	/* Pull eee_active */
+	if (val == TG3_CL45_D7_EEERES_STAT_LP_1000T ||
+	    val == TG3_CL45_D7_EEERES_STAT_LP_100TX) {
+		dest->eee_active = 1;
+	} else
+		dest->eee_active = 0;
+
+	/* Pull lp advertised settings */
+	if (tg3_phy_cl45_read(tp, MDIO_MMD_AN, MDIO_AN_EEE_LPABLE, &val))
+		return;
+	dest->lp_advertised = mmd_eee_adv_to_ethtool_adv_t(val);
+
+	/* Pull advertised and eee_enabled settings */
+	if (tg3_phy_cl45_read(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, &val))
+		return;
+	dest->eee_enabled = !!val;
+	dest->advertised = mmd_eee_adv_to_ethtool_adv_t(val);
+
+	/* Pull tx_lpi_enabled */
+	val = tr32(TG3_CPMU_EEE_MODE);
+	dest->tx_lpi_enabled = !!(val & TG3_CPMU_EEEMD_LPI_IN_TX);
+
+	/* Pull lpi timer value */
+	dest->tx_lpi_timer = tr32(TG3_CPMU_EEE_DBTMR1) & 0xffff;
+}
+
+static void tg3_phy_eee_adjust(struct tg3 *tp, bool current_link_up)
 {
 	u32 val;
 
@@ -2302,7 +2381,7 @@ static void tg3_phy_eee_adjust(struct tg3 *tp, u32 current_link_up)
 	tp->setlpicnt = 0;
 
 	if (tp->link_config.autoneg == AUTONEG_ENABLE &&
-	    current_link_up == 1 &&
+	    current_link_up &&
 	    tp->link_config.active_duplex == DUPLEX_FULL &&
 	    (tp->link_config.active_speed == SPEED_100 ||
 	     tp->link_config.active_speed == SPEED_1000)) {
@@ -2315,16 +2394,13 @@ static void tg3_phy_eee_adjust(struct tg3 *tp, u32 current_link_up)
 
 		tw32(TG3_CPMU_EEE_CTRL, eeectl);
 
-		tg3_phy_cl45_read(tp, MDIO_MMD_AN,
-				  TG3_CL45_D7_EEERES_STAT, &val);
-
-		if (val == TG3_CL45_D7_EEERES_STAT_LP_1000T ||
-		    val == TG3_CL45_D7_EEERES_STAT_LP_100TX)
+		tg3_eee_pull_config(tp, NULL);
+		if (tp->eee.eee_active)
 			tp->setlpicnt = 2;
 	}
 
 	if (!tp->setlpicnt) {
-		if (current_link_up == 1 &&
+		if (current_link_up &&
 		   !tg3_phy_toggle_auxctl_smdsp(tp, true)) {
 			tg3_phydsp_write(tp, MII_TG3_DSP_TAP26, 0x0000);
 			tg3_phy_toggle_auxctl_smdsp(tp, false);
@@ -2531,6 +2607,13 @@ static void tg3_carrier_off(struct tg3 *tp)
 	tp->link_up = false;
 }
 
+static void tg3_warn_mgmt_link_flap(struct tg3 *tp)
+{
+	if (tg3_flag(tp, ENABLE_ASF))
+		netdev_warn(tp->dev,
+			    "Management side-band traffic will be interrupted during phy settings change\n");
+}
+
 /* This will reset the tigon3 PHY if there is no valid
  * link unless the FORCE argument is non-zero.
  */
@@ -2670,7 +2753,7 @@ out:
 	if (tg3_chip_rev_id(tp) == CHIPREV_ID_5762_A0)
 		tg3_phydsp_write(tp, 0xffb, 0x4000);
 
-	tg3_phy_toggle_automdix(tp, 1);
+	tg3_phy_toggle_automdix(tp, true);
 	tg3_phy_set_wirespeed(tp);
 	return 0;
 }
@@ -2922,9 +3005,37 @@ static int tg3_5700_link_polarity(struct tg3 *tp, u32 speed)
 	return 0;
 }
 
+static bool tg3_phy_power_bug(struct tg3 *tp)
+{
+	switch (tg3_asic_rev(tp)) {
+	case ASIC_REV_5700:
+	case ASIC_REV_5704:
+		return true;
+	case ASIC_REV_5780:
+		if (tp->phy_flags & TG3_PHYFLG_MII_SERDES)
+			return true;
+		return false;
+	case ASIC_REV_5717:
+		if (!tp->pci_fn)
+			return true;
+		return false;
+	case ASIC_REV_5719:
+	case ASIC_REV_5720:
+		if ((tp->phy_flags & TG3_PHYFLG_PHY_SERDES) &&
+		    !tp->pci_fn)
+			return true;
+		return false;
+	}
+
+	return false;
+}
+
 static void tg3_power_down_phy(struct tg3 *tp, bool do_low_power)
 {
 	u32 val;
+
+	if (tp->phy_flags & TG3_PHYFLG_KEEP_LINK_ON_PWRDN)
+		return;
 
 	if (tp->phy_flags & TG3_PHYFLG_PHY_SERDES) {
 		if (tg3_asic_rev(tp) == ASIC_REV_5704) {
@@ -2978,12 +3089,7 @@ static void tg3_power_down_phy(struct tg3 *tp, bool do_low_power)
 	/* The PHY should not be powered down on some chips because
 	 * of bugs.
 	 */
-	if (tg3_asic_rev(tp) == ASIC_REV_5700 ||
-	    tg3_asic_rev(tp) == ASIC_REV_5704 ||
-	    (tg3_asic_rev(tp) == ASIC_REV_5780 &&
-	     (tp->phy_flags & TG3_PHYFLG_MII_SERDES)) ||
-	    (tg3_asic_rev(tp) == ASIC_REV_5717 &&
-	     !tp->pci_fn))
+	if (tg3_phy_power_bug(tp))
 		return;
 
 	if (tg3_chip_rev(tp) == CHIPREV_5784_AX ||
@@ -3459,6 +3565,8 @@ static int tg3_pause_cpu(struct tg3 *tp, u32 cpu_base)
 		tw32(cpu_base + CPU_MODE,  CPU_MODE_HALT);
 		if (tr32(cpu_base + CPU_MODE) & CPU_MODE_HALT)
 			break;
+		if (pci_channel_offline(tp->pdev))
+			return -EBUSY;
 	}
 
 	return (i == iters) ? -EBUSY : 0;
@@ -3813,7 +3921,7 @@ static int tg3_load_tso_firmware(struct tg3 *tp)
 
 
 /* tp->lock is held. */
-static void __tg3_set_mac_addr(struct tg3 *tp, int skip_mac_1)
+static void __tg3_set_mac_addr(struct tg3 *tp, bool skip_mac_1)
 {
 	u32 addr_high, addr_low;
 	int i;
@@ -3876,7 +3984,7 @@ static int tg3_power_up(struct tg3 *tp)
 	return err;
 }
 
-static int tg3_setup_phy(struct tg3 *, int);
+static int tg3_setup_phy(struct tg3 *, bool);
 
 static int tg3_power_down_prepare(struct tg3 *tp)
 {
@@ -3948,7 +4056,7 @@ static int tg3_power_down_prepare(struct tg3 *tp)
 			tp->phy_flags |= TG3_PHYFLG_IS_LOW_POWER;
 
 		if (!(tp->phy_flags & TG3_PHYFLG_ANY_SERDES))
-			tg3_setup_phy(tp, 0);
+			tg3_setup_phy(tp, false);
 	}
 
 	if (tg3_asic_rev(tp) == ASIC_REV_5906) {
@@ -3989,7 +4097,13 @@ static int tg3_power_down_prepare(struct tg3 *tp)
 
 			if (tp->phy_flags & TG3_PHYFLG_MII_SERDES)
 				mac_mode = MAC_MODE_PORT_MODE_GMII;
-			else
+			else if (tp->phy_flags &
+				 TG3_PHYFLG_KEEP_LINK_ON_PWRDN) {
+				if (tp->link_config.active_speed == SPEED_1000)
+					mac_mode = MAC_MODE_PORT_MODE_GMII;
+				else
+					mac_mode = MAC_MODE_PORT_MODE_MII;
+			} else
 				mac_mode = MAC_MODE_PORT_MODE_MII;
 
 			mac_mode |= tp->mac_mode & MAC_MODE_LINK_POLARITY;
@@ -4105,6 +4219,8 @@ static int tg3_power_down_prepare(struct tg3 *tp)
 
 	tg3_write_sig_post_reset(tp, RESET_KIND_SHUTDOWN);
 
+	tg3_ape_driver_state_change(tp, RESET_KIND_SHUTDOWN);
+
 	return 0;
 }
 
@@ -4205,6 +4321,16 @@ static int tg3_phy_autoneg_cfg(struct tg3 *tp, u32 advertise, u32 flowctrl)
 		/* Advertise 1000-BaseT EEE ability */
 		if (advertise & ADVERTISED_1000baseT_Full)
 			val |= MDIO_AN_EEE_ADV_1000T;
+
+		if (!tp->eee.eee_enabled) {
+			val = 0;
+			tp->eee.advertised = 0;
+		} else {
+			tp->eee.advertised = advertise &
+					     (ADVERTISED_100baseT_Full |
+					      ADVERTISED_1000baseT_Full);
+		}
+
 		err = tg3_phy_cl45_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, val);
 		if (err)
 			val = 0;
@@ -4243,12 +4369,16 @@ static void tg3_phy_copper_begin(struct tg3 *tp)
 	    (tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER)) {
 		u32 adv, fc;
 
-		if (tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER) {
+		if ((tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER) &&
+		    !(tp->phy_flags & TG3_PHYFLG_KEEP_LINK_ON_PWRDN)) {
 			adv = ADVERTISED_10baseT_Half |
 			      ADVERTISED_10baseT_Full;
 			if (tg3_flag(tp, WOL_SPEED_100MB))
 				adv |= ADVERTISED_100baseT_Half |
 				       ADVERTISED_100baseT_Full;
+			if (tp->phy_flags & TG3_PHYFLG_1G_ON_VAUX_OK)
+				adv |= ADVERTISED_1000baseT_Half |
+				       ADVERTISED_1000baseT_Full;
 
 			fc = FLOW_CTRL_TX | FLOW_CTRL_RX;
 		} else {
@@ -4261,6 +4391,15 @@ static void tg3_phy_copper_begin(struct tg3 *tp)
 		}
 
 		tg3_phy_autoneg_cfg(tp, adv, fc);
+
+		if ((tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER) &&
+		    (tp->phy_flags & TG3_PHYFLG_KEEP_LINK_ON_PWRDN)) {
+			/* Normally during power down we want to autonegotiate
+			 * the lowest possible speed for WOL. However, to avoid
+			 * link flap, we leave it untouched.
+			 */
+			return;
+		}
 
 		tg3_writephy(tp, MII_BMCR,
 			     BMCR_ANENABLE | BMCR_ANRESTART);
@@ -4318,6 +4457,103 @@ static void tg3_phy_copper_begin(struct tg3 *tp)
 	}
 }
 
+static int tg3_phy_pull_config(struct tg3 *tp)
+{
+	int err;
+	u32 val;
+
+	err = tg3_readphy(tp, MII_BMCR, &val);
+	if (err)
+		goto done;
+
+	if (!(val & BMCR_ANENABLE)) {
+		tp->link_config.autoneg = AUTONEG_DISABLE;
+		tp->link_config.advertising = 0;
+		tg3_flag_clear(tp, PAUSE_AUTONEG);
+
+		err = -EIO;
+
+		switch (val & (BMCR_SPEED1000 | BMCR_SPEED100)) {
+		case 0:
+			if (tp->phy_flags & TG3_PHYFLG_ANY_SERDES)
+				goto done;
+
+			tp->link_config.speed = SPEED_10;
+			break;
+		case BMCR_SPEED100:
+			if (tp->phy_flags & TG3_PHYFLG_ANY_SERDES)
+				goto done;
+
+			tp->link_config.speed = SPEED_100;
+			break;
+		case BMCR_SPEED1000:
+			if (!(tp->phy_flags & TG3_PHYFLG_10_100_ONLY)) {
+				tp->link_config.speed = SPEED_1000;
+				break;
+			}
+			/* Fall through */
+		default:
+			goto done;
+		}
+
+		if (val & BMCR_FULLDPLX)
+			tp->link_config.duplex = DUPLEX_FULL;
+		else
+			tp->link_config.duplex = DUPLEX_HALF;
+
+		tp->link_config.flowctrl = FLOW_CTRL_RX | FLOW_CTRL_TX;
+
+		err = 0;
+		goto done;
+	}
+
+	tp->link_config.autoneg = AUTONEG_ENABLE;
+	tp->link_config.advertising = ADVERTISED_Autoneg;
+	tg3_flag_set(tp, PAUSE_AUTONEG);
+
+	if (!(tp->phy_flags & TG3_PHYFLG_ANY_SERDES)) {
+		u32 adv;
+
+		err = tg3_readphy(tp, MII_ADVERTISE, &val);
+		if (err)
+			goto done;
+
+		adv = mii_adv_to_ethtool_adv_t(val & ADVERTISE_ALL);
+		tp->link_config.advertising |= adv | ADVERTISED_TP;
+
+		tp->link_config.flowctrl = tg3_decode_flowctrl_1000T(val);
+	} else {
+		tp->link_config.advertising |= ADVERTISED_FIBRE;
+	}
+
+	if (!(tp->phy_flags & TG3_PHYFLG_10_100_ONLY)) {
+		u32 adv;
+
+		if (!(tp->phy_flags & TG3_PHYFLG_ANY_SERDES)) {
+			err = tg3_readphy(tp, MII_CTRL1000, &val);
+			if (err)
+				goto done;
+
+			adv = mii_ctrl1000_to_ethtool_adv_t(val);
+		} else {
+			err = tg3_readphy(tp, MII_ADVERTISE, &val);
+			if (err)
+				goto done;
+
+			adv = tg3_decode_flowctrl_1000X(val);
+			tp->link_config.flowctrl = adv;
+
+			val &= (ADVERTISE_1000XHALF | ADVERTISE_1000XFULL);
+			adv = mii_adv_to_ethtool_adv_x(val);
+		}
+
+		tp->link_config.advertising |= adv;
+	}
+
+done:
+	return err;
+}
+
 static int tg3_init_5401phy_dsp(struct tg3 *tp)
 {
 	int err;
@@ -4335,6 +4571,29 @@ static int tg3_init_5401phy_dsp(struct tg3 *tp)
 	udelay(40);
 
 	return err;
+}
+
+static bool tg3_phy_eee_config_ok(struct tg3 *tp)
+{
+	struct ethtool_eee eee;
+
+	if (!(tp->phy_flags & TG3_PHYFLG_EEE_CAP))
+		return true;
+
+	tg3_eee_pull_config(tp, &eee);
+
+	if (tp->eee.eee_enabled) {
+		if (tp->eee.advertised != eee.advertised ||
+		    tp->eee.tx_lpi_timer != eee.tx_lpi_timer ||
+		    tp->eee.tx_lpi_enabled != eee.tx_lpi_enabled)
+			return false;
+	} else {
+		/* EEE is disabled but we're advertising */
+		if (eee.advertised)
+			return false;
+	}
+
+	return true;
 }
 
 static bool tg3_phy_copper_an_config_ok(struct tg3 *tp, u32 *lcladv)
@@ -4403,7 +4662,7 @@ static bool tg3_phy_copper_fetch_rmtadv(struct tg3 *tp, u32 *rmtadv)
 	return true;
 }
 
-static bool tg3_test_and_report_link_chg(struct tg3 *tp, int curr_link_up)
+static bool tg3_test_and_report_link_chg(struct tg3 *tp, bool curr_link_up)
 {
 	if (curr_link_up != tp->link_up) {
 		if (curr_link_up) {
@@ -4421,23 +4680,64 @@ static bool tg3_test_and_report_link_chg(struct tg3 *tp, int curr_link_up)
 	return false;
 }
 
-static int tg3_setup_copper_phy(struct tg3 *tp, int force_reset)
+static void tg3_clear_mac_status(struct tg3 *tp)
 {
-	int current_link_up;
+	tw32(MAC_EVENT, 0);
+
+	tw32_f(MAC_STATUS,
+	       MAC_STATUS_SYNC_CHANGED |
+	       MAC_STATUS_CFG_CHANGED |
+	       MAC_STATUS_MI_COMPLETION |
+	       MAC_STATUS_LNKSTATE_CHANGED);
+	udelay(40);
+}
+
+static void tg3_setup_eee(struct tg3 *tp)
+{
+	u32 val;
+
+	val = TG3_CPMU_EEE_LNKIDL_PCIE_NL0 |
+	      TG3_CPMU_EEE_LNKIDL_UART_IDL;
+	if (tg3_chip_rev_id(tp) == CHIPREV_ID_57765_A0)
+		val |= TG3_CPMU_EEE_LNKIDL_APE_TX_MT;
+
+	tw32_f(TG3_CPMU_EEE_LNKIDL_CTRL, val);
+
+	tw32_f(TG3_CPMU_EEE_CTRL,
+	       TG3_CPMU_EEE_CTRL_EXIT_20_1_US);
+
+	val = TG3_CPMU_EEEMD_ERLY_L1_XIT_DET |
+	      (tp->eee.tx_lpi_enabled ? TG3_CPMU_EEEMD_LPI_IN_TX : 0) |
+	      TG3_CPMU_EEEMD_LPI_IN_RX |
+	      TG3_CPMU_EEEMD_EEE_ENABLE;
+
+	if (tg3_asic_rev(tp) != ASIC_REV_5717)
+		val |= TG3_CPMU_EEEMD_SND_IDX_DET_EN;
+
+	if (tg3_flag(tp, ENABLE_APE))
+		val |= TG3_CPMU_EEEMD_APE_TX_DET_EN;
+
+	tw32_f(TG3_CPMU_EEE_MODE, tp->eee.eee_enabled ? val : 0);
+
+	tw32_f(TG3_CPMU_EEE_DBTMR1,
+	       TG3_CPMU_DBTMR1_PCIEXIT_2047US |
+	       (tp->eee.tx_lpi_timer & 0xffff));
+
+	tw32_f(TG3_CPMU_EEE_DBTMR2,
+	       TG3_CPMU_DBTMR2_APE_TX_2047US |
+	       TG3_CPMU_DBTMR2_TXIDXEQ_2047US);
+}
+
+static int tg3_setup_copper_phy(struct tg3 *tp, bool force_reset)
+{
+	bool current_link_up;
 	u32 bmsr, val;
 	u32 lcl_adv, rmt_adv;
 	u16 current_speed;
 	u8 current_duplex;
 	int i, err;
 
-	tw32(MAC_EVENT, 0);
-
-	tw32_f(MAC_STATUS,
-	     (MAC_STATUS_SYNC_CHANGED |
-	      MAC_STATUS_CFG_CHANGED |
-	      MAC_STATUS_MI_COMPLETION |
-	      MAC_STATUS_LNKSTATE_CHANGED));
-	udelay(40);
+	tg3_clear_mac_status(tp);
 
 	if ((tp->mi_mode & MAC_MI_MODE_AUTO_POLL) != 0) {
 		tw32_f(MAC_MI_MODE,
@@ -4457,7 +4757,7 @@ static int tg3_setup_copper_phy(struct tg3 *tp, int force_reset)
 		tg3_readphy(tp, MII_BMSR, &bmsr);
 		if (!tg3_readphy(tp, MII_BMSR, &bmsr) &&
 		    !(bmsr & BMSR_LSTATUS))
-			force_reset = 1;
+			force_reset = true;
 	}
 	if (force_reset)
 		tg3_phy_reset(tp);
@@ -4521,7 +4821,7 @@ static int tg3_setup_copper_phy(struct tg3 *tp, int force_reset)
 			tg3_writephy(tp, MII_TG3_EXT_CTRL, 0);
 	}
 
-	current_link_up = 0;
+	current_link_up = false;
 	current_speed = SPEED_UNKNOWN;
 	current_duplex = DUPLEX_UNKNOWN;
 	tp->phy_flags &= ~TG3_PHYFLG_MDIX_STATE;
@@ -4580,21 +4880,33 @@ static int tg3_setup_copper_phy(struct tg3 *tp, int force_reset)
 		tp->link_config.active_duplex = current_duplex;
 
 		if (tp->link_config.autoneg == AUTONEG_ENABLE) {
+			bool eee_config_ok = tg3_phy_eee_config_ok(tp);
+
 			if ((bmcr & BMCR_ANENABLE) &&
+			    eee_config_ok &&
 			    tg3_phy_copper_an_config_ok(tp, &lcl_adv) &&
 			    tg3_phy_copper_fetch_rmtadv(tp, &rmt_adv))
-				current_link_up = 1;
+				current_link_up = true;
+
+			/* EEE settings changes take effect only after a phy
+			 * reset.  If we have skipped a reset due to Link Flap
+			 * Avoidance being enabled, do it now.
+			 */
+			if (!eee_config_ok &&
+			    (tp->phy_flags & TG3_PHYFLG_KEEP_LINK_ON_PWRDN) &&
+			    !force_reset) {
+				tg3_setup_eee(tp);
+				tg3_phy_reset(tp);
+			}
 		} else {
 			if (!(bmcr & BMCR_ANENABLE) &&
 			    tp->link_config.speed == current_speed &&
-			    tp->link_config.duplex == current_duplex &&
-			    tp->link_config.flowctrl ==
-			    tp->link_config.active_flowctrl) {
-				current_link_up = 1;
+			    tp->link_config.duplex == current_duplex) {
+				current_link_up = true;
 			}
 		}
 
-		if (current_link_up == 1 &&
+		if (current_link_up &&
 		    tp->link_config.active_duplex == DUPLEX_FULL) {
 			u32 reg, bit;
 
@@ -4614,11 +4926,11 @@ static int tg3_setup_copper_phy(struct tg3 *tp, int force_reset)
 	}
 
 relink:
-	if (current_link_up == 0 || (tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER)) {
+	if (!current_link_up || (tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER)) {
 		tg3_phy_copper_begin(tp);
 
 		if (tg3_flag(tp, ROBOSWITCH)) {
-			current_link_up = 1;
+			current_link_up = true;
 			/* FIXME: when BCM5325 switch is used use 100 MBit/s */
 			current_speed = SPEED_1000;
 			current_duplex = DUPLEX_FULL;
@@ -4629,11 +4941,11 @@ relink:
 		tg3_readphy(tp, MII_BMSR, &bmsr);
 		if ((!tg3_readphy(tp, MII_BMSR, &bmsr) && (bmsr & BMSR_LSTATUS)) ||
 		    (tp->mac_mode & MAC_MODE_PORT_INT_LPBACK))
-			current_link_up = 1;
+			current_link_up = true;
 	}
 
 	tp->mac_mode &= ~MAC_MODE_PORT_MODE_MASK;
-	if (current_link_up == 1) {
+	if (current_link_up) {
 		if (tp->link_config.active_speed == SPEED_100 ||
 		    tp->link_config.active_speed == SPEED_10)
 			tp->mac_mode |= MAC_MODE_PORT_MODE_MII;
@@ -4669,7 +4981,7 @@ relink:
 		tp->mac_mode |= MAC_MODE_HALF_DUPLEX;
 
 	if (tg3_asic_rev(tp) == ASIC_REV_5700) {
-		if (current_link_up == 1 &&
+		if (current_link_up &&
 		    tg3_5700_link_polarity(tp, tp->link_config.active_speed))
 			tp->mac_mode |= MAC_MODE_LINK_POLARITY;
 		else
@@ -4700,7 +5012,7 @@ relink:
 	udelay(40);
 
 	if (tg3_asic_rev(tp) == ASIC_REV_5700 &&
-	    current_link_up == 1 &&
+	    current_link_up &&
 	    tp->link_config.active_speed == SPEED_1000 &&
 	    (tg3_flag(tp, PCIX_MODE) || tg3_flag(tp, PCI_HIGH_SPEED))) {
 		udelay(120);
@@ -5140,19 +5452,19 @@ static void tg3_init_bcm8002(struct tg3 *tp)
 	tg3_writephy(tp, 0x10, 0x8011);
 }
 
-static int tg3_setup_fiber_hw_autoneg(struct tg3 *tp, u32 mac_status)
+static bool tg3_setup_fiber_hw_autoneg(struct tg3 *tp, u32 mac_status)
 {
 	u16 flowctrl;
+	bool current_link_up;
 	u32 sg_dig_ctrl, sg_dig_status;
 	u32 serdes_cfg, expected_sg_dig_ctrl;
 	int workaround, port_a;
-	int current_link_up;
 
 	serdes_cfg = 0;
 	expected_sg_dig_ctrl = 0;
 	workaround = 0;
 	port_a = 1;
-	current_link_up = 0;
+	current_link_up = false;
 
 	if (tg3_chip_rev_id(tp) != CHIPREV_ID_5704_A0 &&
 	    tg3_chip_rev_id(tp) != CHIPREV_ID_5704_A1) {
@@ -5183,7 +5495,7 @@ static int tg3_setup_fiber_hw_autoneg(struct tg3 *tp, u32 mac_status)
 		}
 		if (mac_status & MAC_STATUS_PCS_SYNCED) {
 			tg3_setup_flow_control(tp, 0, 0);
-			current_link_up = 1;
+			current_link_up = true;
 		}
 		goto out;
 	}
@@ -5204,7 +5516,7 @@ static int tg3_setup_fiber_hw_autoneg(struct tg3 *tp, u32 mac_status)
 				    MAC_STATUS_RCVD_CFG)) ==
 		     MAC_STATUS_PCS_SYNCED)) {
 			tp->serdes_counter--;
-			current_link_up = 1;
+			current_link_up = true;
 			goto out;
 		}
 restart_autoneg:
@@ -5239,7 +5551,7 @@ restart_autoneg:
 					   mii_adv_to_ethtool_adv_x(remote_adv);
 
 			tg3_setup_flow_control(tp, local_adv, remote_adv);
-			current_link_up = 1;
+			current_link_up = true;
 			tp->serdes_counter = 0;
 			tp->phy_flags &= ~TG3_PHYFLG_PARALLEL_DETECT;
 		} else if (!(sg_dig_status & SG_DIG_AUTONEG_COMPLETE)) {
@@ -5267,7 +5579,7 @@ restart_autoneg:
 				if ((mac_status & MAC_STATUS_PCS_SYNCED) &&
 				    !(mac_status & MAC_STATUS_RCVD_CFG)) {
 					tg3_setup_flow_control(tp, 0, 0);
-					current_link_up = 1;
+					current_link_up = true;
 					tp->phy_flags |=
 						TG3_PHYFLG_PARALLEL_DETECT;
 					tp->serdes_counter =
@@ -5285,9 +5597,9 @@ out:
 	return current_link_up;
 }
 
-static int tg3_setup_fiber_by_hand(struct tg3 *tp, u32 mac_status)
+static bool tg3_setup_fiber_by_hand(struct tg3 *tp, u32 mac_status)
 {
-	int current_link_up = 0;
+	bool current_link_up = false;
 
 	if (!(mac_status & MAC_STATUS_PCS_SYNCED))
 		goto out;
@@ -5314,7 +5626,7 @@ static int tg3_setup_fiber_by_hand(struct tg3 *tp, u32 mac_status)
 
 			tg3_setup_flow_control(tp, local_adv, remote_adv);
 
-			current_link_up = 1;
+			current_link_up = true;
 		}
 		for (i = 0; i < 30; i++) {
 			udelay(20);
@@ -5329,15 +5641,15 @@ static int tg3_setup_fiber_by_hand(struct tg3 *tp, u32 mac_status)
 		}
 
 		mac_status = tr32(MAC_STATUS);
-		if (current_link_up == 0 &&
+		if (!current_link_up &&
 		    (mac_status & MAC_STATUS_PCS_SYNCED) &&
 		    !(mac_status & MAC_STATUS_RCVD_CFG))
-			current_link_up = 1;
+			current_link_up = true;
 	} else {
 		tg3_setup_flow_control(tp, 0, 0);
 
 		/* Forcing 1000FD link up. */
-		current_link_up = 1;
+		current_link_up = true;
 
 		tw32_f(MAC_MODE, (tp->mac_mode | MAC_MODE_SEND_CONFIGS));
 		udelay(40);
@@ -5350,13 +5662,13 @@ out:
 	return current_link_up;
 }
 
-static int tg3_setup_fiber_phy(struct tg3 *tp, int force_reset)
+static int tg3_setup_fiber_phy(struct tg3 *tp, bool force_reset)
 {
 	u32 orig_pause_cfg;
 	u16 orig_active_speed;
 	u8 orig_active_duplex;
 	u32 mac_status;
-	int current_link_up;
+	bool current_link_up;
 	int i;
 
 	orig_pause_cfg = tp->link_config.active_flowctrl;
@@ -5393,7 +5705,7 @@ static int tg3_setup_fiber_phy(struct tg3 *tp, int force_reset)
 	tw32_f(MAC_EVENT, MAC_EVENT_LNKSTATE_CHANGED);
 	udelay(40);
 
-	current_link_up = 0;
+	current_link_up = false;
 	tp->link_config.rmt_adv = 0;
 	mac_status = tr32(MAC_STATUS);
 
@@ -5418,7 +5730,7 @@ static int tg3_setup_fiber_phy(struct tg3 *tp, int force_reset)
 
 	mac_status = tr32(MAC_STATUS);
 	if ((mac_status & MAC_STATUS_PCS_SYNCED) == 0) {
-		current_link_up = 0;
+		current_link_up = false;
 		if (tp->link_config.autoneg == AUTONEG_ENABLE &&
 		    tp->serdes_counter == 0) {
 			tw32_f(MAC_MODE, (tp->mac_mode |
@@ -5428,7 +5740,7 @@ static int tg3_setup_fiber_phy(struct tg3 *tp, int force_reset)
 		}
 	}
 
-	if (current_link_up == 1) {
+	if (current_link_up) {
 		tp->link_config.active_speed = SPEED_1000;
 		tp->link_config.active_duplex = DUPLEX_FULL;
 		tw32(MAC_LED_CTRL, (tp->led_ctrl |
@@ -5453,33 +5765,63 @@ static int tg3_setup_fiber_phy(struct tg3 *tp, int force_reset)
 	return 0;
 }
 
-static int tg3_setup_fiber_mii_phy(struct tg3 *tp, int force_reset)
+static int tg3_setup_fiber_mii_phy(struct tg3 *tp, bool force_reset)
 {
-	int current_link_up, err = 0;
+	int err = 0;
 	u32 bmsr, bmcr;
-	u16 current_speed;
-	u8 current_duplex;
-	u32 local_adv, remote_adv;
+	u16 current_speed = SPEED_UNKNOWN;
+	u8 current_duplex = DUPLEX_UNKNOWN;
+	bool current_link_up = false;
+	u32 local_adv, remote_adv, sgsr;
+
+	if ((tg3_asic_rev(tp) == ASIC_REV_5719 ||
+	     tg3_asic_rev(tp) == ASIC_REV_5720) &&
+	     !tg3_readphy(tp, SERDES_TG3_1000X_STATUS, &sgsr) &&
+	     (sgsr & SERDES_TG3_SGMII_MODE)) {
+
+		if (force_reset)
+			tg3_phy_reset(tp);
+
+		tp->mac_mode &= ~MAC_MODE_PORT_MODE_MASK;
+
+		if (!(sgsr & SERDES_TG3_LINK_UP)) {
+			tp->mac_mode |= MAC_MODE_PORT_MODE_GMII;
+		} else {
+			current_link_up = true;
+			if (sgsr & SERDES_TG3_SPEED_1000) {
+				current_speed = SPEED_1000;
+				tp->mac_mode |= MAC_MODE_PORT_MODE_GMII;
+			} else if (sgsr & SERDES_TG3_SPEED_100) {
+				current_speed = SPEED_100;
+				tp->mac_mode |= MAC_MODE_PORT_MODE_MII;
+			} else {
+				current_speed = SPEED_10;
+				tp->mac_mode |= MAC_MODE_PORT_MODE_MII;
+			}
+
+			if (sgsr & SERDES_TG3_FULL_DUPLEX)
+				current_duplex = DUPLEX_FULL;
+			else
+				current_duplex = DUPLEX_HALF;
+		}
+
+		tw32_f(MAC_MODE, tp->mac_mode);
+		udelay(40);
+
+		tg3_clear_mac_status(tp);
+
+		goto fiber_setup_done;
+	}
 
 	tp->mac_mode |= MAC_MODE_PORT_MODE_GMII;
 	tw32_f(MAC_MODE, tp->mac_mode);
 	udelay(40);
 
-	tw32(MAC_EVENT, 0);
-
-	tw32_f(MAC_STATUS,
-	     (MAC_STATUS_SYNC_CHANGED |
-	      MAC_STATUS_CFG_CHANGED |
-	      MAC_STATUS_MI_COMPLETION |
-	      MAC_STATUS_LNKSTATE_CHANGED));
-	udelay(40);
+	tg3_clear_mac_status(tp);
 
 	if (force_reset)
 		tg3_phy_reset(tp);
 
-	current_link_up = 0;
-	current_speed = SPEED_UNKNOWN;
-	current_duplex = DUPLEX_UNKNOWN;
 	tp->link_config.rmt_adv = 0;
 
 	err |= tg3_readphy(tp, MII_BMSR, &bmsr);
@@ -5565,7 +5907,7 @@ static int tg3_setup_fiber_mii_phy(struct tg3 *tp, int force_reset)
 
 	if (bmsr & BMSR_LSTATUS) {
 		current_speed = SPEED_1000;
-		current_link_up = 1;
+		current_link_up = true;
 		if (bmcr & BMCR_FULLDPLX)
 			current_duplex = DUPLEX_FULL;
 		else
@@ -5592,12 +5934,13 @@ static int tg3_setup_fiber_mii_phy(struct tg3 *tp, int force_reset)
 			} else if (!tg3_flag(tp, 5780_CLASS)) {
 				/* Link is up via parallel detect */
 			} else {
-				current_link_up = 0;
+				current_link_up = false;
 			}
 		}
 	}
 
-	if (current_link_up == 1 && current_duplex == DUPLEX_FULL)
+fiber_setup_done:
+	if (current_link_up && current_duplex == DUPLEX_FULL)
 		tg3_setup_flow_control(tp, local_adv, remote_adv);
 
 	tp->mac_mode &= ~MAC_MODE_HALF_DUPLEX;
@@ -5676,7 +6019,7 @@ static void tg3_serdes_parallel_detect(struct tg3 *tp)
 	}
 }
 
-static int tg3_setup_phy(struct tg3 *tp, int force_reset)
+static int tg3_setup_phy(struct tg3 *tp, bool force_reset)
 {
 	u32 val;
 	int err;
@@ -5766,10 +6109,13 @@ static int tg3_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info)
 
 	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
 				SOF_TIMESTAMPING_RX_SOFTWARE |
-				SOF_TIMESTAMPING_SOFTWARE    |
-				SOF_TIMESTAMPING_TX_HARDWARE |
-				SOF_TIMESTAMPING_RX_HARDWARE |
-				SOF_TIMESTAMPING_RAW_HARDWARE;
+				SOF_TIMESTAMPING_SOFTWARE;
+
+	if (tg3_flag(tp, PTP_CAPABLE)) {
+		info->so_timestamping |= SOF_TIMESTAMPING_TX_HARDWARE |
+					SOF_TIMESTAMPING_RX_HARDWARE |
+					SOF_TIMESTAMPING_RAW_HARDWARE;
+	}
 
 	if (tp->ptp_clock)
 		info->phc_index = ptp_clock_index(tp->ptp_clock);
@@ -6063,9 +6409,7 @@ static void tg3_tx_recover(struct tg3 *tp)
 		    "Please report the problem to the driver maintainer "
 		    "and include system chipset information.\n");
 
-	spin_lock(&tp->lock);
 	tg3_flag_set(tp, TX_RECOVERY_PENDING);
-	spin_unlock(&tp->lock);
 }
 
 static inline u32 tg3_tx_avail(struct tg3_napi *tnapi)
@@ -6489,7 +6833,7 @@ static int tg3_rx(struct tg3_napi *tnapi, int budget)
 
 		if (desc->type_flags & RXD_FLAG_VLAN &&
 		    !(tp->rx_mode & RX_MODE_KEEP_VLAN_TAG))
-			__vlan_hwaccel_put_tag(skb,
+			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
 					       desc->err_vlan & RXD_VLAN_MASK);
 
 		napi_gro_receive(&tnapi->napi, skb);
@@ -6577,7 +6921,7 @@ static void tg3_poll_link(struct tg3 *tp)
 				      MAC_STATUS_LNKSTATE_CHANGED));
 				udelay(40);
 			} else
-				tg3_setup_phy(tp, 0);
+				tg3_setup_phy(tp, false);
 			spin_unlock(&tp->lock);
 		}
 	}
@@ -7199,6 +7543,20 @@ static inline int tg3_4g_overflow_test(dma_addr_t mapping, int len)
 	return (base > 0xffffdcc0) && (base + len + 8 < base);
 }
 
+/* Test for TSO DMA buffers that cross into regions which are within MSS bytes
+ * of any 4GB boundaries: 4G, 8G, etc
+ */
+static inline int tg3_4g_tso_overflow_test(struct tg3 *tp, dma_addr_t mapping,
+					   u32 len, u32 mss)
+{
+	if (tg3_asic_rev(tp) == ASIC_REV_5762 && mss) {
+		u32 base = (u32) mapping & 0xffffffff;
+
+		return ((base + len + (mss & 0x3fff)) < base);
+	}
+	return 0;
+}
+
 /* Test for DMA addresses > 40-bit */
 static inline int tg3_40bit_overflow_test(struct tg3 *tp, dma_addr_t mapping,
 					  int len)
@@ -7233,6 +7591,9 @@ static bool tg3_tx_frag_set(struct tg3_napi *tnapi, u32 *entry, u32 *budget,
 		hwbug = true;
 
 	if (tg3_4g_overflow_test(map, len))
+		hwbug = true;
+
+	if (tg3_4g_tso_overflow_test(tp, map, len, mss))
 		hwbug = true;
 
 	if (tg3_40bit_overflow_test(tp, map, len))
@@ -7674,7 +8035,7 @@ static int tg3_phy_lpbk_set(struct tg3 *tp, u32 speed, bool extlpbk)
 	u32 val, bmcr, mac_mode, ptest = 0;
 
 	tg3_phy_toggle_apd(tp, false);
-	tg3_phy_toggle_automdix(tp, 0);
+	tg3_phy_toggle_automdix(tp, false);
 
 	if (extlpbk && tg3_phy_set_extloopbk(tp))
 		return -EIO;
@@ -7782,7 +8143,7 @@ static void tg3_set_loopback(struct net_device *dev, netdev_features_t features)
 		spin_lock_bh(&tp->lock);
 		tg3_mac_loopback(tp, false);
 		/* Force link status check */
-		tg3_setup_phy(tp, 1);
+		tg3_setup_phy(tp, true);
 		spin_unlock_bh(&tp->lock);
 		netdev_info(dev, "Internal MAC loopback mode disabled.\n");
 	}
@@ -8293,7 +8654,7 @@ err_out:
 /* To stop a block, clear the enable bit and poll till it
  * clears.  tp->lock is held.
  */
-static int tg3_stop_block(struct tg3 *tp, unsigned long ofs, u32 enable_bit, int silent)
+static int tg3_stop_block(struct tg3 *tp, unsigned long ofs, u32 enable_bit, bool silent)
 {
 	unsigned int i;
 	u32 val;
@@ -8320,6 +8681,14 @@ static int tg3_stop_block(struct tg3 *tp, unsigned long ofs, u32 enable_bit, int
 	tw32_f(ofs, val);
 
 	for (i = 0; i < MAX_WAIT_CNT; i++) {
+		if (pci_channel_offline(tp->pdev)) {
+			dev_err(&tp->pdev->dev,
+				"tg3_stop_block device offline, "
+				"ofs=%lx enable_bit=%x\n",
+				ofs, enable_bit);
+			return -ENODEV;
+		}
+
 		udelay(100);
 		val = tr32(ofs);
 		if ((val & enable_bit) == 0)
@@ -8337,11 +8706,18 @@ static int tg3_stop_block(struct tg3 *tp, unsigned long ofs, u32 enable_bit, int
 }
 
 /* tp->lock is held. */
-static int tg3_abort_hw(struct tg3 *tp, int silent)
+static int tg3_abort_hw(struct tg3 *tp, bool silent)
 {
 	int i, err;
 
 	tg3_disable_ints(tp);
+
+	if (pci_channel_offline(tp->pdev)) {
+		tp->rx_mode &= ~(RX_MODE_ENABLE | TX_MODE_ENABLE);
+		tp->mac_mode &= ~MAC_MODE_TDE_ENABLE;
+		err = -ENODEV;
+		goto err_no_dev;
+	}
 
 	tp->rx_mode &= ~RX_MODE_ENABLE;
 	tw32_f(MAC_RX_MODE, tp->rx_mode);
@@ -8391,6 +8767,7 @@ static int tg3_abort_hw(struct tg3 *tp, int silent)
 	err |= tg3_stop_block(tp, BUFMGR_MODE, BUFMGR_MODE_ENABLE, silent);
 	err |= tg3_stop_block(tp, MEMARB_MODE, MEMARB_MODE_ENABLE, silent);
 
+err_no_dev:
 	for (i = 0; i < tp->irq_cnt; i++) {
 		struct tg3_napi *tnapi = &tp->napi[i];
 		if (tnapi->hw_status)
@@ -8645,6 +9022,10 @@ static int tg3_chip_reset(struct tg3 *tp)
 		tg3_halt_cpu(tp, RX_CPU_BASE);
 	}
 
+	err = tg3_poll_fw(tp);
+	if (err)
+		return err;
+
 	tw32(GRC_MODE, tp->grc_mode);
 
 	if (tg3_chip_rev_id(tp) == CHIPREV_ID_5705_A0) {
@@ -8675,10 +9056,6 @@ static int tg3_chip_reset(struct tg3 *tp)
 
 	tg3_ape_unlock(tp, TG3_APE_LOCK_GRC);
 
-	err = tg3_poll_fw(tp);
-	if (err)
-		return err;
-
 	tg3_mdio_start(tp);
 
 	if (tg3_flag(tp, PCI_EXPRESS) &&
@@ -8697,6 +9074,9 @@ static int tg3_chip_reset(struct tg3 *tp)
 
 	/* Reprobe ASF enable state.  */
 	tg3_flag_clear(tp, ENABLE_ASF);
+	tp->phy_flags &= ~(TG3_PHYFLG_1G_ON_VAUX_OK |
+			   TG3_PHYFLG_KEEP_LINK_ON_PWRDN);
+
 	tg3_flag_clear(tp, ASF_NEW_HANDSHAKE);
 	tg3_read_mem(tp, NIC_SRAM_DATA_SIG, &val);
 	if (val == NIC_SRAM_DATA_SIG_MAGIC) {
@@ -8708,6 +9088,12 @@ static int tg3_chip_reset(struct tg3 *tp)
 			tp->last_event_jiffies = jiffies;
 			if (tg3_flag(tp, 5750_PLUS))
 				tg3_flag_set(tp, ASF_NEW_HANDSHAKE);
+
+			tg3_read_mem(tp, NIC_SRAM_DATA_CFG_3, &nic_cfg);
+			if (nic_cfg & NIC_SRAM_1G_ON_VAUX_OK)
+				tp->phy_flags |= TG3_PHYFLG_1G_ON_VAUX_OK;
+			if (nic_cfg & NIC_SRAM_LNK_FLAP_AVOID)
+				tp->phy_flags |= TG3_PHYFLG_KEEP_LINK_ON_PWRDN;
 		}
 	}
 
@@ -8718,7 +9104,7 @@ static void tg3_get_nstats(struct tg3 *, struct rtnl_link_stats64 *);
 static void tg3_get_estats(struct tg3 *, struct tg3_ethtool_stats *);
 
 /* tp->lock is held. */
-static int tg3_halt(struct tg3 *tp, int kind, int silent)
+static int tg3_halt(struct tg3 *tp, int kind, bool silent)
 {
 	int err;
 
@@ -8729,7 +9115,7 @@ static int tg3_halt(struct tg3 *tp, int kind, int silent)
 	tg3_abort_hw(tp, silent);
 	err = tg3_chip_reset(tp);
 
-	__tg3_set_mac_addr(tp, 0);
+	__tg3_set_mac_addr(tp, false);
 
 	tg3_write_sig_legacy(tp, kind);
 	tg3_write_sig_post_reset(tp, kind);
@@ -8753,7 +9139,8 @@ static int tg3_set_mac_addr(struct net_device *dev, void *p)
 {
 	struct tg3 *tp = netdev_priv(dev);
 	struct sockaddr *addr = p;
-	int err = 0, skip_mac_1 = 0;
+	int err = 0;
+	bool skip_mac_1 = false;
 
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
@@ -8774,7 +9161,7 @@ static int tg3_set_mac_addr(struct net_device *dev, void *p)
 		/* Skip MAC addr 1 if ASF is using it. */
 		if ((addr0_high != addr1_high || addr0_low != addr1_low) &&
 		    !(addr1_high == 0 && addr1_low == 0))
-			skip_mac_1 = 1;
+			skip_mac_1 = true;
 	}
 	spin_lock_bh(&tp->lock);
 	__tg3_set_mac_addr(tp, skip_mac_1);
@@ -8890,11 +9277,9 @@ static void __tg3_set_coalesce(struct tg3 *tp, struct ethtool_coalesce *ec)
 }
 
 /* tp->lock is held. */
-static void tg3_rings_reset(struct tg3 *tp)
+static void tg3_tx_rcbs_disable(struct tg3 *tp)
 {
-	int i;
-	u32 stblk, txrcb, rxrcb, limit;
-	struct tg3_napi *tnapi = &tp->napi[0];
+	u32 txrcb, limit;
 
 	/* Disable all transmit rings but the first. */
 	if (!tg3_flag(tp, 5705_PLUS))
@@ -8911,7 +9296,33 @@ static void tg3_rings_reset(struct tg3 *tp)
 	     txrcb < limit; txrcb += TG3_BDINFO_SIZE)
 		tg3_write_mem(tp, txrcb + TG3_BDINFO_MAXLEN_FLAGS,
 			      BDINFO_FLAGS_DISABLED);
+}
 
+/* tp->lock is held. */
+static void tg3_tx_rcbs_init(struct tg3 *tp)
+{
+	int i = 0;
+	u32 txrcb = NIC_SRAM_SEND_RCB;
+
+	if (tg3_flag(tp, ENABLE_TSS))
+		i++;
+
+	for (; i < tp->irq_max; i++, txrcb += TG3_BDINFO_SIZE) {
+		struct tg3_napi *tnapi = &tp->napi[i];
+
+		if (!tnapi->tx_ring)
+			continue;
+
+		tg3_set_bdinfo(tp, txrcb, tnapi->tx_desc_mapping,
+			       (TG3_TX_RING_SIZE << BDINFO_FLAGS_MAXLEN_SHIFT),
+			       NIC_SRAM_TX_BUFFER_DESC);
+	}
+}
+
+/* tp->lock is held. */
+static void tg3_rx_ret_rcbs_disable(struct tg3 *tp)
+{
+	u32 rxrcb, limit;
 
 	/* Disable all receive return rings but the first. */
 	if (tg3_flag(tp, 5717_PLUS))
@@ -8929,6 +9340,39 @@ static void tg3_rings_reset(struct tg3 *tp)
 	     rxrcb < limit; rxrcb += TG3_BDINFO_SIZE)
 		tg3_write_mem(tp, rxrcb + TG3_BDINFO_MAXLEN_FLAGS,
 			      BDINFO_FLAGS_DISABLED);
+}
+
+/* tp->lock is held. */
+static void tg3_rx_ret_rcbs_init(struct tg3 *tp)
+{
+	int i = 0;
+	u32 rxrcb = NIC_SRAM_RCV_RET_RCB;
+
+	if (tg3_flag(tp, ENABLE_RSS))
+		i++;
+
+	for (; i < tp->irq_max; i++, rxrcb += TG3_BDINFO_SIZE) {
+		struct tg3_napi *tnapi = &tp->napi[i];
+
+		if (!tnapi->rx_rcb)
+			continue;
+
+		tg3_set_bdinfo(tp, rxrcb, tnapi->rx_rcb_mapping,
+			       (tp->rx_ret_ring_mask + 1) <<
+				BDINFO_FLAGS_MAXLEN_SHIFT, 0);
+	}
+}
+
+/* tp->lock is held. */
+static void tg3_rings_reset(struct tg3 *tp)
+{
+	int i;
+	u32 stblk;
+	struct tg3_napi *tnapi = &tp->napi[0];
+
+	tg3_tx_rcbs_disable(tp);
+
+	tg3_rx_ret_rcbs_disable(tp);
 
 	/* Disable interrupts */
 	tw32_mailbox_f(tp->napi[0].int_mbox, 1);
@@ -8965,9 +9409,6 @@ static void tg3_rings_reset(struct tg3 *tp)
 			tw32_tx_mbox(mbox + i * 8, 0);
 	}
 
-	txrcb = NIC_SRAM_SEND_RCB;
-	rxrcb = NIC_SRAM_RCV_RET_RCB;
-
 	/* Clear status block in ram. */
 	memset(tnapi->hw_status, 0, TG3_HW_STATUS_SIZE);
 
@@ -8977,46 +9418,20 @@ static void tg3_rings_reset(struct tg3 *tp)
 	tw32(HOSTCC_STATUS_BLK_HOST_ADDR + TG3_64BIT_REG_LOW,
 	     ((u64) tnapi->status_mapping & 0xffffffff));
 
-	if (tnapi->tx_ring) {
-		tg3_set_bdinfo(tp, txrcb, tnapi->tx_desc_mapping,
-			       (TG3_TX_RING_SIZE <<
-				BDINFO_FLAGS_MAXLEN_SHIFT),
-			       NIC_SRAM_TX_BUFFER_DESC);
-		txrcb += TG3_BDINFO_SIZE;
-	}
-
-	if (tnapi->rx_rcb) {
-		tg3_set_bdinfo(tp, rxrcb, tnapi->rx_rcb_mapping,
-			       (tp->rx_ret_ring_mask + 1) <<
-				BDINFO_FLAGS_MAXLEN_SHIFT, 0);
-		rxrcb += TG3_BDINFO_SIZE;
-	}
-
 	stblk = HOSTCC_STATBLCK_RING1;
 
 	for (i = 1, tnapi++; i < tp->irq_cnt; i++, tnapi++) {
 		u64 mapping = (u64)tnapi->status_mapping;
 		tw32(stblk + TG3_64BIT_REG_HIGH, mapping >> 32);
 		tw32(stblk + TG3_64BIT_REG_LOW, mapping & 0xffffffff);
+		stblk += 8;
 
 		/* Clear status block in ram. */
 		memset(tnapi->hw_status, 0, TG3_HW_STATUS_SIZE);
-
-		if (tnapi->tx_ring) {
-			tg3_set_bdinfo(tp, txrcb, tnapi->tx_desc_mapping,
-				       (TG3_TX_RING_SIZE <<
-					BDINFO_FLAGS_MAXLEN_SHIFT),
-				       NIC_SRAM_TX_BUFFER_DESC);
-			txrcb += TG3_BDINFO_SIZE;
-		}
-
-		tg3_set_bdinfo(tp, rxrcb, tnapi->rx_rcb_mapping,
-			       ((tp->rx_ret_ring_mask + 1) <<
-				BDINFO_FLAGS_MAXLEN_SHIFT), 0);
-
-		stblk += 8;
-		rxrcb += TG3_BDINFO_SIZE;
 	}
+
+	tg3_tx_rcbs_init(tp);
+	tg3_rx_ret_rcbs_init(tp);
 }
 
 static void tg3_setup_rxbd_thresholds(struct tg3 *tp)
@@ -9192,8 +9607,16 @@ static void tg3_rss_write_indir_tbl(struct tg3 *tp)
 	}
 }
 
+static inline u32 tg3_lso_rd_dma_workaround_bit(struct tg3 *tp)
+{
+	if (tg3_asic_rev(tp) == ASIC_REV_5719)
+		return TG3_LSO_RD_DMA_TX_LENGTH_WA_5719;
+	else
+		return TG3_LSO_RD_DMA_TX_LENGTH_WA_5720;
+}
+
 /* tp->lock is held. */
-static int tg3_reset_hw(struct tg3 *tp, int reset_phy)
+static int tg3_reset_hw(struct tg3 *tp, bool reset_phy)
 {
 	u32 val, rdmac_mode;
 	int i, err, limit;
@@ -9208,39 +9631,16 @@ static int tg3_reset_hw(struct tg3 *tp, int reset_phy)
 	if (tg3_flag(tp, INIT_COMPLETE))
 		tg3_abort_hw(tp, 1);
 
-	/* Enable MAC control of LPI */
-	if (tp->phy_flags & TG3_PHYFLG_EEE_CAP) {
-		val = TG3_CPMU_EEE_LNKIDL_PCIE_NL0 |
-		      TG3_CPMU_EEE_LNKIDL_UART_IDL;
-		if (tg3_chip_rev_id(tp) == CHIPREV_ID_57765_A0)
-			val |= TG3_CPMU_EEE_LNKIDL_APE_TX_MT;
-
-		tw32_f(TG3_CPMU_EEE_LNKIDL_CTRL, val);
-
-		tw32_f(TG3_CPMU_EEE_CTRL,
-		       TG3_CPMU_EEE_CTRL_EXIT_20_1_US);
-
-		val = TG3_CPMU_EEEMD_ERLY_L1_XIT_DET |
-		      TG3_CPMU_EEEMD_LPI_IN_TX |
-		      TG3_CPMU_EEEMD_LPI_IN_RX |
-		      TG3_CPMU_EEEMD_EEE_ENABLE;
-
-		if (tg3_asic_rev(tp) != ASIC_REV_5717)
-			val |= TG3_CPMU_EEEMD_SND_IDX_DET_EN;
-
-		if (tg3_flag(tp, ENABLE_APE))
-			val |= TG3_CPMU_EEEMD_APE_TX_DET_EN;
-
-		tw32_f(TG3_CPMU_EEE_MODE, val);
-
-		tw32_f(TG3_CPMU_EEE_DBTMR1,
-		       TG3_CPMU_DBTMR1_PCIEXIT_2047US |
-		       TG3_CPMU_DBTMR1_LNKIDLE_2047US);
-
-		tw32_f(TG3_CPMU_EEE_DBTMR2,
-		       TG3_CPMU_DBTMR2_APE_TX_2047US |
-		       TG3_CPMU_DBTMR2_TXIDXEQ_2047US);
+	if ((tp->phy_flags & TG3_PHYFLG_KEEP_LINK_ON_PWRDN) &&
+	    !(tp->phy_flags & TG3_PHYFLG_USER_CONFIGURED)) {
+		tg3_phy_pull_config(tp);
+		tg3_eee_pull_config(tp, NULL);
+		tp->phy_flags |= TG3_PHYFLG_USER_CONFIGURED;
 	}
+
+	/* Enable MAC control of LPI */
+	if (tp->phy_flags & TG3_PHYFLG_EEE_CAP)
+		tg3_setup_eee(tp);
 
 	if (reset_phy)
 		tg3_phy_reset(tp);
@@ -9580,7 +9980,7 @@ static int tg3_reset_hw(struct tg3 *tp, int reset_phy)
 	tg3_rings_reset(tp);
 
 	/* Initialize MAC address and backoff seed. */
-	__tg3_set_mac_addr(tp, 0);
+	__tg3_set_mac_addr(tp, false);
 
 	/* MTU + ethernet header + FCS + optional VLAN tag */
 	tw32(MAC_RX_MTU_SIZE,
@@ -9871,16 +10271,17 @@ static int tg3_reset_hw(struct tg3 *tp, int reset_phy)
 	tw32_f(RDMAC_MODE, rdmac_mode);
 	udelay(40);
 
-	if (tg3_asic_rev(tp) == ASIC_REV_5719) {
+	if (tg3_asic_rev(tp) == ASIC_REV_5719 ||
+	    tg3_asic_rev(tp) == ASIC_REV_5720) {
 		for (i = 0; i < TG3_NUM_RDMA_CHANNELS; i++) {
 			if (tr32(TG3_RDMA_LENGTH + (i << 2)) > TG3_MAX_MTU(tp))
 				break;
 		}
 		if (i < TG3_NUM_RDMA_CHANNELS) {
 			val = tr32(TG3_LSO_RD_DMA_CRPTEN_CTRL);
-			val |= TG3_LSO_RD_DMA_TX_LENGTH_WA;
+			val |= tg3_lso_rd_dma_workaround_bit(tp);
 			tw32(TG3_LSO_RD_DMA_CRPTEN_CTRL, val);
-			tg3_flag_set(tp, 5719_RDMA_BUG);
+			tg3_flag_set(tp, 5719_5720_RDMA_BUG);
 		}
 	}
 
@@ -10031,7 +10432,7 @@ static int tg3_reset_hw(struct tg3 *tp, int reset_phy)
 		if (tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER)
 			tp->phy_flags &= ~TG3_PHYFLG_IS_LOW_POWER;
 
-		err = tg3_setup_phy(tp, 0);
+		err = tg3_setup_phy(tp, false);
 		if (err)
 			return err;
 
@@ -10111,8 +10512,15 @@ static int tg3_reset_hw(struct tg3 *tp, int reset_phy)
 /* Called at device open time to get the chip ready for
  * packet processing.  Invoked with tp->lock held.
  */
-static int tg3_init_hw(struct tg3 *tp, int reset_phy)
+static int tg3_init_hw(struct tg3 *tp, bool reset_phy)
 {
+	/* Chip may have been just powered on. If so, the boot code may still
+	 * be running initialization. Wait for it to finish to avoid races in
+	 * accessing the hardware.
+	 */
+	tg3_enable_register_access(tp);
+	tg3_poll_fw(tp);
+
 	tg3_switch_clocks(tp);
 
 	tw32(TG3PCI_MEM_WIN_BASE_ADDR, 0);
@@ -10244,15 +10652,15 @@ static void tg3_periodic_fetch_stats(struct tg3 *tp)
 	TG3_STAT_ADD32(&sp->tx_ucast_packets, MAC_TX_STATS_UCAST);
 	TG3_STAT_ADD32(&sp->tx_mcast_packets, MAC_TX_STATS_MCAST);
 	TG3_STAT_ADD32(&sp->tx_bcast_packets, MAC_TX_STATS_BCAST);
-	if (unlikely(tg3_flag(tp, 5719_RDMA_BUG) &&
+	if (unlikely(tg3_flag(tp, 5719_5720_RDMA_BUG) &&
 		     (sp->tx_ucast_packets.low + sp->tx_mcast_packets.low +
 		      sp->tx_bcast_packets.low) > TG3_NUM_RDMA_CHANNELS)) {
 		u32 val;
 
 		val = tr32(TG3_LSO_RD_DMA_CRPTEN_CTRL);
-		val &= ~TG3_LSO_RD_DMA_TX_LENGTH_WA;
+		val &= ~tg3_lso_rd_dma_workaround_bit(tp);
 		tw32(TG3_LSO_RD_DMA_CRPTEN_CTRL, val);
-		tg3_flag_clear(tp, 5719_RDMA_BUG);
+		tg3_flag_clear(tp, 5719_5720_RDMA_BUG);
 	}
 
 	TG3_STAT_ADD32(&sp->rx_octets, MAC_RX_STATS_OCTETS);
@@ -10372,7 +10780,7 @@ static void tg3_timer(unsigned long __opaque)
 				phy_event = 1;
 
 			if (phy_event)
-				tg3_setup_phy(tp, 0);
+				tg3_setup_phy(tp, false);
 		} else if (tg3_flag(tp, POLL_SERDES)) {
 			u32 mac_stat = tr32(MAC_STATUS);
 			int need_setup = 0;
@@ -10395,7 +10803,7 @@ static void tg3_timer(unsigned long __opaque)
 					tw32_f(MAC_MODE, tp->mac_mode);
 					udelay(40);
 				}
-				tg3_setup_phy(tp, 0);
+				tg3_setup_phy(tp, false);
 			}
 		} else if ((tp->phy_flags & TG3_PHYFLG_MII_SERDES) &&
 			   tg3_flag(tp, 5780_CLASS)) {
@@ -10481,7 +10889,7 @@ static void tg3_timer_stop(struct tg3 *tp)
 /* Restart hardware after configuration changes, self-test, etc.
  * Invoked with tp->lock held.
  */
-static int tg3_restart_hw(struct tg3 *tp, int reset_phy)
+static int tg3_restart_hw(struct tg3 *tp, bool reset_phy)
 	__releases(tp->lock)
 	__acquires(tp->lock)
 {
@@ -10531,7 +10939,7 @@ static void tg3_reset_task(struct work_struct *work)
 	}
 
 	tg3_halt(tp, RESET_KIND_SHUTDOWN, 0);
-	err = tg3_init_hw(tp, 1);
+	err = tg3_init_hw(tp, true);
 	if (err)
 		goto out;
 
@@ -10701,7 +11109,7 @@ static int tg3_test_msi(struct tg3 *tp)
 	tg3_full_lock(tp, 1);
 
 	tg3_halt(tp, RESET_KIND_SHUTDOWN, 1);
-	err = tg3_init_hw(tp, 1);
+	err = tg3_init_hw(tp, true);
 
 	tg3_full_unlock(tp);
 
@@ -10889,7 +11297,7 @@ static int tg3_start(struct tg3 *tp, bool reset_phy, bool test_irq,
 	 */
 	err = tg3_alloc_consistent(tp);
 	if (err)
-		goto err_out1;
+		goto out_ints_fini;
 
 	tg3_napi_init(tp);
 
@@ -10903,11 +11311,14 @@ static int tg3_start(struct tg3 *tp, bool reset_phy, bool test_irq,
 				tnapi = &tp->napi[i];
 				free_irq(tnapi->irq_vec, tnapi);
 			}
-			goto err_out2;
+			goto out_napi_fini;
 		}
 	}
 
 	tg3_full_lock(tp, 0);
+
+	if (init)
+		tg3_ape_driver_state_change(tp, RESET_KIND_INIT);
 
 	err = tg3_init_hw(tp, reset_phy);
 	if (err) {
@@ -10918,7 +11329,7 @@ static int tg3_start(struct tg3 *tp, bool reset_phy, bool test_irq,
 	tg3_full_unlock(tp);
 
 	if (err)
-		goto err_out3;
+		goto out_free_irq;
 
 	if (test_irq && tg3_flag(tp, USING_MSI)) {
 		err = tg3_test_msi(tp);
@@ -10929,7 +11340,7 @@ static int tg3_start(struct tg3 *tp, bool reset_phy, bool test_irq,
 			tg3_free_rings(tp);
 			tg3_full_unlock(tp);
 
-			goto err_out2;
+			goto out_napi_fini;
 		}
 
 		if (!tg3_flag(tp, 57765_PLUS) && tg3_flag(tp, USING_MSI)) {
@@ -10969,18 +11380,18 @@ static int tg3_start(struct tg3 *tp, bool reset_phy, bool test_irq,
 
 	return 0;
 
-err_out3:
+out_free_irq:
 	for (i = tp->irq_cnt - 1; i >= 0; i--) {
 		struct tg3_napi *tnapi = &tp->napi[i];
 		free_irq(tnapi->irq_vec, tnapi);
 	}
 
-err_out2:
+out_napi_fini:
 	tg3_napi_disable(tp);
 	tg3_napi_fini(tp);
 	tg3_free_consistent(tp);
 
-err_out1:
+out_ints_fini:
 	tg3_ints_fini(tp);
 
 	return err;
@@ -11061,7 +11472,9 @@ static int tg3_open(struct net_device *dev)
 
 	tg3_full_unlock(tp);
 
-	err = tg3_start(tp, true, true, true);
+	err = tg3_start(tp,
+			!(tp->phy_flags & TG3_PHYFLG_KEEP_LINK_ON_PWRDN),
+			true, true);
 	if (err) {
 		tg3_frob_aux_power(tp, false);
 		pci_set_power_state(tp->pdev, PCI_D3hot);
@@ -11567,8 +11980,12 @@ static int tg3_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 		tp->link_config.duplex = cmd->duplex;
 	}
 
+	tp->phy_flags |= TG3_PHYFLG_USER_CONFIGURED;
+
+	tg3_warn_mgmt_link_flap(tp);
+
 	if (netif_running(dev))
-		tg3_setup_phy(tp, 1);
+		tg3_setup_phy(tp, true);
 
 	tg3_full_unlock(tp);
 
@@ -11644,6 +12061,8 @@ static int tg3_nway_reset(struct net_device *dev)
 
 	if (tp->phy_flags & TG3_PHYFLG_PHY_SERDES)
 		return -EINVAL;
+
+	tg3_warn_mgmt_link_flap(tp);
 
 	if (tg3_flag(tp, USE_PHYLIB)) {
 		if (!(tp->phy_flags & TG3_PHYFLG_IS_CONNECTED))
@@ -11722,7 +12141,7 @@ static int tg3_set_ringparam(struct net_device *dev, struct ethtool_ringparam *e
 
 	if (netif_running(dev)) {
 		tg3_halt(tp, RESET_KIND_SHUTDOWN, 1);
-		err = tg3_restart_hw(tp, 1);
+		err = tg3_restart_hw(tp, false);
 		if (!err)
 			tg3_netif_start(tp);
 	}
@@ -11756,6 +12175,9 @@ static int tg3_set_pauseparam(struct net_device *dev, struct ethtool_pauseparam 
 {
 	struct tg3 *tp = netdev_priv(dev);
 	int err = 0;
+
+	if (tp->link_config.autoneg == AUTONEG_ENABLE)
+		tg3_warn_mgmt_link_flap(tp);
 
 	if (tg3_flag(tp, USE_PHYLIB)) {
 		u32 newadv;
@@ -11843,13 +12265,15 @@ static int tg3_set_pauseparam(struct net_device *dev, struct ethtool_pauseparam 
 
 		if (netif_running(dev)) {
 			tg3_halt(tp, RESET_KIND_SHUTDOWN, 1);
-			err = tg3_restart_hw(tp, 1);
+			err = tg3_restart_hw(tp, false);
 			if (!err)
 				tg3_netif_start(tp);
 		}
 
 		tg3_full_unlock(tp);
 	}
+
+	tp->phy_flags |= TG3_PHYFLG_USER_CONFIGURED;
 
 	return err;
 }
@@ -12911,7 +13335,7 @@ static int tg3_test_loopback(struct tg3 *tp, u64 *data, bool do_extlpbk)
 		goto done;
 	}
 
-	err = tg3_reset_hw(tp, 1);
+	err = tg3_reset_hw(tp, true);
 	if (err) {
 		data[TG3_MAC_LOOPB_TEST] = TG3_LOOPBACK_FAILED;
 		data[TG3_PHY_LOOPB_TEST] = TG3_LOOPBACK_FAILED;
@@ -13012,11 +13436,13 @@ static void tg3_self_test(struct net_device *dev, struct ethtool_test *etest,
 	struct tg3 *tp = netdev_priv(dev);
 	bool doextlpbk = etest->flags & ETH_TEST_FL_EXTERNAL_LB;
 
-	if ((tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER) &&
-	    tg3_power_up(tp)) {
-		etest->flags |= ETH_TEST_FL_FAILED;
-		memset(data, 1, sizeof(u64) * TG3_NUM_TEST);
-		return;
+	if (tp->phy_flags & TG3_PHYFLG_IS_LOW_POWER) {
+		if (tg3_power_up(tp)) {
+			etest->flags |= ETH_TEST_FL_FAILED;
+			memset(data, 1, sizeof(u64) * TG3_NUM_TEST);
+			return;
+		}
+		tg3_ape_driver_state_change(tp, RESET_KIND_INIT);
 	}
 
 	memset(data, 0, sizeof(u64) * TG3_NUM_TEST);
@@ -13078,7 +13504,7 @@ static void tg3_self_test(struct net_device *dev, struct ethtool_test *etest,
 		tg3_halt(tp, RESET_KIND_SHUTDOWN, 1);
 		if (netif_running(dev)) {
 			tg3_flag_set(tp, INIT_COMPLETE);
-			err2 = tg3_restart_hw(tp, 1);
+			err2 = tg3_restart_hw(tp, true);
 			if (!err2)
 				tg3_netif_start(tp);
 		}
@@ -13307,6 +13733,57 @@ static int tg3_set_coalesce(struct net_device *dev, struct ethtool_coalesce *ec)
 	return 0;
 }
 
+static int tg3_set_eee(struct net_device *dev, struct ethtool_eee *edata)
+{
+	struct tg3 *tp = netdev_priv(dev);
+
+	if (!(tp->phy_flags & TG3_PHYFLG_EEE_CAP)) {
+		netdev_warn(tp->dev, "Board does not support EEE!\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (edata->advertised != tp->eee.advertised) {
+		netdev_warn(tp->dev,
+			    "Direct manipulation of EEE advertisement is not supported\n");
+		return -EINVAL;
+	}
+
+	if (edata->tx_lpi_timer > TG3_CPMU_DBTMR1_LNKIDLE_MAX) {
+		netdev_warn(tp->dev,
+			    "Maximal Tx Lpi timer supported is %#x(u)\n",
+			    TG3_CPMU_DBTMR1_LNKIDLE_MAX);
+		return -EINVAL;
+	}
+
+	tp->eee = *edata;
+
+	tp->phy_flags |= TG3_PHYFLG_USER_CONFIGURED;
+	tg3_warn_mgmt_link_flap(tp);
+
+	if (netif_running(tp->dev)) {
+		tg3_full_lock(tp, 0);
+		tg3_setup_eee(tp);
+		tg3_phy_reset(tp);
+		tg3_full_unlock(tp);
+	}
+
+	return 0;
+}
+
+static int tg3_get_eee(struct net_device *dev, struct ethtool_eee *edata)
+{
+	struct tg3 *tp = netdev_priv(dev);
+
+	if (!(tp->phy_flags & TG3_PHYFLG_EEE_CAP)) {
+		netdev_warn(tp->dev,
+			    "Board does not support EEE!\n");
+		return -EOPNOTSUPP;
+	}
+
+	*edata = tp->eee;
+	return 0;
+}
+
 static const struct ethtool_ops tg3_ethtool_ops = {
 	.get_settings		= tg3_get_settings,
 	.set_settings		= tg3_set_settings,
@@ -13340,6 +13817,8 @@ static const struct ethtool_ops tg3_ethtool_ops = {
 	.get_channels		= tg3_get_channels,
 	.set_channels		= tg3_set_channels,
 	.get_ts_info		= tg3_get_ts_info,
+	.get_eee		= tg3_get_eee,
+	.set_eee		= tg3_set_eee,
 };
 
 static struct rtnl_link_stats64 *tg3_get_stats64(struct net_device *dev,
@@ -13395,7 +13874,8 @@ static inline void tg3_set_mtu(struct net_device *dev, struct tg3 *tp,
 static int tg3_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct tg3 *tp = netdev_priv(dev);
-	int err, reset_phy = 0;
+	int err;
+	bool reset_phy = false;
 
 	if (new_mtu < TG3_MIN_MTU || new_mtu > TG3_MAX_MTU(tp))
 		return -EINVAL;
@@ -13422,7 +13902,7 @@ static int tg3_change_mtu(struct net_device *dev, int new_mtu)
 	 * breaks all requests to 256 bytes.
 	 */
 	if (tg3_asic_rev(tp) == ASIC_REV_57766)
-		reset_phy = 1;
+		reset_phy = true;
 
 	err = tg3_restart_hw(tp, reset_phy);
 
@@ -13988,6 +14468,12 @@ static void tg3_get_5720_nvram_info(struct tg3 *tp)
 		case FLASH_5762_EEPROM_LD:
 			nvmpinstrp = FLASH_5720_EEPROM_LD;
 			break;
+		case FLASH_5720VENDOR_M_ST_M45PE20:
+			/* This pinstrap supports multiple sizes, so force it
+			 * to read the actual size from location 0xf0.
+			 */
+			nvmpinstrp = FLASH_5720VENDOR_ST_45USPT;
+			break;
 		}
 	}
 
@@ -14440,14 +14926,18 @@ static void tg3_get_eeprom_hw_cfg(struct tg3 *tp)
 		    (cfg2 & NIC_SRAM_DATA_CFG_2_APD_EN))
 			tp->phy_flags |= TG3_PHYFLG_ENABLE_APD;
 
-		if (tg3_flag(tp, PCI_EXPRESS) &&
-		    tg3_asic_rev(tp) != ASIC_REV_5785 &&
-		    !tg3_flag(tp, 57765_PLUS)) {
+		if (tg3_flag(tp, PCI_EXPRESS)) {
 			u32 cfg3;
 
 			tg3_read_mem(tp, NIC_SRAM_DATA_CFG_3, &cfg3);
-			if (cfg3 & NIC_SRAM_ASPM_DEBOUNCE)
+			if (tg3_asic_rev(tp) != ASIC_REV_5785 &&
+			    !tg3_flag(tp, 57765_PLUS) &&
+			    (cfg3 & NIC_SRAM_ASPM_DEBOUNCE))
 				tg3_flag_set(tp, ASPM_WORKAROUND);
+			if (cfg3 & NIC_SRAM_LNK_FLAP_AVOID)
+				tp->phy_flags |= TG3_PHYFLG_KEEP_LINK_ON_PWRDN;
+			if (cfg3 & NIC_SRAM_1G_ON_VAUX_OK)
+				tp->phy_flags |= TG3_PHYFLG_1G_ON_VAUX_OK;
 		}
 
 		if (cfg4 & NIC_SRAM_RGMII_INBAND_DISABLE)
@@ -14601,6 +15091,12 @@ static int tg3_phy_probe(struct tg3 *tp)
 		}
 	}
 
+	if (!tg3_flag(tp, ENABLE_ASF) &&
+	    !(tp->phy_flags & TG3_PHYFLG_ANY_SERDES) &&
+	    !(tp->phy_flags & TG3_PHYFLG_10_100_ONLY))
+		tp->phy_flags &= ~(TG3_PHYFLG_1G_ON_VAUX_OK |
+				   TG3_PHYFLG_KEEP_LINK_ON_PWRDN);
+
 	if (tg3_flag(tp, USE_PHYLIB))
 		return tg3_phy_init(tp);
 
@@ -14671,12 +15167,22 @@ static int tg3_phy_probe(struct tg3 *tp)
 	     (tg3_asic_rev(tp) == ASIC_REV_5717 &&
 	      tg3_chip_rev_id(tp) != CHIPREV_ID_5717_A0) ||
 	     (tg3_asic_rev(tp) == ASIC_REV_57765 &&
-	      tg3_chip_rev_id(tp) != CHIPREV_ID_57765_A0)))
+	      tg3_chip_rev_id(tp) != CHIPREV_ID_57765_A0))) {
 		tp->phy_flags |= TG3_PHYFLG_EEE_CAP;
+
+		tp->eee.supported = SUPPORTED_100baseT_Full |
+				    SUPPORTED_1000baseT_Full;
+		tp->eee.advertised = ADVERTISED_100baseT_Full |
+				     ADVERTISED_1000baseT_Full;
+		tp->eee.eee_enabled = 1;
+		tp->eee.tx_lpi_enabled = 1;
+		tp->eee.tx_lpi_timer = TG3_CPMU_DBTMR1_LNKIDLE_2047US;
+	}
 
 	tg3_phy_init_link_config(tp);
 
-	if (!(tp->phy_flags & TG3_PHYFLG_ANY_SERDES) &&
+	if (!(tp->phy_flags & TG3_PHYFLG_KEEP_LINK_ON_PWRDN) &&
+	    !(tp->phy_flags & TG3_PHYFLG_ANY_SERDES) &&
 	    !tg3_flag(tp, ENABLE_APE) &&
 	    !tg3_flag(tp, ENABLE_ASF)) {
 		u32 bmsr, dummy;
@@ -16305,7 +16811,7 @@ out:
 }
 
 static int tg3_do_test_dma(struct tg3 *tp, u32 *buf, dma_addr_t buf_dma,
-			   int size, int to_device)
+			   int size, bool to_device)
 {
 	struct tg3_internal_buffer_desc test_desc;
 	u32 sram_dma_descs;
@@ -16505,7 +17011,7 @@ static int tg3_test_dma(struct tg3 *tp)
 			p[i] = i;
 
 		/* Send the buffer to the chip. */
-		ret = tg3_do_test_dma(tp, buf, buf_dma, TEST_BUFFER_SIZE, 1);
+		ret = tg3_do_test_dma(tp, buf, buf_dma, TEST_BUFFER_SIZE, true);
 		if (ret) {
 			dev_err(&tp->pdev->dev,
 				"%s: Buffer write failed. err = %d\n",
@@ -16528,7 +17034,7 @@ static int tg3_test_dma(struct tg3 *tp)
 		}
 #endif
 		/* Now read it back. */
-		ret = tg3_do_test_dma(tp, buf, buf_dma, TEST_BUFFER_SIZE, 0);
+		ret = tg3_do_test_dma(tp, buf, buf_dma, TEST_BUFFER_SIZE, false);
 		if (ret) {
 			dev_err(&tp->pdev->dev, "%s: Buffer read failed. "
 				"err = %d\n", __func__, ret);
@@ -16744,7 +17250,7 @@ static int tg3_init_one(struct pci_dev *pdev,
 {
 	struct net_device *dev;
 	struct tg3 *tp;
-	int i, err, pm_cap;
+	int i, err;
 	u32 sndmbx, rcvmbx, intmbx;
 	char str[40];
 	u64 dma_mask, persist_dma_mask;
@@ -16766,25 +17272,10 @@ static int tg3_init_one(struct pci_dev *pdev,
 
 	pci_set_master(pdev);
 
-	/* Find power-management capability. */
-	pm_cap = pci_find_capability(pdev, PCI_CAP_ID_PM);
-	if (pm_cap == 0) {
-		dev_err(&pdev->dev,
-			"Cannot find Power Management capability, aborting\n");
-		err = -EIO;
-		goto err_out_free_res;
-	}
-
-	err = pci_set_power_state(pdev, PCI_D0);
-	if (err) {
-		dev_err(&pdev->dev, "Transition to D0 failed, aborting\n");
-		goto err_out_free_res;
-	}
-
 	dev = alloc_etherdev_mq(sizeof(*tp), TG3_IRQ_MAX_VECS);
 	if (!dev) {
 		err = -ENOMEM;
-		goto err_out_power_down;
+		goto err_out_free_res;
 	}
 
 	SET_NETDEV_DEV(dev, &pdev->dev);
@@ -16792,7 +17283,7 @@ static int tg3_init_one(struct pci_dev *pdev,
 	tp = netdev_priv(dev);
 	tp->pdev = pdev;
 	tp->dev = dev;
-	tp->pm_cap = pm_cap;
+	tp->pm_cap = pdev->pm_cap;
 	tp->rx_mode = TG3_DEF_RX_MODE;
 	tp->tx_mode = TG3_DEF_TX_MODE;
 	tp->irq_sync = 1;
@@ -16924,7 +17415,7 @@ static int tg3_init_one(struct pci_dev *pdev,
 
 	tg3_init_bufmgr_config(tp);
 
-	features |= NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_RX;
+	features |= NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
 
 	/* 5700 B0 chips do not support checksumming correctly due
 	 * to hardware bugs.
@@ -17130,14 +17621,12 @@ err_out_iounmap:
 err_out_free_dev:
 	free_netdev(dev);
 
-err_out_power_down:
-	pci_set_power_state(pdev, PCI_D3hot);
-
 err_out_free_res:
 	pci_release_regions(pdev);
 
 err_out_disable_pdev:
-	pci_disable_device(pdev);
+	if (pci_is_enabled(pdev))
+		pci_disable_device(pdev);
 	pci_set_drvdata(pdev, NULL);
 	return err;
 }
@@ -17209,7 +17698,7 @@ static int tg3_suspend(struct device *device)
 		tg3_full_lock(tp, 0);
 
 		tg3_flag_set(tp, INIT_COMPLETE);
-		err2 = tg3_restart_hw(tp, 1);
+		err2 = tg3_restart_hw(tp, true);
 		if (err2)
 			goto out;
 
@@ -17242,8 +17731,11 @@ static int tg3_resume(struct device *device)
 
 	tg3_full_lock(tp, 0);
 
+	tg3_ape_driver_state_change(tp, RESET_KIND_INIT);
+
 	tg3_flag_set(tp, INIT_COMPLETE);
-	err = tg3_restart_hw(tp, 1);
+	err = tg3_restart_hw(tp,
+			     !(tp->phy_flags & TG3_PHYFLG_KEEP_LINK_ON_PWRDN));
 	if (err)
 		goto out;
 
@@ -17259,15 +17751,9 @@ out:
 
 	return err;
 }
+#endif /* CONFIG_PM_SLEEP */
 
 static SIMPLE_DEV_PM_OPS(tg3_pm_ops, tg3_suspend, tg3_resume);
-#define TG3_PM_OPS (&tg3_pm_ops)
-
-#else
-
-#define TG3_PM_OPS NULL
-
-#endif /* CONFIG_PM_SLEEP */
 
 /**
  * tg3_io_error_detected - called when PCI error is detected
@@ -17288,7 +17774,8 @@ static pci_ers_result_t tg3_io_error_detected(struct pci_dev *pdev,
 
 	rtnl_lock();
 
-	if (!netif_running(netdev))
+	/* We probably don't have netdev yet */
+	if (!netdev || !netif_running(netdev))
 		goto done;
 
 	tg3_phy_stop(tp);
@@ -17308,10 +17795,15 @@ static pci_ers_result_t tg3_io_error_detected(struct pci_dev *pdev,
 	tg3_full_unlock(tp);
 
 done:
-	if (state == pci_channel_io_perm_failure)
+	if (state == pci_channel_io_perm_failure) {
+		if (netdev) {
+			tg3_napi_enable(tp);
+			dev_close(netdev);
+		}
 		err = PCI_ERS_RESULT_DISCONNECT;
-	else
+	} else {
 		pci_disable_device(pdev);
+	}
 
 	rtnl_unlock();
 
@@ -17337,7 +17829,8 @@ static pci_ers_result_t tg3_io_slot_reset(struct pci_dev *pdev)
 	rtnl_lock();
 
 	if (pci_enable_device(pdev)) {
-		netdev_err(netdev, "Cannot re-enable PCI device after reset.\n");
+		dev_err(&pdev->dev,
+			"Cannot re-enable PCI device after reset.\n");
 		goto done;
 	}
 
@@ -17345,7 +17838,7 @@ static pci_ers_result_t tg3_io_slot_reset(struct pci_dev *pdev)
 	pci_restore_state(pdev);
 	pci_save_state(pdev);
 
-	if (!netif_running(netdev)) {
+	if (!netdev || !netif_running(netdev)) {
 		rc = PCI_ERS_RESULT_RECOVERED;
 		goto done;
 	}
@@ -17357,6 +17850,10 @@ static pci_ers_result_t tg3_io_slot_reset(struct pci_dev *pdev)
 	rc = PCI_ERS_RESULT_RECOVERED;
 
 done:
+	if (rc != PCI_ERS_RESULT_RECOVERED && netdev && netif_running(netdev)) {
+		tg3_napi_enable(tp);
+		dev_close(netdev);
+	}
 	rtnl_unlock();
 
 	return rc;
@@ -17381,8 +17878,9 @@ static void tg3_io_resume(struct pci_dev *pdev)
 		goto done;
 
 	tg3_full_lock(tp, 0);
+	tg3_ape_driver_state_change(tp, RESET_KIND_INIT);
 	tg3_flag_set(tp, INIT_COMPLETE);
-	err = tg3_restart_hw(tp, 1);
+	err = tg3_restart_hw(tp, true);
 	if (err) {
 		tg3_full_unlock(tp);
 		netdev_err(netdev, "Cannot restart hardware after reset.\n");
@@ -17415,18 +17913,7 @@ static struct pci_driver tg3_driver = {
 	.probe		= tg3_init_one,
 	.remove		= tg3_remove_one,
 	.err_handler	= &tg3_err_handler,
-	.driver.pm	= TG3_PM_OPS,
+	.driver.pm	= &tg3_pm_ops,
 };
 
-static int __init tg3_init(void)
-{
-	return pci_register_driver(&tg3_driver);
-}
-
-static void __exit tg3_cleanup(void)
-{
-	pci_unregister_driver(&tg3_driver);
-}
-
-module_init(tg3_init);
-module_exit(tg3_cleanup);
+module_pci_driver(tg3_driver);

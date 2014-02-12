@@ -15,11 +15,9 @@
 #include <linux/err.h>
 #include <linux/acct.h>
 #include <linux/slab.h>
-#include <linux/proc_fs.h>
+#include <linux/proc_ns.h>
 #include <linux/reboot.h>
 #include <linux/export.h>
-
-#define BITS_PER_PAGE		(PAGE_SIZE*8)
 
 struct pid_cache {
 	int nr_ids;
@@ -351,8 +349,8 @@ static int pidns_install(struct nsproxy *nsproxy, void *ns)
 	if (ancestor != active)
 		return -EINVAL;
 
-	put_pid_ns(nsproxy->pid_ns);
-	nsproxy->pid_ns = get_pid_ns(new);
+	put_pid_ns(nsproxy->pid_ns_for_children);
+	nsproxy->pid_ns_for_children = get_pid_ns(new);
 	return 0;
 }
 

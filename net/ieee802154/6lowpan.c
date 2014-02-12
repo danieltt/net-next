@@ -1139,10 +1139,10 @@ static netdev_tx_t lowpan_xmit(struct sk_buff *skb, struct net_device *dev)
 error:
 	dev_kfree_skb(skb);
 out:
-	if (err < 0)
+	if (err)
 		pr_debug("ERROR: xmit failed\n");
 
-	return (err < 0 ? NETDEV_TX_BUSY : NETDEV_TX_OK);
+	return (err < 0) ? NET_XMIT_DROP : err;
 }
 
 static struct wpan_phy *lowpan_get_phy(const struct net_device *dev)
@@ -1352,10 +1352,9 @@ static inline void lowpan_netlink_fini(void)
 }
 
 static int lowpan_device_event(struct notifier_block *unused,
-				unsigned long event,
-				void *ptr)
+			       unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	LIST_HEAD(del_list);
 	struct lowpan_dev_record *entry, *tmp;
 

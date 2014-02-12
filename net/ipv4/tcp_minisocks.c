@@ -317,7 +317,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 			key = tp->af_specific->md5_lookup(sk, sk);
 			if (key != NULL) {
 				tcptw->tw_md5_key = kmemdup(key, sizeof(*key), GFP_ATOMIC);
-				if (tcptw->tw_md5_key && tcp_alloc_md5sig_pool(sk) == NULL)
+				if (tcptw->tw_md5_key && !tcp_alloc_md5sig_pool())
 					BUG();
 			}
 		} while (0);
@@ -358,10 +358,8 @@ void tcp_twsk_destructor(struct sock *sk)
 #ifdef CONFIG_TCP_MD5SIG
 	struct tcp_timewait_sock *twsk = tcp_twsk(sk);
 
-	if (twsk->tw_md5_key) {
-		tcp_free_md5sig_pool();
+	if (twsk->tw_md5_key)
 		kfree_rcu(twsk->tw_md5_key, rcu);
-	}
 #endif
 }
 EXPORT_SYMBOL_GPL(tcp_twsk_destructor);
@@ -551,8 +549,13 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 		 *
 		 * Note that even if there is new data in the SYN packet
 		 * they will be thrown away too.
+		 *
+		 * Reset timer after retransmitting SYNACK, similar to
+		 * the idea of fast retransmit in recovery.
 		 */
-		inet_rtx_syn_ack(sk, req);
+		if (!inet_rtx_syn_ack(sk, req))
+			req->expires = min(TCP_TIMEOUT_INIT << req->num_timeout,
+					   TCP_RTO_MAX) + jiffies;
 		return NULL;
 	}
 

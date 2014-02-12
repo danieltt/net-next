@@ -215,6 +215,7 @@ void in_dev_finish_destroy(struct in_device *idev)
 
 	WARN_ON(idev->ifa_list);
 	WARN_ON(idev->mc_list);
+	kfree(rcu_dereference_protected(idev->mc_hash, 1));
 #ifdef NET_REFCNT_DEBUG
 	pr_debug("%s: %p=%s\n", __func__, idev, dev ? dev->name : "NIL");
 #endif
@@ -587,13 +588,16 @@ static void check_lifetime(struct work_struct *work)
 {
 	unsigned long now, next, next_sec, next_sched;
 	struct in_ifaddr *ifa;
+	struct hlist_node *n;
 	int i;
 
 	now = jiffies;
 	next = round_jiffies_up(now + ADDR_CHECK_FREQUENCY);
 
-	rcu_read_lock();
 	for (i = 0; i < IN4_ADDR_HSIZE; i++) {
+		bool change_needed = false;
+
+		rcu_read_lock();
 		hlist_for_each_entry_rcu(ifa, &inet_addr_lst[i], hash) {
 			unsigned long age;
 
@@ -606,16 +610,7 @@ static void check_lifetime(struct work_struct *work)
 
 			if (ifa->ifa_valid_lft != INFINITY_LIFE_TIME &&
 			    age >= ifa->ifa_valid_lft) {
-				struct in_ifaddr **ifap ;
-
-				rtnl_lock();
-				for (ifap = &ifa->ifa_dev->ifa_list;
-				     *ifap != NULL; ifap = &ifa->ifa_next) {
-					if (*ifap == ifa)
-						inet_del_ifa(ifa->ifa_dev,
-							     ifap, 1);
-				}
-				rtnl_unlock();
+				change_needed = true;
 			} else if (ifa->ifa_preferred_lft ==
 				   INFINITY_LIFE_TIME) {
 				continue;
@@ -625,10 +620,8 @@ static void check_lifetime(struct work_struct *work)
 					next = ifa->ifa_tstamp +
 					       ifa->ifa_valid_lft * HZ;
 
-				if (!(ifa->ifa_flags & IFA_F_DEPRECATED)) {
-					ifa->ifa_flags |= IFA_F_DEPRECATED;
-					rtmsg_ifa(RTM_NEWADDR, ifa, NULL, 0);
-				}
+				if (!(ifa->ifa_flags & IFA_F_DEPRECATED))
+					change_needed = true;
 			} else if (time_before(ifa->ifa_tstamp +
 					       ifa->ifa_preferred_lft * HZ,
 					       next)) {
@@ -636,8 +629,42 @@ static void check_lifetime(struct work_struct *work)
 				       ifa->ifa_preferred_lft * HZ;
 			}
 		}
+		rcu_read_unlock();
+		if (!change_needed)
+			continue;
+		rtnl_lock();
+		hlist_for_each_entry_safe(ifa, n, &inet_addr_lst[i], hash) {
+			unsigned long age;
+
+			if (ifa->ifa_flags & IFA_F_PERMANENT)
+				continue;
+
+			/* We try to batch several events at once. */
+			age = (now - ifa->ifa_tstamp +
+			       ADDRCONF_TIMER_FUZZ_MINUS) / HZ;
+
+			if (ifa->ifa_valid_lft != INFINITY_LIFE_TIME &&
+			    age >= ifa->ifa_valid_lft) {
+				struct in_ifaddr **ifap;
+
+				for (ifap = &ifa->ifa_dev->ifa_list;
+				     *ifap != NULL; ifap = &(*ifap)->ifa_next) {
+					if (*ifap == ifa) {
+						inet_del_ifa(ifa->ifa_dev,
+							     ifap, 1);
+						break;
+					}
+				}
+			} else if (ifa->ifa_preferred_lft !=
+				   INFINITY_LIFE_TIME &&
+				   age >= ifa->ifa_preferred_lft &&
+				   !(ifa->ifa_flags & IFA_F_DEPRECATED)) {
+				ifa->ifa_flags |= IFA_F_DEPRECATED;
+				rtmsg_ifa(RTM_NEWADDR, ifa, NULL, 0);
+			}
+		}
+		rtnl_unlock();
 	}
-	rcu_read_unlock();
 
 	next_sec = round_jiffies_up(next);
 	next_sched = next;
@@ -745,7 +772,7 @@ static struct in_ifaddr *rtm_to_ifaddr(struct net *net, struct nlmsghdr *nlh,
 		ci = nla_data(tb[IFA_CACHEINFO]);
 		if (!ci->ifa_valid || ci->ifa_prefered > ci->ifa_valid) {
 			err = -EINVAL;
-			goto errout;
+			goto errout_free;
 		}
 		*pvalid_lft = ci->ifa_valid;
 		*pprefered_lft = ci->ifa_prefered;
@@ -753,6 +780,8 @@ static struct in_ifaddr *rtm_to_ifaddr(struct net *net, struct nlmsghdr *nlh,
 
 	return ifa;
 
+errout_free:
+	inet_free_ifa(ifa);
 errout:
 	return ERR_PTR(err);
 }
@@ -802,8 +831,12 @@ static int inet_rtm_newaddr(struct sk_buff *skb, struct nlmsghdr *nlh)
 		if (nlh->nlmsg_flags & NLM_F_EXCL ||
 		    !(nlh->nlmsg_flags & NLM_F_REPLACE))
 			return -EEXIST;
-
-		set_ifa_lifetime(ifa_existing, valid_lft, prefered_lft);
+		ifa = ifa_existing;
+		set_ifa_lifetime(ifa, valid_lft, prefered_lft);
+		cancel_delayed_work(&check_lifetime_work);
+		schedule_delayed_work(&check_lifetime_work, 0);
+		rtmsg_ifa(RTM_NEWADDR, ifa, nlh, NETLINK_CB(skb).portid);
+		blocking_notifier_call_chain(&inetaddr_chain, NETDEV_UP, ifa);
 	}
 	return 0;
 }
@@ -1303,7 +1336,7 @@ static void inetdev_send_gratuitous_arp(struct net_device *dev,
 static int inetdev_event(struct notifier_block *this, unsigned long event,
 			 void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct in_device *in_dev = __in_dev_get_rtnl(dev);
 
 	ASSERT_RTNL();
@@ -1911,7 +1944,7 @@ static void inet_forward_change(struct net *net)
 	}
 }
 
-static int devinet_conf_proc(ctl_table *ctl, int write,
+static int devinet_conf_proc(struct ctl_table *ctl, int write,
 			     void __user *buffer,
 			     size_t *lenp, loff_t *ppos)
 {
@@ -1954,7 +1987,7 @@ static int devinet_conf_proc(ctl_table *ctl, int write,
 	return ret;
 }
 
-static int devinet_sysctl_forward(ctl_table *ctl, int write,
+static int devinet_sysctl_forward(struct ctl_table *ctl, int write,
 				  void __user *buffer,
 				  size_t *lenp, loff_t *ppos)
 {
@@ -1997,7 +2030,7 @@ static int devinet_sysctl_forward(ctl_table *ctl, int write,
 	return ret;
 }
 
-static int ipv4_doint_and_flush(ctl_table *ctl, int write,
+static int ipv4_doint_and_flush(struct ctl_table *ctl, int write,
 				void __user *buffer,
 				size_t *lenp, loff_t *ppos)
 {

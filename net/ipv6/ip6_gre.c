@@ -724,6 +724,11 @@ static netdev_tx_t ip6gre_xmit2(struct sk_buff *skb,
 		ipv6_push_nfrag_opts(skb, &opt.ops, &proto, NULL);
 	}
 
+	if (likely(!skb->encapsulation)) {
+		skb_reset_inner_headers(skb);
+		skb->encapsulation = 1;
+	}
+
 	skb_push(skb, gre_hlen);
 	skb_reset_network_header(skb);
 	skb_set_transport_header(skb, sizeof(*ipv6h));
@@ -1081,6 +1086,7 @@ static int ip6gre_tunnel_ioctl(struct net_device *dev,
 		}
 		if (t == NULL)
 			t = netdev_priv(dev);
+		memset(&p, 0, sizeof(p));
 		ip6gre_tnl_parm_to_user(&p, &t->parms);
 		if (copy_to_user(ifr->ifr_ifru.ifru_data, &p, sizeof(p)))
 			err = -EFAULT;
@@ -1128,6 +1134,7 @@ static int ip6gre_tunnel_ioctl(struct net_device *dev,
 		if (t) {
 			err = 0;
 
+			memset(&p, 0, sizeof(p));
 			ip6gre_tnl_parm_to_user(&p, &t->parms);
 			if (copy_to_user(ifr->ifr_ifru.ifru_data, &p, sizeof(p)))
 				err = -EFAULT;

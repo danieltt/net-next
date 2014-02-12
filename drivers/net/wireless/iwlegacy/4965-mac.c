@@ -588,6 +588,11 @@ il4965_pass_packet_to_mac80211(struct il_priv *il, struct ieee80211_hdr *hdr,
 		return;
 	}
 
+	if (unlikely(test_bit(IL_STOP_REASON_PASSIVE, &il->stop_reason))) {
+		il_wake_queues_by_reason(il, IL_STOP_REASON_PASSIVE);
+		D_INFO("Woke queues - frame received on passive channel\n");
+	}
+
 	/* In case of HW accelerated crypto and bad decryption, drop */
 	if (!il->cfg->mod_params->sw_crypto &&
 	    il_set_decrypted_flag(il, hdr, ampdu_status, stats))
@@ -2806,6 +2811,19 @@ il4965_hdl_tx(struct il_priv *il, struct il_rx_buf *rxb)
 		return;
 	}
 
+	/*
+	 * Firmware will not transmit frame on passive channel, if it not yet
+	 * received some valid frame on that channel. When this error happen
+	 * we have to wait until firmware will unblock itself i.e. when we
+	 * note received beacon or other frame. We unblock queues in
+	 * il4965_pass_packet_to_mac80211 or in il_mac_bss_info_changed.
+	 */
+	if (unlikely((status & TX_STATUS_MSK) == TX_STATUS_FAIL_PASSIVE_NO_RX) &&
+	    il->iw_mode == NL80211_IFTYPE_STATION) {
+		il_stop_queues_by_reason(il, IL_STOP_REASON_PASSIVE);
+		D_INFO("Stopped queues - RX waiting on passive channel\n");
+	}
+
 	spin_lock_irqsave(&il->sta_lock, flags);
 	if (txq->sched_retry) {
 		const u32 scd_ssn = il4965_get_scd_ssn(tx_resp);
@@ -4442,13 +4460,13 @@ il4965_irq_tasklet(struct il_priv *il)
 		 * is killed. Hence update the killswitch state here. The
 		 * rfkill handler will care about restarting if needed.
 		 */
-		if (!test_bit(S_ALIVE, &il->status)) {
-			if (hw_rf_kill)
-				set_bit(S_RFKILL, &il->status);
-			else
-				clear_bit(S_RFKILL, &il->status);
-			wiphy_rfkill_set_hw_state(il->hw->wiphy, hw_rf_kill);
+		if (hw_rf_kill) {
+			set_bit(S_RFKILL, &il->status);
+		} else {
+			clear_bit(S_RFKILL, &il->status);
+			il_force_reset(il, true);
 		}
+		wiphy_rfkill_set_hw_state(il->hw->wiphy, hw_rf_kill);
 
 		handled |= CSR_INT_BIT_RF_KILL;
 	}
@@ -4567,7 +4585,7 @@ il4965_store_debug_level(struct device *d, struct device_attribute *attr,
 	unsigned long val;
 	int ret;
 
-	ret = strict_strtoul(buf, 0, &val);
+	ret = kstrtoul(buf, 0, &val);
 	if (ret)
 		IL_ERR("%s is not in hex or decimal form.\n", buf);
 	else
@@ -4614,7 +4632,7 @@ il4965_store_tx_power(struct device *d, struct device_attribute *attr,
 	unsigned long val;
 	int ret;
 
-	ret = strict_strtoul(buf, 10, &val);
+	ret = kstrtoul(buf, 10, &val);
 	if (ret)
 		IL_INFO("%s is not in decimal form.\n", buf);
 	else {
@@ -5316,6 +5334,9 @@ il4965_alive_start(struct il_priv *il)
 
 	il->active_rate = RATES_MASK;
 
+	il_power_update_mode(il, true);
+	D_INFO("Updated power mode\n");
+
 	if (il_is_associated(il)) {
 		struct il_rxon_cmd *active_rxon =
 		    (struct il_rxon_cmd *)&il->active;
@@ -5345,9 +5366,6 @@ il4965_alive_start(struct il_priv *il)
 
 	D_INFO("ALIVE processing complete.\n");
 	wake_up(&il->wait_command_queue);
-
-	il_power_update_mode(il, true);
-	D_INFO("Updated power mode\n");
 
 	return;
 
@@ -6057,7 +6075,7 @@ il4965_mac_channel_switch(struct ieee80211_hw *hw,
 	struct il_priv *il = hw->priv;
 	const struct il_channel_info *ch_info;
 	struct ieee80211_conf *conf = &hw->conf;
-	struct ieee80211_channel *channel = ch_switch->channel;
+	struct ieee80211_channel *channel = ch_switch->chandef.chan;
 	struct il_ht_config *ht_conf = &il->current_ht_config;
 	u16 ch;
 
@@ -6094,23 +6112,21 @@ il4965_mac_channel_switch(struct ieee80211_hw *hw,
 	il->current_ht_config.smps = conf->smps_mode;
 
 	/* Configure HT40 channels */
-	il->ht.enabled = conf_is_ht(conf);
-	if (il->ht.enabled) {
-		if (conf_is_ht40_minus(conf)) {
-			il->ht.extension_chan_offset =
-			    IEEE80211_HT_PARAM_CHA_SEC_BELOW;
-			il->ht.is_40mhz = true;
-		} else if (conf_is_ht40_plus(conf)) {
-			il->ht.extension_chan_offset =
-			    IEEE80211_HT_PARAM_CHA_SEC_ABOVE;
-			il->ht.is_40mhz = true;
-		} else {
-			il->ht.extension_chan_offset =
-			    IEEE80211_HT_PARAM_CHA_SEC_NONE;
-			il->ht.is_40mhz = false;
-		}
-	} else
+	switch (cfg80211_get_chandef_type(&ch_switch->chandef)) {
+	case NL80211_CHAN_NO_HT:
+	case NL80211_CHAN_HT20:
 		il->ht.is_40mhz = false;
+		il->ht.extension_chan_offset = IEEE80211_HT_PARAM_CHA_SEC_NONE;
+		break;
+	case NL80211_CHAN_HT40MINUS:
+		il->ht.extension_chan_offset = IEEE80211_HT_PARAM_CHA_SEC_BELOW;
+		il->ht.is_40mhz = true;
+		break;
+	case NL80211_CHAN_HT40PLUS:
+		il->ht.extension_chan_offset = IEEE80211_HT_PARAM_CHA_SEC_ABOVE;
+		il->ht.is_40mhz = true;
+		break;
+	}
 
 	if ((le16_to_cpu(il->staging.channel) != ch))
 		il->staging.flags = 0;

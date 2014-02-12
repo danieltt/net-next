@@ -27,6 +27,8 @@
 
 #include <linux/types.h>
 
+#define NL80211_GENL_NAME "nl80211"
+
 /**
  * DOC: Station handling
  *
@@ -639,6 +641,13 @@
  *	with the relevant Information Elements. This event is used to report
  *	received FT IEs (MDIE, FTIE, RSN IE, TIE, RICIE).
  *
+ * @NL80211_CMD_CRIT_PROTOCOL_START: Indicates user-space will start running
+ *	a critical protocol that needs more reliability in the connection to
+ *	complete.
+ *
+ * @NL80211_CMD_CRIT_PROTOCOL_STOP: Indicates the connection reliability can
+ *	return back to normal.
+ *
  * @NL80211_CMD_MAX: highest used command number
  * @__NL80211_CMD_AFTER_LAST: internal use
  */
@@ -797,6 +806,9 @@ enum nl80211_commands {
 
 	NL80211_CMD_UPDATE_FT_IES,
 	NL80211_CMD_FT_EVENT,
+
+	NL80211_CMD_CRIT_PROTOCOL_START,
+	NL80211_CMD_CRIT_PROTOCOL_STOP,
 
 	/* add new commands above here */
 
@@ -1414,6 +1426,16 @@ enum nl80211_commands {
  * @NL80211_ATTR_IE_RIC: Resource Information Container Information
  *	Element
  *
+ * @NL80211_ATTR_CRIT_PROT_ID: critical protocol identifier requiring increased
+ *	reliability, see &enum nl80211_crit_proto_id (u16).
+ * @NL80211_ATTR_MAX_CRIT_PROT_DURATION: duration in milliseconds in which
+ *      the connection should have increased reliability (u16).
+ *
+ * @NL80211_ATTR_PEER_AID: Association ID for the peer TDLS station (u16).
+ *	This is similar to @NL80211_ATTR_STA_AID but with a difference of being
+ *	allowed to be used with the first @NL80211_CMD_SET_STATION command to
+ *	update a TDLS peer STA entry.
+ *
  * @NL80211_ATTR_MAX: highest attribute number currently defined
  * @__NL80211_ATTR_AFTER_LAST: internal use
  */
@@ -1709,6 +1731,11 @@ enum nl80211_attrs {
 	NL80211_ATTR_MDID,
 	NL80211_ATTR_IE_RIC,
 
+	NL80211_ATTR_CRIT_PROT_ID,
+	NL80211_ATTR_MAX_CRIT_PROT_DURATION,
+
+	NL80211_ATTR_PEER_AID,
+
 	/* add attributes here, update the policy in nl80211.c */
 
 	__NL80211_ATTR_AFTER_LAST,
@@ -1973,6 +2000,10 @@ enum nl80211_sta_bss_param {
  * @NL80211_STA_INFO_PEER_PM: peer mesh STA link-specific power mode
  * @NL80211_STA_INFO_NONPEER_PM: neighbor mesh STA power save mode towards
  *	non-peer STA
+ * @NL80211_STA_INFO_CHAIN_SIGNAL: per-chain signal strength of last PPDU
+ *	Contains a nested array of signal strength attributes (u8, dBm)
+ * @NL80211_STA_INFO_CHAIN_SIGNAL_AVG: per-chain signal strength average
+ *	Same format as NL80211_STA_INFO_CHAIN_SIGNAL.
  * @__NL80211_STA_INFO_AFTER_LAST: internal
  * @NL80211_STA_INFO_MAX: highest possible station info attribute
  */
@@ -2002,6 +2033,8 @@ enum nl80211_sta_info {
 	NL80211_STA_INFO_NONPEER_PM,
 	NL80211_STA_INFO_RX_BYTES64,
 	NL80211_STA_INFO_TX_BYTES64,
+	NL80211_STA_INFO_CHAIN_SIGNAL,
+	NL80211_STA_INFO_CHAIN_SIGNAL_AVG,
 
 	/* keep last */
 	__NL80211_STA_INFO_AFTER_LAST,
@@ -2395,6 +2428,8 @@ enum nl80211_survey_info {
  * @NL80211_MNTR_FLAG_OTHER_BSS: disable BSSID filtering
  * @NL80211_MNTR_FLAG_COOK_FRAMES: report frames after processing.
  *	overrides all other flags.
+ * @NL80211_MNTR_FLAG_ACTIVE: use the configured MAC address
+ *	and ACK incoming unicast packets.
  *
  * @__NL80211_MNTR_FLAG_AFTER_LAST: internal use
  * @NL80211_MNTR_FLAG_MAX: highest possible monitor flag
@@ -2406,6 +2441,7 @@ enum nl80211_mntr_flags {
 	NL80211_MNTR_FLAG_CONTROL,
 	NL80211_MNTR_FLAG_OTHER_BSS,
 	NL80211_MNTR_FLAG_COOK_FRAMES,
+	NL80211_MNTR_FLAG_ACTIVE,
 
 	/* keep last */
 	__NL80211_MNTR_FLAG_AFTER_LAST,
@@ -2541,6 +2577,10 @@ enum nl80211_mesh_power_mode {
  *
  * @NL80211_MESHCONF_AWAKE_WINDOW: awake window duration (in TUs)
  *
+ * @NL80211_MESHCONF_PLINK_TIMEOUT: If no tx activity is seen from a STA we've
+ *	established peering with for longer than this time (in seconds), then
+ *	remove it from the STA's list of peers.  Default is 30 minutes.
+ *
  * @__NL80211_MESHCONF_ATTR_AFTER_LAST: internal use
  */
 enum nl80211_meshconf_params {
@@ -2572,6 +2612,7 @@ enum nl80211_meshconf_params {
 	NL80211_MESHCONF_HWMP_CONFIRMATION_INTERVAL,
 	NL80211_MESHCONF_POWER_MODE,
 	NL80211_MESHCONF_AWAKE_WINDOW,
+	NL80211_MESHCONF_PLINK_TIMEOUT,
 
 	/* keep last */
 	__NL80211_MESHCONF_ATTR_AFTER_LAST,
@@ -2619,6 +2660,10 @@ enum nl80211_meshconf_params {
  * @NL80211_MESH_SETUP_USERSPACE_MPM: Enable this option if userspace will
  *	implement an MPM which handles peer allocation and state.
  *
+ * @NL80211_MESH_SETUP_AUTH_PROTOCOL: Inform the kernel of the authentication
+ *	method (u8, as defined in IEEE 8.4.2.100.6, e.g. 0x1 for SAE).
+ *	Default is no authentication method required.
+ *
  * @NL80211_MESH_SETUP_ATTR_MAX: highest possible mesh setup attribute number
  *
  * @__NL80211_MESH_SETUP_ATTR_AFTER_LAST: Internal use
@@ -2632,6 +2677,7 @@ enum nl80211_mesh_setup_params {
 	NL80211_MESH_SETUP_USERSPACE_AMPE,
 	NL80211_MESH_SETUP_ENABLE_VENDOR_SYNC,
 	NL80211_MESH_SETUP_USERSPACE_MPM,
+	NL80211_MESH_SETUP_AUTH_PROTOCOL,
 
 	/* keep last */
 	__NL80211_MESH_SETUP_ATTR_AFTER_LAST,
@@ -2712,6 +2758,8 @@ enum nl80211_channel_type {
  *	and %NL80211_ATTR_CENTER_FREQ2 attributes must be provided as well
  * @NL80211_CHAN_WIDTH_160: 160 MHz channel, the %NL80211_ATTR_CENTER_FREQ1
  *	attribute must be provided as well
+ * @NL80211_CHAN_WIDTH_5: 5 MHz OFDM channel
+ * @NL80211_CHAN_WIDTH_10: 10 MHz OFDM channel
  */
 enum nl80211_chan_width {
 	NL80211_CHAN_WIDTH_20_NOHT,
@@ -2720,6 +2768,8 @@ enum nl80211_chan_width {
 	NL80211_CHAN_WIDTH_80,
 	NL80211_CHAN_WIDTH_80P80,
 	NL80211_CHAN_WIDTH_160,
+	NL80211_CHAN_WIDTH_5,
+	NL80211_CHAN_WIDTH_10,
 };
 
 /**
@@ -3538,6 +3588,10 @@ enum nl80211_ap_sme_features {
  *	Peering Management entity which may be implemented by registering for
  *	beacons or NL80211_CMD_NEW_PEER_CANDIDATE events. The mesh beacon is
  *	still generated by the driver.
+ * @NL80211_FEATURE_ACTIVE_MONITOR: This driver supports an active monitor
+ *	interface. An active monitor interface behaves like a normal monitor
+ *	interface, but gets added to the driver. It ensures that incoming
+ *	unicast packets directed at the configured interface address get ACKed.
  */
 enum nl80211_feature_flags {
 	NL80211_FEATURE_SK_TX_STATUS			= 1 << 0,
@@ -3557,6 +3611,7 @@ enum nl80211_feature_flags {
 	NL80211_FEATURE_ADVERTISE_CHAN_LIMITS		= 1 << 14,
 	NL80211_FEATURE_FULL_AP_CLIENT_STATE		= 1 << 15,
 	NL80211_FEATURE_USERSPACE_MPM			= 1 << 16,
+	NL80211_FEATURE_ACTIVE_MONITOR			= 1 << 17,
 };
 
 /**
@@ -3681,5 +3736,26 @@ enum nl80211_dfs_state {
 enum nl80211_protocol_features {
 	NL80211_PROTOCOL_FEATURE_SPLIT_WIPHY_DUMP =	1 << 0,
 };
+
+/**
+ * enum nl80211_crit_proto_id - nl80211 critical protocol identifiers
+ *
+ * @NL80211_CRIT_PROTO_UNSPEC: protocol unspecified.
+ * @NL80211_CRIT_PROTO_DHCP: BOOTP or DHCPv6 protocol.
+ * @NL80211_CRIT_PROTO_EAPOL: EAPOL protocol.
+ * @NL80211_CRIT_PROTO_APIPA: APIPA protocol.
+ * @NUM_NL80211_CRIT_PROTO: must be kept last.
+ */
+enum nl80211_crit_proto_id {
+	NL80211_CRIT_PROTO_UNSPEC,
+	NL80211_CRIT_PROTO_DHCP,
+	NL80211_CRIT_PROTO_EAPOL,
+	NL80211_CRIT_PROTO_APIPA,
+	/* add other protocols before this one */
+	NUM_NL80211_CRIT_PROTO
+};
+
+/* maximum duration for critical protocol measures */
+#define NL80211_CRIT_PROTO_MAX_DURATION		5000 /* msec */
 
 #endif /* __LINUX_NL80211_H */

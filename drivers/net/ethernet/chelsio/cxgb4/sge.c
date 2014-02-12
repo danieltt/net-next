@@ -1294,7 +1294,7 @@ static inline unsigned int calc_tx_flits_ofld(const struct sk_buff *skb)
 
 	flits = skb_transport_offset(skb) / 8U;   /* headers */
 	cnt = skb_shinfo(skb)->nr_frags;
-	if (skb->tail != skb->transport_header)
+	if (skb_tail_pointer(skb) != skb_transport_header(skb))
 		cnt++;
 	return flits + sgl_len(cnt);
 }
@@ -1633,7 +1633,7 @@ static void do_gro(struct sge_eth_rxq *rxq, const struct pkt_gl *gl,
 		skb->rxhash = (__force u32)pkt->rsshdr.hash_val;
 
 	if (unlikely(pkt->vlan_ex)) {
-		__vlan_hwaccel_put_tag(skb, ntohs(pkt->vlan));
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), ntohs(pkt->vlan));
 		rxq->stats.vlan_ex++;
 	}
 	ret = napi_gro_frags(&rxq->rspq.napi);
@@ -1705,7 +1705,7 @@ int t4_ethrx_handler(struct sge_rspq *q, const __be64 *rsp,
 		skb_checksum_none_assert(skb);
 
 	if (unlikely(pkt->vlan_ex)) {
-		__vlan_hwaccel_put_tag(skb, ntohs(pkt->vlan));
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), ntohs(pkt->vlan));
 		rxq->stats.vlan_ex++;
 	}
 	netif_receive_skb(skb);

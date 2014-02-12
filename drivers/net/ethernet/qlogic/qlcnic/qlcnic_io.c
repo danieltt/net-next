@@ -161,36 +161,68 @@ static inline int qlcnic_82xx_is_lb_pkt(u64 sts_data)
 	return (qlcnic_get_sts_status(sts_data) == STATUS_CKSUM_LOOP) ? 1 : 0;
 }
 
+static void qlcnic_delete_rx_list_mac(struct qlcnic_adapter *adapter,
+				      struct qlcnic_filter *fil,
+				      void *addr, u16 vlan_id)
+{
+	int ret;
+	u8 op;
+
+	op = vlan_id ? QLCNIC_MAC_VLAN_ADD : QLCNIC_MAC_ADD;
+	ret = qlcnic_sre_macaddr_change(adapter, addr, vlan_id, op);
+	if (ret)
+		return;
+
+	op = vlan_id ? QLCNIC_MAC_VLAN_DEL : QLCNIC_MAC_DEL;
+	ret = qlcnic_sre_macaddr_change(adapter, addr, vlan_id, op);
+	if (!ret) {
+		hlist_del(&fil->fnode);
+		adapter->rx_fhash.fnum--;
+	}
+}
+
+static struct qlcnic_filter *qlcnic_find_mac_filter(struct hlist_head *head,
+						    void *addr, u16 vlan_id)
+{
+	struct qlcnic_filter *tmp_fil = NULL;
+	struct hlist_node *n;
+
+	hlist_for_each_entry_safe(tmp_fil, n, head, fnode) {
+		if (!memcmp(tmp_fil->faddr, addr, ETH_ALEN) &&
+		    tmp_fil->vlan_id == vlan_id)
+			return tmp_fil;
+	}
+
+	return NULL;
+}
+
 void qlcnic_add_lb_filter(struct qlcnic_adapter *adapter, struct sk_buff *skb,
-			  int loopback_pkt, __le16 vlan_id)
+			  int loopback_pkt, u16 vlan_id)
 {
 	struct ethhdr *phdr = (struct ethhdr *)(skb->data);
 	struct qlcnic_filter *fil, *tmp_fil;
-	struct hlist_node *n;
 	struct hlist_head *head;
 	unsigned long time;
 	u64 src_addr = 0;
-	u8 hindex, found = 0, op;
+	u8 hindex, op;
 	int ret;
 
 	memcpy(&src_addr, phdr->h_source, ETH_ALEN);
+	hindex = qlcnic_mac_hash(src_addr) &
+		 (adapter->fhash.fbucket_size - 1);
 
 	if (loopback_pkt) {
 		if (adapter->rx_fhash.fnum >= adapter->rx_fhash.fmax)
 			return;
 
-		hindex = qlcnic_mac_hash(src_addr) &
-			 (adapter->fhash.fbucket_size - 1);
 		head = &(adapter->rx_fhash.fhead[hindex]);
 
-		hlist_for_each_entry_safe(tmp_fil, n, head, fnode) {
-			if (!memcmp(tmp_fil->faddr, &src_addr, ETH_ALEN) &&
-			    tmp_fil->vlan_id == vlan_id) {
-				time = tmp_fil->ftime;
-				if (jiffies > (QLCNIC_READD_AGE * HZ + time))
-					tmp_fil->ftime = jiffies;
-				return;
-			}
+		tmp_fil = qlcnic_find_mac_filter(head, &src_addr, vlan_id);
+		if (tmp_fil) {
+			time = tmp_fil->ftime;
+			if (time_after(jiffies, QLCNIC_READD_AGE * HZ + time))
+				tmp_fil->ftime = jiffies;
+			return;
 		}
 
 		fil = kzalloc(sizeof(struct qlcnic_filter), GFP_ATOMIC);
@@ -205,42 +237,43 @@ void qlcnic_add_lb_filter(struct qlcnic_adapter *adapter, struct sk_buff *skb,
 		adapter->rx_fhash.fnum++;
 		spin_unlock(&adapter->rx_mac_learn_lock);
 	} else {
-		hindex = qlcnic_mac_hash(src_addr) &
-			 (adapter->fhash.fbucket_size - 1);
-		head = &(adapter->rx_fhash.fhead[hindex]);
-		spin_lock(&adapter->rx_mac_learn_lock);
-		hlist_for_each_entry_safe(tmp_fil, n, head, fnode) {
-			if (!memcmp(tmp_fil->faddr, &src_addr, ETH_ALEN) &&
-			    tmp_fil->vlan_id == vlan_id) {
-				found = 1;
-				break;
-			}
-		}
+		head = &adapter->fhash.fhead[hindex];
 
-		if (!found) {
-			spin_unlock(&adapter->rx_mac_learn_lock);
-			return;
-		}
+		spin_lock(&adapter->mac_learn_lock);
 
-		op = vlan_id ? QLCNIC_MAC_VLAN_ADD : QLCNIC_MAC_ADD;
-		ret = qlcnic_sre_macaddr_change(adapter, (u8 *)&src_addr,
-						vlan_id, op);
-		if (!ret) {
+		tmp_fil = qlcnic_find_mac_filter(head, &src_addr, vlan_id);
+		if (tmp_fil) {
 			op = vlan_id ? QLCNIC_MAC_VLAN_DEL : QLCNIC_MAC_DEL;
 			ret = qlcnic_sre_macaddr_change(adapter,
 							(u8 *)&src_addr,
 							vlan_id, op);
 			if (!ret) {
-				hlist_del(&(tmp_fil->fnode));
-				adapter->rx_fhash.fnum--;
+				hlist_del(&tmp_fil->fnode);
+				adapter->fhash.fnum--;
 			}
+
+			spin_unlock(&adapter->mac_learn_lock);
+
+			return;
 		}
+
+		spin_unlock(&adapter->mac_learn_lock);
+
+		head = &adapter->rx_fhash.fhead[hindex];
+
+		spin_lock(&adapter->rx_mac_learn_lock);
+
+		tmp_fil = qlcnic_find_mac_filter(head, &src_addr, vlan_id);
+		if (tmp_fil)
+			qlcnic_delete_rx_list_mac(adapter, tmp_fil, &src_addr,
+						  vlan_id);
+
 		spin_unlock(&adapter->rx_mac_learn_lock);
 	}
 }
 
 void qlcnic_82xx_change_filter(struct qlcnic_adapter *adapter, u64 *uaddr,
-			       __le16 vlan_id)
+			       u16 vlan_id)
 {
 	struct cmd_desc_type0 *hwdesc;
 	struct qlcnic_nic_req *req;
@@ -262,10 +295,10 @@ void qlcnic_82xx_change_filter(struct qlcnic_adapter *adapter, u64 *uaddr,
 
 	mac_req = (struct qlcnic_mac_req *)&(req->words[0]);
 	mac_req->op = vlan_id ? QLCNIC_MAC_VLAN_ADD : QLCNIC_MAC_ADD;
-	memcpy(mac_req->mac_addr, &uaddr, ETH_ALEN);
+	memcpy(mac_req->mac_addr, uaddr, ETH_ALEN);
 
 	vlan_req = (struct qlcnic_vlan_req *)&req->words[1];
-	vlan_req->vlan_id = vlan_id;
+	vlan_req->vlan_id = cpu_to_le16(vlan_id);
 
 	tx_ring->producer = get_next_index(producer, tx_ring->num_desc);
 	smp_mb();
@@ -281,7 +314,7 @@ static void qlcnic_send_filter(struct qlcnic_adapter *adapter,
 	struct net_device *netdev = adapter->netdev;
 	struct ethhdr *phdr = (struct ethhdr *)(skb->data);
 	u64 src_addr = 0;
-	__le16 vlan_id = 0;
+	u16 vlan_id = 0;
 	u8 hindex;
 
 	if (ether_addr_equal(phdr->h_source, adapter->mac_addr))
@@ -344,14 +377,14 @@ static int qlcnic_tx_pkt(struct qlcnic_adapter *adapter,
 		flags = FLAGS_VLAN_OOB;
 		vlan_tci = vlan_tx_tag_get(skb);
 	}
-	if (unlikely(adapter->pvid)) {
+	if (unlikely(adapter->tx_pvid)) {
 		if (vlan_tci && !(adapter->flags & QLCNIC_TAGGING_ENABLED))
 			return -EIO;
 		if (vlan_tci && (adapter->flags & QLCNIC_TAGGING_ENABLED))
 			goto set_flags;
 
 		flags = FLAGS_VLAN_OOB;
-		vlan_tci = adapter->pvid;
+		vlan_tci = adapter->tx_pvid;
 	}
 set_flags:
 	qlcnic_set_tx_vlan_tci(first_desc, vlan_tci);
@@ -362,8 +395,7 @@ set_flags:
 		memcpy(&first_desc->eth_addr, skb->data, ETH_ALEN);
 	}
 	opcode = TX_ETHER_PKT;
-	if ((adapter->netdev->features & (NETIF_F_TSO | NETIF_F_TSO6)) &&
-	    skb_shinfo(skb)->gso_size > 0) {
+	if (skb_is_gso(skb)) {
 		hdr_len = skb_transport_offset(skb) + tcp_hdrlen(skb);
 		first_desc->mss = cpu_to_le16(skb_shinfo(skb)->gso_size);
 		first_desc->total_hdr_length = hdr_len;
@@ -980,10 +1012,10 @@ static inline int qlcnic_check_rx_tagging(struct qlcnic_adapter *adapter,
 		memmove(skb->data + VLAN_HLEN, eth_hdr, ETH_ALEN * 2);
 		skb_pull(skb, VLAN_HLEN);
 	}
-	if (!adapter->pvid)
+	if (!adapter->rx_pvid)
 		return 0;
 
-	if (*vlan_tag == adapter->pvid) {
+	if (*vlan_tag == adapter->rx_pvid) {
 		/* Outer vlan tag. Packet should follow non-vlan path */
 		*vlan_tag = 0xffff;
 		return 0;
@@ -1029,8 +1061,7 @@ qlcnic_process_rcv(struct qlcnic_adapter *adapter,
 	    (adapter->flags & QLCNIC_ESWITCH_ENABLED)) {
 		t_vid = 0;
 		is_lb_pkt = qlcnic_82xx_is_lb_pkt(sts_data0);
-		qlcnic_add_lb_filter(adapter, skb, is_lb_pkt,
-				     cpu_to_le16(t_vid));
+		qlcnic_add_lb_filter(adapter, skb, is_lb_pkt, t_vid);
 	}
 
 	if (length > rds_ring->skb_size)
@@ -1050,7 +1081,7 @@ qlcnic_process_rcv(struct qlcnic_adapter *adapter,
 	skb->protocol = eth_type_trans(skb, netdev);
 
 	if (vid != 0xffff)
-		__vlan_hwaccel_put_tag(skb, vid);
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
 
 	napi_gro_receive(&sds_ring->napi, skb);
 
@@ -1107,8 +1138,7 @@ qlcnic_process_lro(struct qlcnic_adapter *adapter,
 	    (adapter->flags & QLCNIC_ESWITCH_ENABLED)) {
 		t_vid = 0;
 		is_lb_pkt = qlcnic_82xx_is_lb_pkt(sts_data0);
-		qlcnic_add_lb_filter(adapter, skb, is_lb_pkt,
-				     cpu_to_le16(t_vid));
+		qlcnic_add_lb_filter(adapter, skb, is_lb_pkt, t_vid);
 	}
 
 	if (timestamp)
@@ -1153,7 +1183,7 @@ qlcnic_process_lro(struct qlcnic_adapter *adapter,
 	}
 
 	if (vid != 0xffff)
-		__vlan_hwaccel_put_tag(skb, vid);
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
 	netif_receive_skb(skb);
 
 	adapter->stats.lro_pkts++;
@@ -1500,8 +1530,7 @@ qlcnic_83xx_process_rcv(struct qlcnic_adapter *adapter,
 	    (adapter->flags & QLCNIC_ESWITCH_ENABLED)) {
 		t_vid = 0;
 		is_lb_pkt = qlcnic_83xx_is_lb_pkt(sts_data[1], 0);
-		qlcnic_add_lb_filter(adapter, skb, is_lb_pkt,
-				     cpu_to_le16(t_vid));
+		qlcnic_add_lb_filter(adapter, skb, is_lb_pkt, t_vid);
 	}
 
 	if (length > rds_ring->skb_size)
@@ -1518,7 +1547,7 @@ qlcnic_83xx_process_rcv(struct qlcnic_adapter *adapter,
 	skb->protocol = eth_type_trans(skb, netdev);
 
 	if (vid != 0xffff)
-		__vlan_hwaccel_put_tag(skb, vid);
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
 
 	napi_gro_receive(&sds_ring->napi, skb);
 
@@ -1570,8 +1599,7 @@ qlcnic_83xx_process_lro(struct qlcnic_adapter *adapter,
 	    (adapter->flags & QLCNIC_ESWITCH_ENABLED)) {
 		t_vid = 0;
 		is_lb_pkt = qlcnic_83xx_is_lb_pkt(sts_data[1], 1);
-		qlcnic_add_lb_filter(adapter, skb, is_lb_pkt,
-				     cpu_to_le16(t_vid));
+		qlcnic_add_lb_filter(adapter, skb, is_lb_pkt, t_vid);
 	}
 	if (qlcnic_83xx_is_tstamp(sts_data[1]))
 		data_offset = l4_hdr_offset + QLCNIC_TCP_TS_HDR_SIZE;
@@ -1615,7 +1643,7 @@ qlcnic_83xx_process_lro(struct qlcnic_adapter *adapter,
 	}
 
 	if (vid != 0xffff)
-		__vlan_hwaccel_put_tag(skb, vid);
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
 
 	netif_receive_skb(skb);
 

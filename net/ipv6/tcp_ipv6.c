@@ -63,6 +63,7 @@
 #include <net/inet_common.h>
 #include <net/secure_seq.h>
 #include <net/tcp_memcontrol.h>
+#include <net/busy_poll.h>
 
 #include <asm/uaccess.h>
 
@@ -386,6 +387,7 @@ static void tcp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 
 		if (dst)
 			dst->ops->redirect(dst, sk, skb);
+		goto out;
 	}
 
 	if (type == ICMPV6_PKT_TOOBIG) {
@@ -1404,6 +1406,7 @@ discard:
 	kfree_skb(skb);
 	return 0;
 csum_err:
+	TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_CSUMERRORS);
 	TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);
 	goto discard;
 
@@ -1465,7 +1468,7 @@ static int tcp_v6_rcv(struct sk_buff *skb)
 		goto discard_it;
 
 	if (!skb_csum_unnecessary(skb) && tcp_v6_checksum_init(skb))
-		goto bad_packet;
+		goto csum_error;
 
 	th = tcp_hdr(skb);
 	hdr = ipv6_hdr(skb);
@@ -1496,6 +1499,7 @@ process:
 	if (sk_filter(sk, skb))
 		goto discard_and_relse;
 
+	sk_mark_napi_id(sk, skb);
 	skb->dev = NULL;
 
 	bh_lock_sock_nested(sk);
@@ -1529,6 +1533,8 @@ no_tcp_socket:
 		goto discard_it;
 
 	if (skb->len < (th->doff<<2) || tcp_checksum_complete(skb)) {
+csum_error:
+		TCP_INC_STATS_BH(net, TCP_MIB_CSUMERRORS);
 bad_packet:
 		TCP_INC_STATS_BH(net, TCP_MIB_INERRS);
 	} else {
@@ -1536,11 +1542,6 @@ bad_packet:
 	}
 
 discard_it:
-
-	/*
-	 *	Discard frame
-	 */
-
 	kfree_skb(skb);
 	return 0;
 
@@ -1554,10 +1555,13 @@ do_time_wait:
 		goto discard_it;
 	}
 
-	if (skb->len < (th->doff<<2) || tcp_checksum_complete(skb)) {
-		TCP_INC_STATS_BH(net, TCP_MIB_INERRS);
+	if (skb->len < (th->doff<<2)) {
 		inet_twsk_put(inet_twsk(sk));
-		goto discard_it;
+		goto bad_packet;
+	}
+	if (tcp_checksum_complete(skb)) {
+		inet_twsk_put(inet_twsk(sk));
+		goto csum_error;
 	}
 
 	switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {
@@ -1888,6 +1892,17 @@ void tcp6_proc_exit(struct net *net)
 }
 #endif
 
+static void tcp_v6_clear_sk(struct sock *sk, int size)
+{
+	struct inet_sock *inet = inet_sk(sk);
+
+	/* we do not want to clear pinet6 field, because of RCU lookups */
+	sk_prot_clear_nulls(sk, offsetof(struct inet_sock, pinet6));
+
+	size -= offsetof(struct inet_sock, pinet6) + sizeof(inet->pinet6);
+	memset(&inet->pinet6 + 1, 0, size);
+}
+
 struct proto tcpv6_prot = {
 	.name			= "TCPv6",
 	.owner			= THIS_MODULE,
@@ -1931,6 +1946,7 @@ struct proto tcpv6_prot = {
 #ifdef CONFIG_MEMCG_KMEM
 	.proto_cgroup		= tcp_proto_cgroup,
 #endif
+	.clear_sk		= tcp_v6_clear_sk,
 };
 
 static const struct inet6_protocol tcpv6_protocol = {

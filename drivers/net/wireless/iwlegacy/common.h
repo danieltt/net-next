@@ -1299,6 +1299,8 @@ struct il_priv {
 	/* queue refcounts */
 #define IL_MAX_HW_QUEUES	32
 	unsigned long queue_stopped[BITS_TO_LONGS(IL_MAX_HW_QUEUES)];
+#define IL_STOP_REASON_PASSIVE	0
+	unsigned long stop_reason;
 	/* for each AC */
 	atomic_t queue_stop_count[4];
 
@@ -1720,7 +1722,7 @@ void il_mac_remove_interface(struct ieee80211_hw *hw,
 			     struct ieee80211_vif *vif);
 int il_mac_change_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			    enum nl80211_iftype newtype, bool newp2p);
-void il_mac_flush(struct ieee80211_hw *hw, bool drop);
+void il_mac_flush(struct ieee80211_hw *hw, u32 queues, bool drop);
 int il_alloc_txq_mem(struct il_priv *il);
 void il_free_txq_mem(struct il_priv *il);
 
@@ -1832,16 +1834,16 @@ u32 il_usecs_to_beacons(struct il_priv *il, u32 usec, u32 beacon_interval);
 __le32 il_add_beacon_time(struct il_priv *il, u32 base, u32 addon,
 			  u32 beacon_interval);
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 extern const struct dev_pm_ops il_pm_ops;
 
 #define IL_LEGACY_PM_OPS	(&il_pm_ops)
 
-#else /* !CONFIG_PM */
+#else /* !CONFIG_PM_SLEEP */
 
 #define IL_LEGACY_PM_OPS	NULL
 
-#endif /* !CONFIG_PM */
+#endif /* !CONFIG_PM_SLEEP */
 
 /*****************************************************
 *  Error Handling Debugging
@@ -2257,6 +2259,19 @@ il_set_swq_id(struct il_tx_queue *txq, u8 ac, u8 hwq)
 }
 
 static inline void
+_il_wake_queue(struct il_priv *il, u8 ac)
+{
+	if (atomic_dec_return(&il->queue_stop_count[ac]) <= 0)
+		ieee80211_wake_queue(il->hw, ac);
+}
+
+static inline void
+_il_stop_queue(struct il_priv *il, u8 ac)
+{
+	if (atomic_inc_return(&il->queue_stop_count[ac]) > 0)
+		ieee80211_stop_queue(il->hw, ac);
+}
+static inline void
 il_wake_queue(struct il_priv *il, struct il_tx_queue *txq)
 {
 	u8 queue = txq->swq_id;
@@ -2264,8 +2279,7 @@ il_wake_queue(struct il_priv *il, struct il_tx_queue *txq)
 	u8 hwq = (queue >> 2) & 0x1f;
 
 	if (test_and_clear_bit(hwq, il->queue_stopped))
-		if (atomic_dec_return(&il->queue_stop_count[ac]) <= 0)
-			ieee80211_wake_queue(il->hw, ac);
+		_il_wake_queue(il, ac);
 }
 
 static inline void
@@ -2276,8 +2290,27 @@ il_stop_queue(struct il_priv *il, struct il_tx_queue *txq)
 	u8 hwq = (queue >> 2) & 0x1f;
 
 	if (!test_and_set_bit(hwq, il->queue_stopped))
-		if (atomic_inc_return(&il->queue_stop_count[ac]) > 0)
-			ieee80211_stop_queue(il->hw, ac);
+		_il_stop_queue(il, ac);
+}
+
+static inline void
+il_wake_queues_by_reason(struct il_priv *il, int reason)
+{
+	u8 ac;
+
+	if (test_and_clear_bit(reason, &il->stop_reason))
+		for (ac = 0; ac < 4; ac++)
+			_il_wake_queue(il, ac);
+}
+
+static inline void
+il_stop_queues_by_reason(struct il_priv *il, int reason)
+{
+	u8 ac;
+
+	if (!test_and_set_bit(reason, &il->stop_reason))
+		for (ac = 0; ac < 4; ac++)
+			_il_stop_queue(il, ac);
 }
 
 #ifdef ieee80211_stop_queue

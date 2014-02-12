@@ -1,7 +1,7 @@
 /*
  * CAIF Interface registration.
  * Copyright (C) ST-Ericsson AB 2010
- * Author:	Sjur Brendeland/sjur.brandeland@stericsson.com
+ * Author:	Sjur Brendeland
  * License terms: GNU General Public License (GPL) version 2
  *
  * Borrowed heavily from file: pn_dev.c. Thanks to Remi Denis-Courmont
@@ -352,9 +352,9 @@ EXPORT_SYMBOL(caif_enroll_dev);
 
 /* notify Caif of device events */
 static int caif_device_notify(struct notifier_block *me, unsigned long what,
-			      void *arg)
+			      void *ptr)
 {
-	struct net_device *dev = arg;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct caif_device_entry *caifd = NULL;
 	struct caif_dev_common *caifdev;
 	struct cfcnfg *cfg;

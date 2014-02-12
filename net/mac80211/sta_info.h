@@ -203,6 +203,7 @@ struct tid_ampdu_rx {
  *	driver requested to close until the work for it runs
  * @mtx: mutex to protect all TX data (except non-NULL assignments
  *	to tid_tx[idx], which are protected by the sta spinlock)
+ *	tid_start_tx is also protected by sta->lock.
  */
 struct sta_ampdu_mlme {
 	struct mutex mtx;
@@ -297,6 +298,9 @@ struct sta_ampdu_mlme {
  * @rcu_head: RCU head used for freeing this station struct
  * @cur_max_bandwidth: maximum bandwidth to use for TX to the station,
  *	taken from HT/VHT capabilities or VHT operating mode notification
+ * @chains: chains ever used for RX from this station
+ * @chain_signal_last: last signal (per chain)
+ * @chain_signal_avg: signal average (per chain)
  */
 struct sta_info {
 	/* General information, mostly static */
@@ -333,7 +337,8 @@ struct sta_info {
 	unsigned long driver_buffered_tids;
 
 	/* Updated from RX path only, no locking requirements */
-	unsigned long rx_packets, rx_bytes;
+	unsigned long rx_packets;
+	u64 rx_bytes;
 	unsigned long wep_weak_iv_count;
 	unsigned long last_rx;
 	long last_connected;
@@ -343,6 +348,11 @@ struct sta_info {
 	int last_signal;
 	struct ewma avg_signal;
 	int last_ack_signal;
+
+	u8 chains;
+	s8 chain_signal_last[IEEE80211_MAX_CHAINS];
+	struct ewma chain_signal_avg[IEEE80211_MAX_CHAINS];
+
 	/* Plus 1 for non-QoS frames */
 	__le16 last_seq_ctrl[IEEE80211_NUM_TIDS + 1];
 
@@ -353,9 +363,9 @@ struct sta_info {
 	unsigned int fail_avg;
 
 	/* Updated from TX path only, no locking requirements */
-	unsigned long tx_packets;
-	unsigned long tx_bytes;
-	unsigned long tx_fragments;
+	u32 tx_fragments;
+	u64 tx_packets[IEEE80211_NUM_ACS];
+	u64 tx_bytes[IEEE80211_NUM_ACS];
 	struct ieee80211_tx_rate last_tx_rate;
 	int last_rx_rate_idx;
 	u32 last_rx_rate_flag;
